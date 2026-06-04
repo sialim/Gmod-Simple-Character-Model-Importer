@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "description": "Category suggestions shown in the main and QC category fields. Add internal/display pairs under categories.",
+  "scan_roots": [
+    "E:/G/Upload"
+  ],
+  "categories": {
+    "SheepyLord": "SheepyLord",
+    "aether_gazer": "Aether Gazer",
+    "genshin_impact": "Genshin Impact",
+    "honkai_star_rail": "Honkai: Star Rail",
+    "saekano": "Saekano",
+    "wuthering_waves": "Wuthering Waves",
+    "zenless_zone_zero": "Zenless Zone Zero",
+    "neverness_to_everness": "Neverness to Everness",
+    "ananta": "Ananta",
+    "azur_lane": "Azur Lane",
+    "blue_archive": "Blue Archive",
+    "fate_grand_order": "Fate Grand Order",
+    "honkai_impact": "Honkai Impact",
+    "arknights": "Arknights",
+    "arknights_endfield": "Arknights: Endfield",
+    "virtual_youtuber": "Virtual YouTuber",
+    "vocaloid": "Vocaloid",
+    "touhou_project": "Touhou Project"
+  }
+}

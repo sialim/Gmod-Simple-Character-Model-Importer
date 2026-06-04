@@ -1,0 +1,17256 @@
+#!/usr/bin/env python3
+"""PySide6 launcher for the MMD Character Importer workflow."""
+
+from __future__ import annotations
+
+import faulthandler
+import html
+import json
+import os
+import re
+import runpy
+import shutil
+import subprocess
+import sys
+import time
+import traceback
+from pathlib import Path
+from typing import Callable, Iterable
+
+QT_IMAGEIO_MAXALLOC_MB = 1024
+try:
+    current_qt_image_limit = int(os.environ.get("QT_IMAGEIO_MAXALLOC", "0") or "0")
+except ValueError:
+    current_qt_image_limit = 0
+if current_qt_image_limit < QT_IMAGEIO_MAXALLOC_MB:
+    os.environ["QT_IMAGEIO_MAXALLOC"] = str(QT_IMAGEIO_MAXALLOC_MB)
+
+try:
+    from PySide6 import QtCore, QtGui, QtWidgets
+except Exception as exc:  # pragma: no cover - GUI dependency guard
+    raise SystemExit("PySide6 is required. Install with: python -m pip install PySide6") from exc
+
+if hasattr(QtGui.QImageReader, "setAllocationLimit"):
+    QtGui.QImageReader.setAllocationLimit(QT_IMAGEIO_MAXALLOC_MB)
+
+try:
+    import mmd_character_importer_core as core
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import mmd_character_importer_core as core  # type: ignore[no-redef]
+
+
+def bundled_resource_root() -> Path:
+    """Return the project resource root in source and PyInstaller builds."""
+
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent)).resolve()
+    return Path(__file__).resolve().parents[1]
+
+
+ROOT_DIR = bundled_resource_root()
+
+
+try:
+    from model_preview import MaterialPreviewWidget, SkeletonPlanPreviewWidget, StaticModelPreviewWidget
+except Exception:
+    StaticModelPreviewWidget = None  # type: ignore[assignment]
+    SkeletonPlanPreviewWidget = None  # type: ignore[assignment]
+    MaterialPreviewWidget = None  # type: ignore[assignment]
+
+IconVmdPreviewWidget = None
+try:
+    _enhanced_tools_dir = ROOT_DIR / "reference" / "!enhanced_animation_importer_arc" / "tools"
+    if _enhanced_tools_dir.exists():
+        sys.path.insert(0, str(_enhanced_tools_dir))
+        from preview.widget import PreviewWidget as IconVmdPreviewWidget  # type: ignore[assignment]
+except Exception:
+    IconVmdPreviewWidget = None  # type: ignore[assignment]
+
+
+APP_ICON_PATH = ROOT_DIR / "tools" / "assets" / "mmd_character_importer_icon.ico"
+REFERENCE_ICON_PATH = ROOT_DIR / "reference" / "!enhanced_animation_importer_arc" / "tools" / "assets" / "importer_icon.ico"
+I18N_DIR = ROOT_DIR / "tools" / "i18n"
+LANGUAGE_OPTIONS = [
+    ("en_us", "English"),
+    ("zh_cn", "简体中文"),
+    ("zh_tw", "繁體中文"),
+    ("ja_jp", "日本語"),
+    ("fr_fr", "Français"),
+    ("ko_kr", "한국어"),
+    ("es_es", "Español"),
+    ("ru_ru", "Русский"),
+]
+CATEGORY_SUGGESTIONS_FILE = ROOT_DIR / "tools" / "category_suggestions.json"
+LOCAL_CATEGORY_SUGGESTIONS_FILE = (
+    Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "MMDCharacterImporter" / "category_suggestions.json"
+)
+CATEGORY_SUGGESTIONS_ENV = "MCI_CATEGORY_SUGGESTIONS"
+CATEGORY_SCAN_ROOT_ENV = "MCI_CATEGORY_SCAN_ROOT"
+DEFAULT_CATEGORY_SCAN_ROOTS = [Path("E:/G/Upload")]
+DEFAULT_CATEGORY_SUGGESTIONS = {"SheepyLord": "Sheepy Lord"}
+CATEGORY_COMPLETER_SEPARATOR = "    -    "
+INTERNAL_IDENTIFIER_ALLOWED_RE = re.compile(r"^[A-Za-z_]*$")
+INTERNAL_IDENTIFIER_REQUIRED_RE = re.compile(r"^[A-Za-z_]+$")
+INTERNAL_IDENTIFIER_UNSAFE_RE = re.compile(r"[^A-Za-z_]+")
+DISPLAY_NAME_ALLOWED_RE = re.compile(r"^[A-Za-z_ ]*$")
+DISPLAY_NAME_UNSAFE_RE = re.compile(r"[^A-Za-z_ ]+")
+CATEGORY_DISPLAY_ALLOWED_RE = re.compile(r"^[\x20-\x7E]*$")
+CATEGORY_DISPLAY_UNSAFE_RE = re.compile(r"[^\x20-\x7E]+")
+VRD_INTENSITY_DEFAULTS = {10: 1.0, 20: 1.0, 30: 0.70}
+VRD_WEIGHT_FRAMES = (10, 20, 30)
+VRD_WEIGHT_COLUMNS = {10: 4, 20: 5, 30: 6}
+
+
+def sanitize_internal_identifier_text(value: object) -> str:
+    return INTERNAL_IDENTIFIER_UNSAFE_RE.sub("", str(value or ""))
+
+
+def sanitize_display_name_text(value: object) -> str:
+    return DISPLAY_NAME_UNSAFE_RE.sub("", str(value or ""))
+
+
+def sanitize_category_display_name_text(value: object) -> str:
+    return CATEGORY_DISPLAY_UNSAFE_RE.sub("", str(value or ""))
+
+
+def is_valid_display_name_text(value: object, allow_blank: bool = True) -> bool:
+    text = str(value or "")
+    if allow_blank and not text.strip():
+        return True
+    return bool(DISPLAY_NAME_ALLOWED_RE.fullmatch(text))
+
+
+def is_valid_category_display_name_text(value: object, allow_blank: bool = True) -> bool:
+    text = str(value or "")
+    if allow_blank and not text.strip():
+        return True
+    return bool(CATEGORY_DISPLAY_ALLOWED_RE.fullmatch(text))
+
+
+def category_suggestion_file_paths() -> list[Path]:
+    paths: list[Path] = [CATEGORY_SUGGESTIONS_FILE]
+    if LOCAL_CATEGORY_SUGGESTIONS_FILE not in paths:
+        paths.append(LOCAL_CATEGORY_SUGGESTIONS_FILE)
+    for raw in str(os.environ.get(CATEGORY_SUGGESTIONS_ENV) or "").split(os.pathsep):
+        text = raw.strip()
+        if not text:
+            continue
+        path = Path(text)
+        if path not in paths:
+            paths.append(path)
+    return paths
+
+
+def category_config_entries(raw_categories: object) -> Iterable[tuple[str, str]]:
+    if isinstance(raw_categories, dict):
+        for internal, display in raw_categories.items():
+            yield str(internal or "").strip(), sanitize_category_display_name_text(display).strip()
+        return
+    if not isinstance(raw_categories, list):
+        return
+    for item in raw_categories:
+        if isinstance(item, dict):
+            internal = str(item.get("internal") or item.get("id") or item.get("name") or "").strip()
+            display = sanitize_category_display_name_text(item.get("display") or item.get("label") or "").strip()
+            yield internal, display
+
+
+def load_category_suggestion_config() -> tuple[dict[str, str], list[Path], list[Path]]:
+    categories: dict[str, str] = {}
+    scan_roots: list[Path] = []
+    loaded_files: list[Path] = []
+    for path in category_suggestion_file_paths():
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        loaded_files.append(path)
+        raw_scan_roots = data.get("scan_roots", [])
+        if isinstance(raw_scan_roots, str):
+            raw_scan_roots = [raw_scan_roots]
+        if isinstance(raw_scan_roots, list):
+            for raw in raw_scan_roots:
+                text = str(raw or "").strip()
+                if text:
+                    scan_roots.append(Path(text))
+        for internal, display in category_config_entries(data.get("categories", {})):
+            if re.fullmatch(r"[A-Za-z_]+", internal or "") and display:
+                categories[internal] = display
+    for internal, display in DEFAULT_CATEGORY_SUGGESTIONS.items():
+        categories.setdefault(internal, display)
+    env_scan_root = str(os.environ.get(CATEGORY_SCAN_ROOT_ENV) or "").strip()
+    if env_scan_root:
+        scan_roots.insert(0, Path(env_scan_root))
+    if not scan_roots:
+        scan_roots.extend(DEFAULT_CATEGORY_SCAN_ROOTS)
+    deduped_scan_roots: list[Path] = []
+    seen_roots: set[str] = set()
+    for root in scan_roots:
+        key = str(root).casefold()
+        if key in seen_roots:
+            continue
+        seen_roots.add(key)
+        deduped_scan_roots.append(root)
+    return categories, deduped_scan_roots, loaded_files
+
+
+def importer_icon_path() -> Path | None:
+    for candidate in (APP_ICON_PATH, REFERENCE_ICON_PATH):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+SPINE_CHAIN_TARGETS = [
+    "ValveBiped.Bip01_Pelvis",
+    "ValveBiped.Bip01_Spine",
+    "ValveBiped.Bip01_Spine1",
+    "ValveBiped.Bip01_Spine2",
+    "ValveBiped.Bip01_Spine4",
+]
+SPINE_ATTACHMENT_TARGETS = [
+    "ValveBiped.Bip01_Neck1",
+    "ValveBiped.Bip01_R_Clavicle",
+    "ValveBiped.Bip01_L_Clavicle",
+]
+SPINE_TARGETS = SPINE_CHAIN_TARGETS + SPINE_ATTACHMENT_TARGETS
+SPINE_TARGET_PARENTS = {
+    "ValveBiped.Bip01_Pelvis": None,
+    "ValveBiped.Bip01_Spine": "ValveBiped.Bip01_Pelvis",
+    "ValveBiped.Bip01_Spine1": "ValveBiped.Bip01_Spine",
+    "ValveBiped.Bip01_Spine2": "ValveBiped.Bip01_Spine1",
+    "ValveBiped.Bip01_Spine4": "ValveBiped.Bip01_Spine2",
+    "ValveBiped.Bip01_Neck1": "ValveBiped.Bip01_Spine4",
+    "ValveBiped.Bip01_R_Clavicle": "ValveBiped.Bip01_Spine4",
+    "ValveBiped.Bip01_L_Clavicle": "ValveBiped.Bip01_Spine4",
+}
+SPINE_ADDABLE_TARGETS = {"ValveBiped.Bip01_Spine", "ValveBiped.Bip01_Spine2"}
+ADD_NEW_MARKER = "__MCI_ADD_NEW_BONE__"
+_CRASH_LOG_HANDLE = None
+OPENAI_MODEL_OPTIONS = [
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.3",
+    "gpt-5.2",
+    "gpt-5.2-pro",
+    "gpt-5.1",
+    "gpt-5.1-chat-latest",
+    "gpt-5",
+    "gpt-5-mini",
+    "gpt-5-nano",
+    "gpt-4.1",
+    "gpt-4.1-mini",
+    "gpt-4.1-nano",
+    "gpt-4o",
+    "gpt-4o-mini",
+]
+
+
+def enable_crash_logging() -> Path | None:
+    global _CRASH_LOG_HANDLE
+    try:
+        root = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+        log_dir = root / "MMDCharacterImporter" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "gui_crash.log"
+        _CRASH_LOG_HANDLE = log_path.open("a", encoding="utf-8")
+        _CRASH_LOG_HANDLE.write("\n--- MMD Character Importer GUI start ---\n")
+        _CRASH_LOG_HANDLE.flush()
+        faulthandler.enable(file=_CRASH_LOG_HANDLE, all_threads=True)
+
+        def _log_uncaught_exception(exc_type, exc_value, exc_tb):
+            try:
+                if _CRASH_LOG_HANDLE:
+                    traceback.print_exception(exc_type, exc_value, exc_tb, file=_CRASH_LOG_HANDLE)
+                    _CRASH_LOG_HANDLE.flush()
+            finally:
+                sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+        sys.excepthook = _log_uncaught_exception
+        return log_path
+    except Exception:
+        return None
+
+
+class PathRow(QtWidgets.QWidget):
+    changed = QtCore.Signal(str)
+
+    def __init__(
+        self,
+        label: str,
+        mode: str,
+        file_filter: str = "All files (*.*)",
+        default: str = "",
+        required: bool = False,
+        hint: str = "",
+    ) -> None:
+        super().__init__()
+        self.mode = mode
+        self.file_filter = file_filter
+        self.required = required
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Fixed)
+        self.label = QtWidgets.QLabel(label)
+        self.badge = QtWidgets.QLabel("Required" if required else "Optional")
+        self.badge.setObjectName("requiredBadge" if required else "optionalBadge")
+        self.badge.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.badge.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)
+        self.badge.setMinimumHeight(20)
+        self.badge.setMaximumHeight(22)
+        self.hint = QtWidgets.QLabel(hint)
+        self.hint.setObjectName("fieldHint")
+        self.edit = QtWidgets.QLineEdit(default)
+        self.button = QtWidgets.QPushButton("Browse")
+        self.button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DirOpenIcon))
+
+        layout = QtWidgets.QGridLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        header = QtWidgets.QHBoxLayout()
+        header.addWidget(self.label, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
+        header.addWidget(self.badge, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
+        header.addWidget(self.hint, 1, QtCore.Qt.AlignmentFlag.AlignVCenter)
+        layout.addLayout(header, 0, 0, 1, 3)
+        layout.addWidget(self.edit, 1, 0, 1, 2)
+        layout.addWidget(self.button, 1, 2)
+        layout.setRowStretch(0, 0)
+        layout.setRowStretch(1, 0)
+        self.button.clicked.connect(self.browse)
+        self.edit.textChanged.connect(self.changed)
+
+    def value(self) -> str:
+        return self.edit.text().strip()
+
+    def set_value(self, value: str) -> None:
+        self.edit.setText(value)
+
+    def browse(self) -> None:
+        if self.mode == "dir":
+            selected = QtWidgets.QFileDialog.getExistingDirectory(self, "Select folder", self.value() or str(Path.home()))
+        else:
+            selected, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self,
+                "Select file",
+                self.value() or str(Path.home()),
+                self.file_filter,
+            )
+        if selected:
+            self.set_value(selected)
+
+
+class FixedHintLabel(QtWidgets.QLabel):
+    def __init__(self, text: str = "", width: int = 420, height: int = 160, parent=None) -> None:
+        super().__init__(text, parent)
+        self._hint_size = QtCore.QSize(width, height)
+
+    def sizeHint(self) -> QtCore.QSize:  # noqa: N802 - Qt override
+        return QtCore.QSize(self._hint_size)
+
+    def minimumSizeHint(self) -> QtCore.QSize:  # noqa: N802 - Qt override
+        return QtCore.QSize(0, self._hint_size.height())
+
+
+class ImportWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, pmx_path: str, source_dir: str) -> None:
+        super().__init__()
+        self.pmx_path = pmx_path
+        self.source_dir = source_dir
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            result = core.import_pmx_to_blender(
+                Path(self.pmx_path),
+                Path(self.source_dir),
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            self.done.emit(
+                {
+                    "workspace": str(result.workspace.root),
+                    "source_assets": str(result.workspace.source_assets_dir),
+                    "blend": str(result.workspace.blend_path),
+                    "log": str(result.workspace.import_log_path),
+                    "report": str(result.workspace.import_report_path),
+                    "preflight": str(result.workspace.preflight_report_path),
+                    "blender": str(result.setup.blender_exe),
+                    "blender_version": result.setup.version,
+                    "setup_reused": result.setup.reused,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class FixWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, input_blend: str, clear_custom_normals: bool = True) -> None:
+        super().__init__()
+        self.input_blend = input_blend
+        self.clear_custom_normals = bool(clear_custom_normals)
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            result = core.fix_imported_blend(
+                Path(self.input_blend),
+                clear_custom_normals=self.clear_custom_normals,
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            self.done.emit(
+                {
+                    "input_blend": str(result.input_blend),
+                    "output_blend": str(result.output_blend),
+                    "fix_dir": str(result.fix_dir),
+                    "log": str(result.fix_log_path),
+                    "report": str(result.fix_report_path),
+                    "blender": str(result.setup.blender_exe),
+                    "blender_version": result.setup.version,
+                    "setup_reused": result.setup.reused,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class SpineAnalyzeWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, input_blend: str) -> None:
+        super().__init__()
+        self.input_blend = input_blend
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            result = core.analyze_spine_blend(
+                Path(self.input_blend),
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            self.done.emit(
+                {
+                    "input_blend": str(result.input_blend),
+                    "spine_dir": str(result.spine_dir),
+                    "analysis": str(result.analysis_path),
+                    "plan": str(result.plan_path),
+                    "log": str(result.log_path),
+                    "analysis_data": result.analysis,
+                    "plan_data": result.plan,
+                    "blender": str(result.setup.blender_exe),
+                    "blender_version": result.setup.version,
+                    "setup_reused": result.setup.reused,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class SpineFixWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, input_blend: str, plan: dict[str, object]) -> None:
+        super().__init__()
+        self.input_blend = input_blend
+        self.plan = plan
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            result = core.fix_spine_blend(
+                Path(self.input_blend),
+                self.plan,
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            self.done.emit(
+                {
+                    "input_blend": str(result.input_blend),
+                    "output_blend": str(result.output_blend),
+                    "spine_dir": str(result.spine_dir),
+                    "analysis": str(result.analysis_path),
+                    "plan": str(result.plan_path),
+                    "log": str(result.log_path),
+                    "report": str(result.report_path),
+                    "report_data": result.report,
+                    "blender": str(result.setup.blender_exe),
+                    "blender_version": result.setup.version,
+                    "setup_reused": result.setup.reused,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class SortBonesAnalyzeWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, input_blend: str, limit: int) -> None:
+        super().__init__()
+        self.input_blend = input_blend
+        self.limit = limit
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            result = core.analyze_sort_bones_blend(
+                Path(self.input_blend),
+                self.limit,
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            self.done.emit(
+                {
+                    "input_blend": str(result.input_blend),
+                    "sort_dir": str(result.sort_dir),
+                    "analysis": str(result.analysis_path),
+                    "plan": str(result.plan_path),
+                    "log": str(result.log_path),
+                    "analysis_data": result.analysis,
+                    "plan_data": result.plan,
+                    "blender": str(result.setup.blender_exe),
+                    "blender_version": result.setup.version,
+                    "setup_reused": result.setup.reused,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class SortBonesManualMergeWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, manual_blend: str, limit: int, source_blend: str = "") -> None:
+        super().__init__()
+        self.manual_blend = manual_blend
+        self.source_blend = source_blend
+        self.limit = limit
+        self.cancel_requested = False
+        self.process: subprocess.Popen | None = None
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            manual_path = Path(self.manual_blend).resolve()
+            if not manual_path.exists():
+                raise FileNotFoundError(manual_path)
+            setup = core.ensure_portable_blender(self._log)
+            self._log(f"Opening Blender for manual bone merge: {manual_path}")
+            self._log("Waiting for Blender to close before re-analyzing manually merged bones.")
+            self.process = subprocess.Popen([str(setup.blender_exe), str(manual_path)])
+            while True:
+                return_code = self.process.poll()
+                if return_code is not None:
+                    break
+                if self.cancel_requested:
+                    self.process.terminate()
+                    raise RuntimeError("Manual bone merge was cancelled.")
+                self.msleep(250)
+            if return_code != 0:
+                raise RuntimeError(f"Blender exited with code {return_code} during manual bone merging.")
+            self._log("Blender closed; re-running Step 4 Analyze Bones on the manual merge blend.")
+            result = core.analyze_sort_bones_blend(
+                manual_path,
+                self.limit,
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            self.done.emit(
+                {
+                    "input_blend": str(result.input_blend),
+                    "manual_blend": str(manual_path),
+                    "source_blend": self.source_blend,
+                    "sort_dir": str(result.sort_dir),
+                    "analysis": str(result.analysis_path),
+                    "plan": str(result.plan_path),
+                    "log": str(result.log_path),
+                    "analysis_data": result.analysis,
+                    "plan_data": result.plan,
+                    "blender": str(result.setup.blender_exe),
+                    "blender_version": result.setup.version,
+                    "setup_reused": result.setup.reused,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class SortBonesWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, input_blend: str, plan: dict[str, object], limit: int) -> None:
+        super().__init__()
+        self.input_blend = input_blend
+        self.plan = plan
+        self.limit = limit
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            result = core.sort_bones_blend(
+                Path(self.input_blend),
+                self.plan,
+                limit=self.limit,
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            self.done.emit(
+                {
+                    "input_blend": str(result.input_blend),
+                    "output_blend": str(result.output_blend),
+                    "sort_dir": str(result.sort_dir),
+                    "analysis": str(result.analysis_path),
+                    "plan": str(result.plan_path),
+                    "log": str(result.log_path),
+                    "report": str(result.report_path),
+                    "report_data": result.report,
+                    "blender": str(result.setup.blender_exe),
+                    "blender_version": result.setup.version,
+                    "setup_reused": result.setup.reused,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class MaterialScanWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, input_blend: str, limit: int) -> None:
+        super().__init__()
+        self.input_blend = input_blend
+        self.limit = limit
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            result = core.scan_materials_blend(
+                Path(self.input_blend),
+                self.limit,
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            self.done.emit(
+                {
+                    "input_blend": str(result.input_blend),
+                    "material_dir": str(result.material_dir),
+                    "scan": str(result.scan_path),
+                    "plan": str(result.plan_path),
+                    "log": str(result.log_path),
+                    "scan_data": result.scan,
+                    "plan_data": result.plan,
+                    "blender": str(result.setup.blender_exe),
+                    "blender_version": result.setup.version,
+                    "setup_reused": result.setup.reused,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class MaterialApplyWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, input_blend: str, plan: dict[str, object], limit: int) -> None:
+        super().__init__()
+        self.input_blend = input_blend
+        self.plan = plan
+        self.limit = limit
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            result = core.apply_materials_initial_blend(
+                Path(self.input_blend),
+                self.plan,
+                limit=self.limit,
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            self.done.emit(
+                {
+                    "input_blend": str(result.input_blend),
+                    "output_blend": str(result.output_blend),
+                    "material_dir": str(result.material_dir),
+                    "scan": str(result.scan_path),
+                    "plan": str(result.plan_path),
+                    "merge_plan": str(result.merge_plan_path),
+                    "log": str(result.log_path),
+                    "report": str(result.report_path),
+                    "materials_json": str(result.materials_json_path),
+                    "materials_npy": str(result.materials_npy_path),
+                    "report_data": result.report,
+                    "merge_plan_data": result.merge_plan,
+                    "blender": str(result.setup.blender_exe),
+                    "blender_version": result.setup.version,
+                    "setup_reused": result.setup.reused,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class MaterialMergeWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, input_blend: str, merge_plan: dict[str, object], limit: int, output_blend: str = "") -> None:
+        super().__init__()
+        self.input_blend = input_blend
+        self.merge_plan = merge_plan
+        self.limit = limit
+        self.output_blend = output_blend
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            result = core.merge_materials_blend(
+                Path(self.input_blend),
+                self.merge_plan,
+                output_blend=Path(self.output_blend) if self.output_blend else None,
+                limit=self.limit,
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            self.done.emit(
+                {
+                    "input_blend": str(result.input_blend),
+                    "output_blend": str(result.output_blend),
+                    "material_dir": str(result.material_dir),
+                    "merge_plan": str(result.merge_plan_path),
+                    "log": str(result.log_path),
+                    "report": str(result.report_path),
+                    "materials_json": str(result.materials_json_path),
+                    "materials_npy": str(result.materials_npy_path),
+                    "report_data": result.report,
+                    "blender": str(result.setup.blender_exe),
+                    "blender_version": result.setup.version,
+                    "setup_reused": result.setup.reused,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class BodygroupAnalyzeWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, input_blend: str, scale_factor: float, scale_preset: str, always_auto_split: bool, vertex_limit: int) -> None:
+        super().__init__()
+        self.input_blend = input_blend
+        self.scale_factor = scale_factor
+        self.scale_preset = scale_preset
+        self.always_auto_split = always_auto_split
+        self.vertex_limit = vertex_limit
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            result = core.analyze_bodygroups_blend(
+                Path(self.input_blend),
+                self.scale_factor,
+                scale_preset=self.scale_preset,
+                always_auto_split=self.always_auto_split,
+                vertex_limit=self.vertex_limit,
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            self.done.emit(
+                {
+                    "input_blend": str(result.input_blend),
+                    "bodygroup_dir": str(result.bodygroup_dir),
+                    "manual_edit_blend": str(result.manual_edit_blend),
+                    "analysis": str(result.analysis_path),
+                    "plan": str(result.plan_path),
+                    "log": str(result.log_path),
+                    "analysis_data": result.analysis,
+                    "plan_data": result.plan,
+                    "blender": str(result.setup.blender_exe),
+                    "blender_version": result.setup.version,
+                    "setup_reused": result.setup.reused,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class BodygroupApplyWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, input_blend: str, plan: dict[str, object], scale_factor: float, scale_preset: str, always_auto_split: bool, vertex_limit: int) -> None:
+        super().__init__()
+        self.input_blend = input_blend
+        self.plan = plan
+        self.scale_factor = scale_factor
+        self.scale_preset = scale_preset
+        self.always_auto_split = always_auto_split
+        self.vertex_limit = vertex_limit
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            result = core.sort_bodygroups_blend(
+                Path(self.input_blend),
+                self.plan,
+                scale_factor=self.scale_factor,
+                scale_preset=self.scale_preset,
+                always_auto_split=self.always_auto_split,
+                vertex_limit=self.vertex_limit,
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            self.done.emit(
+                {
+                    "input_blend": str(result.input_blend),
+                    "output_blend": str(result.output_blend),
+                    "bodygroup_dir": str(result.bodygroup_dir),
+                    "analysis": str(result.analysis_path),
+                    "plan": str(result.plan_path),
+                    "log": str(result.log_path),
+                    "report": str(result.report_path),
+                    "report_data": result.report,
+                    "blender": str(result.setup.blender_exe),
+                    "blender_version": result.setup.version,
+                    "setup_reused": result.setup.reused,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class BodygroupManualEditWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    manual_report = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, manual_edit_blend: str, vertex_limit: int) -> None:
+        super().__init__()
+        self.manual_edit_blend = manual_edit_blend
+        self.vertex_limit = vertex_limit
+        self.cancel_requested = False
+        self.process: subprocess.Popen | None = None
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+        if self.process and self.process.poll() is None:
+            try:
+                self.process.terminate()
+            except Exception:
+                pass
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            manual_path = Path(self.manual_edit_blend)
+            if not manual_path.exists():
+                raise FileNotFoundError(manual_path)
+            setup = core.ensure_portable_blender(self._log)
+            self.log.emit(f"Opening Blender for manual bodygroup edit: {manual_path}")
+            self.log.emit("Waiting for Blender to close before validating manual bodygroups.")
+            self.process = subprocess.Popen([str(setup.blender_exe), str(manual_path)])
+            return_code = self.process.wait()
+            self.process = None
+            if self.cancel_requested:
+                raise RuntimeError("Manual bodygroup edit cancelled.")
+            if return_code != 0:
+                raise RuntimeError(f"Blender exited with code {return_code} during manual bodygroup editing.")
+            result = core.validate_manual_bodygroups_blend(
+                manual_path,
+                vertex_limit=self.vertex_limit,
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            self.done.emit(
+                {
+                    "input_blend": str(result.input_blend),
+                    "output_blend": str(result.output_blend),
+                    "bodygroup_dir": str(result.bodygroup_dir),
+                    "analysis": str(result.analysis_path),
+                    "plan": str(result.plan_path),
+                    "log": str(result.log_path),
+                    "report": str(result.report_path),
+                    "report_data": result.report,
+                    "blender": str(result.setup.blender_exe),
+                    "blender_version": result.setup.version,
+                    "setup_reused": result.setup.reused,
+                    "manual": True,
+                }
+            )
+        except Exception as exc:
+            try:
+                if "manual_path" in locals():
+                    bodygroup_dir, output_blend, analysis_path, plan_path, report_path = core.bodygroup_paths_for_manual_edit_blend(manual_path)
+                    if report_path.exists():
+                        self.manual_report.emit(
+                            {
+                                "output_blend": str(output_blend),
+                                "bodygroup_dir": str(bodygroup_dir),
+                                "analysis": str(analysis_path),
+                                "plan": str(plan_path),
+                                "report": str(report_path),
+                                "report_data": json.loads(report_path.read_text(encoding="utf-8")),
+                                "manual": True,
+                            }
+                        )
+            except Exception:
+                pass
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class FlexAnalyzeWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, input_blend: str) -> None:
+        super().__init__()
+        self.input_blend = input_blend
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            result = core.analyze_flexes_blend(
+                Path(self.input_blend),
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            self.done.emit(
+                {
+                    "input_blend": str(result.input_blend),
+                    "flex_dir": str(result.flex_dir),
+                    "analysis": str(result.analysis_path),
+                    "plan": str(result.plan_path),
+                    "log": str(result.log_path),
+                    "analysis_data": result.analysis,
+                    "plan_data": result.plan,
+                    "blender": str(result.setup.blender_exe),
+                    "blender_version": result.setup.version,
+                    "setup_reused": result.setup.reused,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class FlexApplyWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, input_blend: str, plan: dict[str, object]) -> None:
+        super().__init__()
+        self.input_blend = input_blend
+        self.plan = plan
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            result = core.sort_flexes_blend(
+                Path(self.input_blend),
+                self.plan,
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            self.done.emit(
+                {
+                    "input_blend": str(result.input_blend),
+                    "output_blend": str(result.output_blend),
+                    "flex_dir": str(result.flex_dir),
+                    "analysis": str(result.analysis_path),
+                    "plan": str(result.plan_path),
+                    "log": str(result.log_path),
+                    "report": str(result.report_path),
+                    "flexes_json": str(result.flexes_json_path),
+                    "report_data": result.report,
+                    "blender": str(result.setup.blender_exe),
+                    "blender_version": result.setup.version,
+                    "setup_reused": result.setup.reused,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class CollisionSourceScanWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, input_blend: str, additional_bone_groups: list[dict[str, object]] | None = None) -> None:
+        super().__init__()
+        self.input_blend = input_blend
+        self.additional_bone_groups = additional_bone_groups
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            result = core.scan_collision_source_bodygroups(
+                Path(self.input_blend),
+                additional_bone_groups=self.additional_bone_groups,
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            self.done.emit(
+                {
+                    "input_blend": str(result.input_blend),
+                    "collision_dir": str(result.collision_dir),
+                    "sources": str(result.sources_path),
+                    "log": str(result.log_path),
+                    "sources_data": result.sources,
+                    "blender": str(result.setup.blender_exe),
+                    "blender_version": result.setup.version,
+                    "setup_reused": result.setup.reused,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class CollisionBoneScanWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, input_blend: str) -> None:
+        super().__init__()
+        self.input_blend = input_blend
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            result = core.scan_collision_bones(
+                Path(self.input_blend),
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            self.done.emit(
+                {
+                    "input_blend": str(result.input_blend),
+                    "collision_dir": str(result.collision_dir),
+                    "bones": str(result.bones_path),
+                    "log": str(result.log_path),
+                    "bones_data": result.bones,
+                    "blender": str(result.setup.blender_exe),
+                    "blender_version": result.setup.version,
+                    "setup_reused": result.setup.reused,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class CollisionAnalyzeWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(
+        self,
+        input_blend: str,
+        source_bodygroups: list[str] | None = None,
+        additional_bone_groups: list[dict[str, object]] | None = None,
+        quality_preset: str = "fast_preview",
+    ) -> None:
+        super().__init__()
+        self.input_blend = input_blend
+        self.source_bodygroups = source_bodygroups
+        self.additional_bone_groups = additional_bone_groups
+        self.quality_preset = quality_preset
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            result = core.analyze_collision_blend(
+                Path(self.input_blend),
+                source_bodygroups=self.source_bodygroups,
+                additional_bone_groups=self.additional_bone_groups,
+                quality_preset=self.quality_preset,
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            self.done.emit(
+                {
+                    "input_blend": str(result.input_blend),
+                    "collision_dir": str(result.collision_dir),
+                    "analysis": str(result.analysis_path),
+                    "plan": str(result.plan_path),
+                    "log": str(result.log_path),
+                    "physics_settings": str(result.physics_settings_path),
+                    "physics_smd": str(result.physics_smd_path),
+                    "analysis_data": result.analysis,
+                    "plan_data": result.plan,
+                    "blender": str(result.setup.blender_exe),
+                    "blender_version": result.setup.version,
+                    "setup_reused": result.setup.reused,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class CollisionApplyWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, input_blend: str, plan: dict[str, object]) -> None:
+        super().__init__()
+        self.input_blend = input_blend
+        self.plan = plan
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            result = core.sort_collision_blend(
+                Path(self.input_blend),
+                self.plan,
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            self.done.emit(
+                {
+                    "input_blend": str(result.input_blend),
+                    "output_blend": str(result.output_blend),
+                    "collision_dir": str(result.collision_dir),
+                    "analysis": str(result.analysis_path),
+                    "plan": str(result.plan_path),
+                    "log": str(result.log_path),
+                    "report": str(result.report_path),
+                    "physics_settings": str(result.physics_settings_path),
+                    "physics_smd": str(result.physics_smd_path),
+                    "report_data": result.report,
+                    "blender": str(result.setup.blender_exe),
+                    "blender_version": result.setup.version,
+                    "setup_reused": result.setup.reused,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class ProportionRunWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, input_blend: str, remove_zero_weight_bones: bool = True) -> None:
+        super().__init__()
+        self.input_blend = input_blend
+        self.remove_zero_weight_bones = bool(remove_zero_weight_bones)
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            result = core.run_proportion_export(
+                Path(self.input_blend),
+                remove_zero_weight_bones=self.remove_zero_weight_bones,
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            self.done.emit(
+                {
+                    "input_blend": str(result.input_blend),
+                    "proportion_dir": str(result.proportion_dir),
+                    "raw_dir": str(result.raw_dir),
+                    "workspace_dir": str(result.workspace_dir),
+                    "final_dir": str(result.final_dir),
+                    "pre_blend": str(result.pre_blend_path),
+                    "processed_blend": str(result.processed_blend_path),
+                    "report": str(result.report_path),
+                    "files": str(result.files_path),
+                    "log": str(result.log_path),
+                    "report_data": result.report,
+                    "files_data": result.files,
+                    "blender": str(result.setup.blender_exe),
+                    "blender_version": result.setup.version,
+                    "setup_reused": result.setup.reused,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class CArmsRunWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, input_dir: str, weight_threshold: float) -> None:
+        super().__init__()
+        self.input_dir = input_dir
+        self.weight_threshold = weight_threshold
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            result = core.run_carms_sort(
+                Path(self.input_dir),
+                self.weight_threshold,
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            self.done.emit(
+                {
+                    "input_dir": str(result.input_dir),
+                    "carms_dir": str(result.carms_dir),
+                    "workspace_blend": str(result.workspace_blend_path),
+                    "report": str(result.report_path),
+                    "files": str(result.files_path),
+                    "log": str(result.log_path),
+                    "report_data": result.report,
+                    "files_data": result.files,
+                    "blender": str(result.setup.blender_exe),
+                    "blender_version": result.setup.version,
+                    "setup_reused": result.setup.reused,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class VrdAnalyzeWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, input_dir: str) -> None:
+        super().__init__()
+        self.input_dir = input_dir
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            result = core.analyze_vrd(
+                Path(self.input_dir),
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            self.done.emit(
+                {
+                    "input_dir": str(result.input_dir),
+                    "vrd_dir": str(result.vrd_dir),
+                    "workspace_blend": str(result.workspace_blend_path),
+                    "analysis": str(result.analysis_path),
+                    "plan": str(result.plan_path),
+                    "preview": str(result.preview_path),
+                    "log": str(result.log_path),
+                    "analysis_data": result.analysis,
+                    "plan_data": result.plan,
+                    "preview_data": result.preview,
+                    "blender": str(result.setup.blender_exe),
+                    "blender_version": result.setup.version,
+                    "setup_reused": result.setup.reused,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class VrdApplyWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, input_dir: str, plan: dict[str, object]) -> None:
+        super().__init__()
+        self.input_dir = input_dir
+        self.plan = plan
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            result = core.apply_vrd(
+                Path(self.input_dir),
+                self.plan,
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            self.done.emit(
+                {
+                    "input_dir": str(result.input_dir),
+                    "vrd_dir": str(result.vrd_dir),
+                    "workspace_blend": str(result.workspace_blend_path),
+                    "analysis": str(result.analysis_path),
+                    "plan": str(result.plan_path),
+                    "preview": str(result.preview_path),
+                    "report": str(result.report_path),
+                    "vrd": str(result.vrd_path),
+                    "log": str(result.log_path),
+                    "report_data": result.report,
+                    "plan_data": json.loads(result.plan_path.read_text(encoding="utf-8")) if result.plan_path.exists() else {},
+                    "preview_data": json.loads(result.preview_path.read_text(encoding="utf-8")) if result.preview_path.exists() else {},
+                    "blender": str(result.setup.blender_exe),
+                    "blender_version": result.setup.version,
+                    "setup_reused": result.setup.reused,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class VrdPreviewWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, input_dir: str, plan: dict[str, object]) -> None:
+        super().__init__()
+        self.input_dir = input_dir
+        self.plan = plan
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            result = core.preview_vrd(
+                Path(self.input_dir),
+                self.plan,
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            self.done.emit(
+                {
+                    "input_dir": str(result.input_dir),
+                    "vrd_dir": str(result.vrd_dir),
+                    "workspace_blend": str(result.workspace_blend_path),
+                    "analysis": str(result.analysis_path),
+                    "plan": str(result.plan_path),
+                    "preview": str(result.preview_path),
+                    "report": str(result.report_path),
+                    "log": str(result.log_path),
+                    "plan_data": result.plan,
+                    "preview_data": result.preview,
+                    "report_data": result.report,
+                    "blender": str(result.setup.blender_exe),
+                    "blender_version": result.setup.version,
+                    "setup_reused": result.setup.reused,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class TextureAnalyzeWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, input_path: str) -> None:
+        super().__init__()
+        self.input_path = input_path
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            result = core.analyze_textures(Path(self.input_path), progress=self._log, cancel_check=self._cancelled)
+            self.done.emit(
+                {
+                    "input": str(result.input_path),
+                    "texture_dir": str(result.texture_dir),
+                    "analysis": str(result.analysis_path),
+                    "plan": str(result.plan_path),
+                    "report": str(result.report_path),
+                    "manifest": str(result.manifest_path),
+                    "log": str(result.log_path),
+                    "analysis_data": result.analysis,
+                    "plan_data": result.plan,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class TextureProcessWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, input_path: str, plan: dict[str, object]) -> None:
+        super().__init__()
+        self.input_path = input_path
+        self.plan = plan
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            result = core.process_textures(Path(self.input_path), self.plan, progress=self._log, cancel_check=self._cancelled)
+            self.done.emit(
+                {
+                    "input": str(result.input_path),
+                    "texture_dir": str(result.texture_dir),
+                    "analysis": str(result.analysis_path),
+                    "plan": str(result.plan_path),
+                    "report": str(result.report_path),
+                    "manifest": str(result.manifest_path),
+                    "log": str(result.log_path),
+                    "report_data": result.report,
+                    "manifest_data": result.manifest,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class IconAnalyzeWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, input_path: str) -> None:
+        super().__init__()
+        self.input_path = input_path
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            result = core.analyze_icons(Path(self.input_path), progress=self._log, cancel_check=self._cancelled)
+            self.done.emit(
+                {
+                    "input": str(result.input_path),
+                    "icon_dir": str(result.icon_dir),
+                    "analysis": str(result.analysis_path),
+                    "plan": str(result.plan_path),
+                    "report": str(result.report_path),
+                    "files": str(result.files_path),
+                    "render_report": str(result.render_report_path),
+                    "log": str(result.log_path),
+                    "analysis_data": result.analysis,
+                    "plan_data": result.plan,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class IconRunWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(
+        self,
+        input_path: str,
+        custom_source_image: str = "",
+        icon_basename: str = "",
+        body_vmd: str = "",
+        face_vmds: list[str] | None = None,
+        frame: int = 334,
+    ) -> None:
+        super().__init__()
+        self.input_path = input_path
+        self.custom_source_image = custom_source_image
+        self.icon_basename = icon_basename
+        self.body_vmd = body_vmd
+        self.face_vmds = face_vmds or []
+        self.frame = int(frame)
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            custom = Path(self.custom_source_image) if self.custom_source_image else None
+            result = core.run_icons(
+                Path(self.input_path),
+                custom_source_image=custom,
+                icon_basename=self.icon_basename,
+                body_vmd_path=Path(self.body_vmd) if self.body_vmd else None,
+                face_vmd_paths=[Path(path) for path in self.face_vmds if path],
+                frame=self.frame,
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            self.done.emit(
+                {
+                    "input": str(result.input_path),
+                    "icon_dir": str(result.icon_dir),
+                    "analysis": str(result.analysis_path),
+                    "plan": str(result.plan_path),
+                    "report": str(result.report_path),
+                    "files": str(result.files_path),
+                    "render_report": str(result.render_report_path),
+                    "log": str(result.log_path),
+                    "report_data": result.report,
+                    "files_data": result.files,
+                    "blender": str(result.setup.blender_exe) if result.setup else "",
+                    "blender_version": result.setup.version if result.setup else "",
+                    "setup_reused": result.setup.reused if result.setup else False,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class QcAnalyzeWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, input_path: str, author: str, category: str, model_name: str, gmod_root: str, studiomdl: str) -> None:
+        super().__init__()
+        self.input_path = input_path
+        self.author = author
+        self.category = category
+        self.model_name = model_name
+        self.gmod_root = gmod_root
+        self.studiomdl = studiomdl
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            result = core.analyze_qc(
+                Path(self.input_path),
+                author=self.author,
+                character_category=self.category,
+                model_name=self.model_name,
+                gmod_root=self.gmod_root,
+                studiomdl_path=self.studiomdl,
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            self.done.emit(
+                {
+                    "input": str(result.input_path),
+                    "qc_dir": str(result.qc_dir),
+                    "analysis": str(result.analysis_path),
+                    "plan": str(result.plan_path),
+                    "report": str(result.report_path),
+                    "files": str(result.files_path),
+                    "log": str(result.log_path),
+                    "analysis_data": result.analysis,
+                    "plan_data": result.plan,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class QcCompileWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, input_path: str, plan: dict[str, object]) -> None:
+        super().__init__()
+        self.input_path = input_path
+        self.plan = plan
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            result = core.compile_and_compose_qc(
+                Path(self.input_path),
+                self.plan,
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            self.done.emit(
+                {
+                    "input": str(result.input_path),
+                    "qc_dir": str(result.qc_dir),
+                    "analysis": str(result.analysis_path),
+                    "plan": str(result.plan_path),
+                    "report": str(result.report_path),
+                    "files": str(result.files_path),
+                    "log": str(result.log_path),
+                    "report_data": result.report,
+                    "files_data": result.files,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+FULL_IMPORT_STEP_TITLES = {
+    1: "Import MMD Model",
+    2: "Fix Model",
+    3: "Fix Spine Bones",
+    4: "Sort Bones",
+    5: "Sort Materials",
+    6: "Sort Bodygroups",
+    7: "Sort Flexes",
+    8: "Sort Collision",
+    9: "Export Proportion Trick",
+    10: "Sort c_arms",
+    11: "Sort VRD",
+    12: "Param Texture",
+    13: "Sort Icons and Arts",
+    14: "Sort QC and Compile",
+}
+
+
+class FullImportWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    progress = QtCore.Signal(int, str, str, str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(
+        self,
+        pmx_path: str,
+        source_dir: str,
+        gmod_path: str,
+        character_category: str,
+        category_display_name: str,
+        model_name: str,
+        model_display_name: str,
+        distribution_output_dir: str,
+        bodygroup_vertex_limit: int = int(getattr(core, "DEFAULT_BODYGROUP_VERTEX_LIMIT", 65535)),
+        clear_custom_normals: bool = True,
+    ) -> None:
+        super().__init__()
+        self.pmx_path = Path(pmx_path)
+        self.source_dir = Path(source_dir)
+        self.gmod_path = gmod_path
+        self.character_category = character_category
+        self.category_display_name = category_display_name
+        self.model_name = model_name
+        self.model_display_name = model_display_name
+        self.distribution_output_dir = distribution_output_dir
+        self.bodygroup_vertex_limit = int(bodygroup_vertex_limit or getattr(core, "DEFAULT_BODYGROUP_VERTEX_LIMIT", 65535))
+        self.clear_custom_normals = bool(clear_custom_normals)
+        self.cancel_requested = False
+        self.step_results: dict[int, dict[str, object]] = {}
+        self.optional_warnings: list[str] = []
+        self.current_step = 0
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def _stage(self, step: int, title: str, detail: str = "", color: str = "#58a6ff") -> None:
+        self.current_step = int(step)
+        pct = max(0, min(99, int((step - 1) * 100 / 14)))
+        self.progress.emit(pct, f"Step {step}: {title}", detail, color)
+        self._log(f"[Main Import] Step {step} - {title}: {detail}")
+
+    def _write_marker(
+        self,
+        step: int,
+        step_dir: Path,
+        outputs: dict[str, object] | None = None,
+        report_path: Path | str | None = None,
+        validation: dict[str, object] | None = None,
+        inputs: dict[str, object] | None = None,
+    ) -> None:
+        core.write_step_complete_marker(
+            step_dir,
+            step,
+            FULL_IMPORT_STEP_TITLES.get(step, f"Step {step}"),
+            inputs=inputs,
+            outputs=outputs or {},
+            report_path=report_path,
+            validation=validation or {"ok": True},
+        )
+
+    def _require_clean_report(self, step: int, report: dict[str, object], context: str) -> None:
+        validation = report.get("validation") if isinstance(report.get("validation"), dict) else {}
+        validation_errors = report.get("validation_errors") if isinstance(report.get("validation_errors"), list) else []
+        errors = report.get("errors") if isinstance(report.get("errors"), list) else []
+        status = str(report.get("status") or "").lower()
+        if validation and validation.get("ok") is False:
+            details = validation.get("errors", []) if isinstance(validation.get("errors"), list) else []
+            raise RuntimeError(f"Step {step} {context} validation failed: {'; '.join(str(item) for item in details) or validation}")
+        if validation_errors:
+            raise RuntimeError(f"Step {step} {context} validation failed: {'; '.join(str(item) for item in validation_errors)}")
+        if errors:
+            raise RuntimeError(f"Step {step} {context} failed: {'; '.join(str(item) for item in errors)}")
+        if status in {"failed", "failure", "error", "incomplete"}:
+            raise RuntimeError(f"Step {step} {context} returned status '{status}'.")
+
+    def _optional(self, step: int, title: str, fn: Callable[[], None]) -> None:
+        try:
+            self._stage(step, title, "Running optional step", "#d29922")
+            fn()
+        except Exception as exc:
+            warning = f"Optional Step {step} ({title}) failed: {exc}"
+            self.optional_warnings.append(warning)
+            self._log("[Main Import] WARNING: " + warning)
+
+    def _split_gmod_input(self) -> tuple[str, str]:
+        raw = self.gmod_path.strip()
+        if not raw:
+            return "", ""
+        path = Path(raw)
+        if path.name.lower() == "studiomdl.exe":
+            return "", str(path)
+        return str(path), ""
+
+    def run(self) -> None:
+        try:
+            gmod_root, studiomdl = self._split_gmod_input()
+            self._stage(1, "Import MMD Model", str(self.pmx_path))
+            import_result = core.import_pmx_to_blender(
+                self.pmx_path,
+                self.source_dir,
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            workspace = import_result.workspace
+            self._write_marker(
+                1,
+                workspace.import_dir,
+                outputs={"blend": str(workspace.blend_path), "preflight": str(workspace.preflight_report_path)},
+                report_path=workspace.import_report_path,
+                inputs={"pmx": str(self.pmx_path), "source_dir": str(self.source_dir)},
+            )
+            self.step_results[1] = {
+                "workspace": str(workspace.root),
+                "blend": str(workspace.blend_path),
+                "report": str(workspace.import_report_path),
+                "log": str(workspace.import_log_path),
+            }
+
+            self._stage(2, "Fix Model", str(workspace.blend_path))
+            fix_result = core.fix_imported_blend(
+                workspace.blend_path,
+                clear_custom_normals=self.clear_custom_normals,
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            self._write_marker(2, fix_result.fix_dir, outputs={"blend": str(fix_result.output_blend)}, report_path=fix_result.fix_report_path)
+            self.step_results[2] = {"blend": str(fix_result.output_blend), "report": str(fix_result.fix_report_path), "dir": str(fix_result.fix_dir)}
+
+            self._stage(3, "Fix Spine Bones", str(fix_result.output_blend))
+            spine_analysis = core.analyze_spine_blend(fix_result.output_blend, progress=self._log, cancel_check=self._cancelled)
+            spine_result = core.fix_spine_blend(fix_result.output_blend, spine_analysis.plan, progress=self._log, cancel_check=self._cancelled)
+            self._require_clean_report(3, spine_result.report, "spine fix")
+            self._write_marker(3, spine_result.spine_dir, outputs={"blend": str(spine_result.output_blend)}, report_path=spine_result.report_path)
+            self.step_results[3] = {"blend": str(spine_result.output_blend), "report": str(spine_result.report_path), "dir": str(spine_result.spine_dir)}
+
+            self._stage(4, "Sort Bones", str(spine_result.output_blend))
+            sort_analysis = core.analyze_sort_bones_blend(spine_result.output_blend, progress=self._log, cancel_check=self._cancelled)
+            sort_result = core.sort_bones_blend(spine_result.output_blend, sort_analysis.plan, progress=self._log, cancel_check=self._cancelled)
+            self._require_clean_report(4, sort_result.report, "bone merge")
+            self._write_marker(4, sort_result.sort_dir, outputs={"blend": str(sort_result.output_blend)}, report_path=sort_result.report_path)
+            self.step_results[4] = {"blend": str(sort_result.output_blend), "report": str(sort_result.report_path), "dir": str(sort_result.sort_dir)}
+
+            self._stage(5, "Sort Materials", str(sort_result.output_blend))
+            material_scan = core.scan_materials_blend(sort_result.output_blend, progress=self._log, cancel_check=self._cancelled)
+            material_apply = core.apply_materials_initial_blend(sort_result.output_blend, material_scan.plan, progress=self._log, cancel_check=self._cancelled)
+            after = material_apply.report.get("after") if isinstance(material_apply.report.get("after"), dict) else {}
+            post_materials = after.get("materials", []) if isinstance(after, dict) and isinstance(after.get("materials"), list) else []
+            material_count = len(post_materials)
+            material_blend = material_apply.output_blend
+            material_report_path = material_apply.report_path
+            material_validation = {"ok": True, "material_count": material_count, "merge_required": material_count > 32}
+            if material_count > 32:
+                material_merge = core.merge_materials_blend(material_apply.output_blend, material_apply.merge_plan, progress=self._log, cancel_check=self._cancelled)
+                self._require_clean_report(5, material_merge.report, "material merge")
+                material_blend = material_merge.output_blend
+                material_report_path = material_merge.report_path
+                material_validation = {"ok": True, "material_count": material_count, "merge_required": True}
+            self._write_marker(
+                5,
+                material_apply.material_dir,
+                outputs={"blend": str(material_blend), "materials_json": str(material_apply.materials_json_path), "materials_npy": str(material_apply.materials_npy_path)},
+                report_path=material_report_path,
+                validation=material_validation,
+            )
+            self.step_results[5] = {
+                "blend": str(material_blend),
+                "report": str(material_report_path),
+                "materials_json": str(material_apply.materials_json_path),
+                "materials_npy": str(material_apply.materials_npy_path),
+                "dir": str(material_apply.material_dir),
+            }
+
+            self._stage(6, "Sort Bodygroups", str(material_blend))
+            body_analysis = core.analyze_bodygroups_blend(
+                material_blend,
+                progress=self._log,
+                cancel_check=self._cancelled,
+                vertex_limit=self.bodygroup_vertex_limit,
+            )
+            body_result = core.sort_bodygroups_blend(
+                material_blend,
+                body_analysis.plan,
+                progress=self._log,
+                cancel_check=self._cancelled,
+                vertex_limit=self.bodygroup_vertex_limit,
+            )
+            self._require_clean_report(6, body_result.report, "bodygroup sort")
+            self._write_marker(6, body_result.bodygroup_dir, outputs={"blend": str(body_result.output_blend)}, report_path=body_result.report_path)
+            self.step_results[6] = {"blend": str(body_result.output_blend), "report": str(body_result.report_path), "dir": str(body_result.bodygroup_dir)}
+
+            self._stage(7, "Sort Flexes", str(body_result.output_blend))
+            flex_analysis = core.analyze_flexes_blend(body_result.output_blend, progress=self._log, cancel_check=self._cancelled)
+            flex_result = core.sort_flexes_blend(body_result.output_blend, flex_analysis.plan, progress=self._log, cancel_check=self._cancelled)
+            self._require_clean_report(7, flex_result.report, "flex sort")
+            self._write_marker(7, flex_result.flex_dir, outputs={"blend": str(flex_result.output_blend), "flexes_json": str(flex_result.flexes_json_path)}, report_path=flex_result.report_path)
+            self.step_results[7] = {"blend": str(flex_result.output_blend), "report": str(flex_result.report_path), "dir": str(flex_result.flex_dir)}
+
+            self._stage(8, "Sort Collision", str(flex_result.output_blend))
+            collision_analysis = core.analyze_collision_blend(
+                flex_result.output_blend,
+                source_bodygroups=None,
+                quality_preset="balanced",
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            collision_result = core.sort_collision_blend(flex_result.output_blend, collision_analysis.plan, progress=self._log, cancel_check=self._cancelled)
+            self._require_clean_report(8, collision_result.report, "collision generation")
+            self._write_marker(
+                8,
+                collision_result.collision_dir,
+                outputs={"blend": str(collision_result.output_blend), "physics_smd": str(collision_result.physics_smd_path), "physics_settings": str(collision_result.physics_settings_path)},
+                report_path=collision_result.report_path,
+            )
+            self.step_results[8] = {"blend": str(collision_result.output_blend), "report": str(collision_result.report_path), "dir": str(collision_result.collision_dir)}
+
+            self._stage(9, "Export Proportion Trick", str(collision_result.output_blend))
+            proportion_result = core.run_proportion_export(collision_result.output_blend, remove_zero_weight_bones=True, progress=self._log, cancel_check=self._cancelled)
+            self._require_clean_report(9, proportion_result.report, "proportion export")
+            self._write_marker(9, proportion_result.proportion_dir, outputs={"final_dir": str(proportion_result.final_dir), "files": str(proportion_result.files_path)}, report_path=proportion_result.report_path)
+            self.step_results[9] = {"final_dir": str(proportion_result.final_dir), "report": str(proportion_result.report_path), "dir": str(proportion_result.proportion_dir)}
+
+            def run_carms() -> None:
+                carms = core.run_carms_sort(proportion_result.final_dir, progress=self._log, cancel_check=self._cancelled)
+                self._require_clean_report(10, carms.report, "c_arms sort")
+                self._write_marker(10, carms.carms_dir, outputs={"files": str(carms.files_path)}, report_path=carms.report_path)
+                self.step_results[10] = {"dir": str(carms.carms_dir), "report": str(carms.report_path), "files": str(carms.files_path)}
+
+            self._optional(10, "Sort c_arms", run_carms)
+
+            def run_vrd() -> None:
+                vrd_analysis = core.analyze_vrd(proportion_result.final_dir, progress=self._log, cancel_check=self._cancelled)
+                vrd = core.apply_vrd(proportion_result.final_dir, vrd_analysis.plan, progress=self._log, cancel_check=self._cancelled)
+                self._require_clean_report(11, vrd.report, "VRD export")
+                self._write_marker(11, vrd.vrd_dir, outputs={"vrd": str(vrd.vrd_path)}, report_path=vrd.report_path)
+                self.step_results[11] = {"dir": str(vrd.vrd_dir), "report": str(vrd.report_path), "vrd": str(vrd.vrd_path)}
+
+            self._optional(11, "Sort VRD", run_vrd)
+
+            def run_textures() -> None:
+                textures_analysis = core.analyze_textures(material_apply.materials_json_path, progress=self._log, cancel_check=self._cancelled)
+                textures = core.process_textures(material_apply.materials_json_path, textures_analysis.plan, progress=self._log, cancel_check=self._cancelled)
+                validation = textures.report.get("validation") if isinstance(textures.report.get("validation"), dict) else {"ok": True}
+                if validation.get("ok") is False:
+                    raise RuntimeError("Texture processing validation failed.")
+                self._write_marker(12, textures.texture_dir, outputs={"manifest": str(textures.manifest_path)}, report_path=textures.report_path, validation=validation)
+                self.step_results[12] = {"dir": str(textures.texture_dir), "report": str(textures.report_path), "manifest": str(textures.manifest_path)}
+
+            self._optional(12, "Param Texture", run_textures)
+
+            def run_icons() -> None:
+                icons = core.run_icons(workspace.root, icon_basename=self.model_name, progress=self._log, cancel_check=self._cancelled)
+                validation = icons.report.get("validation") if isinstance(icons.report.get("validation"), dict) else {"ok": str(icons.report.get("status") or "").lower() == "complete"}
+                if validation.get("ok") is False:
+                    raise RuntimeError("Icon generation validation failed.")
+                self._write_marker(13, icons.icon_dir, outputs={"files": str(icons.files_path), "release_icon": str(icons.icon_dir / "release_icon.png")}, report_path=icons.report_path, validation=validation)
+                self.step_results[13] = {"dir": str(icons.icon_dir), "report": str(icons.report_path), "files": str(icons.files_path)}
+
+            self._optional(13, "Sort Icons and Arts", run_icons)
+
+            self._stage(14, "Sort QC and Compile", str(proportion_result.final_dir))
+            qc_analysis = core.analyze_qc(
+                proportion_result.final_dir,
+                author="sheepylord",
+                character_category=self.character_category,
+                model_name=self.model_name,
+                gmod_root=gmod_root,
+                studiomdl_path=studiomdl,
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            qc_plan = qc_analysis.plan
+            qc_plan["author"] = "sheepylord"
+            qc_plan["character_category"] = self.character_category
+            if self.model_name:
+                qc_plan["model_name"] = self.model_name
+            qc_plan["category_readable"] = self.category_display_name
+            qc_plan["display_name"] = self.model_display_name
+            qc_plan["copy_to_gmod_addons"] = True
+            qc_plan["distribution_output_dir"] = self.distribution_output_dir
+            qc_result = core.compile_and_compose_qc(proportion_result.final_dir, qc_plan, progress=self._log, cancel_check=self._cancelled)
+            validation = qc_result.report.get("validation") if isinstance(qc_result.report.get("validation"), dict) else {}
+            if validation.get("ok") is False:
+                errors = validation.get("errors", []) if isinstance(validation.get("errors"), list) else []
+                raise RuntimeError("Step 14 QC compile failed validation: " + ("; ".join(str(item) for item in errors) or str(validation)))
+            self._write_marker(14, qc_result.qc_dir, outputs={"files": str(qc_result.files_path)}, report_path=qc_result.report_path, validation=validation or {"ok": True})
+            self.step_results[14] = {"dir": str(qc_result.qc_dir), "report": str(qc_result.report_path), "files": str(qc_result.files_path)}
+
+            self.progress.emit(100, "Import Complete", str(qc_result.report.get("distribution_output_dir") or qc_result.report.get("addon_dir") or ""), "#2ea043")
+            self.done.emit(
+                {
+                    "workspace": str(workspace.root),
+                    "steps": self.step_results,
+                    "optional_warnings": self.optional_warnings,
+                    "qc_report": qc_result.report,
+                    "qc_files": qc_result.files,
+                    "distribution_output_dir": str(qc_result.report.get("distribution_output_dir") or ""),
+                    "addon_dir": str(qc_result.report.get("addon_dir") or ""),
+                    "gmod_addon_dir": str(qc_result.report.get("gmod_addon_dir") or ""),
+                }
+            )
+        except Exception as exc:
+            step_text = f"Step {self.current_step}" if self.current_step else "an unknown step"
+            title = FULL_IMPORT_STEP_TITLES.get(self.current_step, "")
+            self.failed.emit(f"Main import failed during {step_text}{f' ({title})' if title else ''}: {exc}\n\n" + traceback.format_exc())
+
+
+class WorkspaceSizeWorker(QtCore.QThread):
+    done = QtCore.Signal(int, int)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, root: Path) -> None:
+        super().__init__()
+        self.root = Path(root)
+
+    def run(self) -> None:
+        try:
+            total_size, folder_count = self.scan_workspace_root(self.root)
+            self.done.emit(total_size, folder_count)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+    @staticmethod
+    def scan_workspace_root(root: Path) -> tuple[int, int]:
+        if not root.exists():
+            return 0, 0
+        total_size = 0
+        folder_count = 0
+        stack: list[Path] = []
+        with os.scandir(root) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        folder_count += 1
+                        stack.append(Path(entry.path))
+                    else:
+                        total_size += entry.stat(follow_symlinks=False).st_size
+                except OSError:
+                    continue
+        while stack:
+            folder = stack.pop()
+            try:
+                with os.scandir(folder) as entries:
+                    for entry in entries:
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append(Path(entry.path))
+                            else:
+                                total_size += entry.stat(follow_symlinks=False).st_size
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+        return total_size, folder_count
+
+
+class WorkspaceCleanupWorker(QtCore.QThread):
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, root: Path) -> None:
+        super().__init__()
+        self.root = Path(root)
+
+    def run(self) -> None:
+        try:
+            root = self.root.resolve()
+            if not root.exists():
+                self.done.emit({"removed": 0, "failures": []})
+                return
+            removed = 0
+            failures: list[str] = []
+            with os.scandir(root) as entries:
+                children = [entry.path for entry in entries]
+            for raw_child in children:
+                child = Path(raw_child)
+                try:
+                    resolved_child = child.resolve()
+                except Exception:
+                    resolved_child = child.absolute()
+                try:
+                    if root not in resolved_child.parents and resolved_child != root:
+                        failures.append(f"Skipped path outside workspace root: {child}")
+                        continue
+                    if child.is_dir() and not child.is_symlink():
+                        shutil.rmtree(child)
+                    else:
+                        child.unlink(missing_ok=True)
+                    removed += 1
+                except Exception as exc:
+                    failures.append(f"{child}: {exc}")
+            self.done.emit({"removed": removed, "failures": failures})
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class ReleaseAnalyzeWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, input_path: str, fields: dict[str, str]) -> None:
+        super().__init__()
+        self.input_path = input_path
+        self.fields = fields
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            result = core.analyze_release_description(
+                Path(self.input_path),
+                character_name=self.fields.get("character_name", ""),
+                work_title=self.fields.get("work_title", ""),
+                author=self.fields.get("author", ""),
+                model_creator=self.fields.get("model_creator", ""),
+                quote_text=self.fields.get("quote_text", ""),
+                quote_original_text=self.fields.get("quote_original_text", ""),
+                quote_language=self.fields.get("quote_language", ""),
+                quote_author=self.fields.get("quote_author", ""),
+                image_url=self.fields.get("image_url", ""),
+                rtx_link=self.fields.get("rtx_link", ""),
+                openai_model=self.fields.get("openai_model", ""),
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            self.done.emit(
+                {
+                    "input": str(result.input_path),
+                    "release_dir": str(result.release_dir),
+                    "analysis": str(result.analysis_path),
+                    "plan": str(result.plan_path),
+                    "report": str(result.report_path),
+                    "files": str(result.files_path),
+                    "translations": str(result.translations_path),
+                    "template": str(result.template_path),
+                    "log": str(result.log_path),
+                    "analysis_data": result.analysis,
+                    "plan_data": result.plan,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class ReleaseGenerateWorker(QtCore.QThread):
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, input_path: str, plan: dict[str, object], openai_key: str = "", deepl_key: str = "") -> None:
+        super().__init__()
+        self.input_path = input_path
+        self.plan = plan
+        self.openai_key = openai_key
+        self.deepl_key = deepl_key
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def _log(self, message: str) -> None:
+        self.log.emit(message)
+
+    def run(self) -> None:
+        try:
+            result = core.generate_release_description(
+                Path(self.input_path),
+                self.plan,
+                openai_api_key=self.openai_key,
+                deepl_api_key=self.deepl_key,
+                progress=self._log,
+                cancel_check=self._cancelled,
+            )
+            self.done.emit(
+                {
+                    "input": str(result.input_path),
+                    "release_dir": str(result.release_dir),
+                    "analysis": str(result.analysis_path),
+                    "plan": str(result.plan_path),
+                    "report": str(result.report_path),
+                    "files": str(result.files_path),
+                    "translations": str(result.translations_path),
+                    "template": str(result.template_path),
+                    "log": str(result.log_path),
+                    "report_data": result.report,
+                    "files_data": result.files,
+                    "plan_data": result.plan,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class ImporterWindow(QtWidgets.QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.settings_store = QtCore.QSettings("MMDCharacterImporter", "PortingTool")
+        self.language_code = str(self.settings_store.value("ui_language", "en_us", str) or "en_us")
+        self.i18n_fallback = self.load_i18n_catalog("en_us")
+        self.i18n_catalog = self.load_i18n_catalog(self.language_code)
+        self._i18n_exact_map: dict[str, str] = {}
+        self._i18n_prefix_map: list[tuple[str, str]] = []
+        self.worker: QtCore.QThread | None = None
+        self.current_analysis: core.PmxAnalysis | None = None
+        self.current_workspace: core.Workspace | None = None
+        self.current_spine_analysis: dict[str, object] | None = None
+        self.current_spine_plan: dict[str, object] | None = None
+        self.current_sort_analysis: dict[str, object] | None = None
+        self.current_sort_plan: dict[str, object] | None = None
+        self.current_material_scan: dict[str, object] | None = None
+        self.current_material_plan: dict[str, object] | None = None
+        self.current_material_merge_plan: dict[str, object] | None = None
+        self.current_bodygroup_analysis: dict[str, object] | None = None
+        self.current_bodygroup_plan: dict[str, object] | None = None
+        self.current_flex_analysis: dict[str, object] | None = None
+        self.current_flex_plan: dict[str, object] | None = None
+        self.current_collision_bones: dict[str, object] | None = None
+        self.current_collision_sources: dict[str, object] | None = None
+        self.current_collision_analysis: dict[str, object] | None = None
+        self.current_collision_plan: dict[str, object] | None = None
+        self.current_vrd_analysis: dict[str, object] | None = None
+        self.current_vrd_plan: dict[str, object] | None = None
+        self.current_vrd_preview: dict[str, object] | None = None
+        self.current_texture_analysis: dict[str, object] | None = None
+        self.current_texture_plan: dict[str, object] | None = None
+        self.current_icon_analysis: dict[str, object] | None = None
+        self.current_icon_plan: dict[str, object] | None = None
+        self.current_icon_files: dict[str, object] | None = None
+        self.current_qc_analysis: dict[str, object] | None = None
+        self.current_qc_plan: dict[str, object] | None = None
+        self.current_qc_files: dict[str, object] | None = None
+        self.current_release_analysis: dict[str, object] | None = None
+        self.current_release_plan: dict[str, object] | None = None
+        self.current_release_files: dict[str, object] | None = None
+        self.current_main_analysis: core.PmxAnalysis | None = None
+        self.current_main_workspace: core.Workspace | None = None
+        self.main_pmx_paths: list[Path] = []
+        self.main_output_files: dict[str, object] | None = None
+        self.workspace_size_worker: WorkspaceSizeWorker | None = None
+        self.workspace_cleanup_worker: WorkspaceCleanupWorker | None = None
+        self.workspace_cache_size_bytes = 0
+        self.workspace_cache_folder_count = 0
+        self.category_suggestion_sources: list[str] = []
+        self.category_scan_roots: list[Path] = []
+        self.known_category_pairs: list[dict[str, object]] = self.scan_known_category_suggestions()
+        self.category_completers: list[QtWidgets.QCompleter] = []
+        self.workflow_specs: dict[int, dict[str, object]] = {}
+        self.workflow_status_labels: dict[int, QtWidgets.QLabel] = {}
+        self.workflow_jump_buttons: dict[int, QtWidgets.QPushButton] = {}
+        self.workflow_states: dict[int, str] = {}
+        self.advanced_steps_visible = False
+        self.bodygroup_sorted_blend_path: str = ""
+        self.bodygroup_manual_edit_blend_path: str = ""
+        self.bodygroup_scale_preset: str = "factor"
+        self.sort_manual_merge_blend_path: str = ""
+        self.sort_apply_input_blend_path: str = ""
+        self.flex_sorted_blend_path: str = ""
+        self.collision_sorted_blend_path: str = ""
+        self.proportion_export_dir: str = ""
+        self.carms_output_dir: str = ""
+        self.vrd_output_dir: str = ""
+        self.texture_output_dir: str = ""
+        self.icon_output_dir: str = ""
+        self.qc_output_dir: str = ""
+        self.release_output_dir: str = ""
+        self.material_sorted_blend_path: str = ""
+        self._updating_spine_table = False
+        self._updating_sort_table = False
+        self._updating_material_table = False
+        self._updating_material_merge_table = False
+        self._hover_material_uid = ""
+        self._hover_merge_material_uid = ""
+        self._hover_bodygroup_uid = ""
+        self._hover_flex_uid = ""
+        self._hover_collision_bone_uid = ""
+        self._hover_collision_source_bodygroup = ""
+        self._hover_collision_uid = ""
+        self._hover_vrd_uid = ""
+        self._hover_texture_uid = ""
+        self._hover_icon_file = ""
+        self._hover_qc_bone_uid = ""
+        self._updating_bodygroup_table = False
+        self._updating_flex_table = False
+        self._updating_collision_bone_table = False
+        self._updating_collision_source_table = False
+        self._updating_collision_table = False
+        self._updating_release_table = False
+        self._updating_vrd_table = False
+        self._updating_vrd_intensity_controls = False
+        self._updating_texture_table = False
+        self._updating_qc_table = False
+        self.pmx_paths: list[Path] = []
+
+        self.setWindowTitle(self._t("app.title", "MMD Character Importer"))
+        icon_path = importer_icon_path()
+        if icon_path:
+            self.setWindowIcon(QtGui.QIcon(str(icon_path)))
+        self.apply_startup_geometry()
+        self.tabs = QtWidgets.QTabWidget()
+        self.tabs.currentChanged.connect(lambda _index: self.refresh_workflow_statuses() if self.workflow_specs else None)
+        self.setCentralWidget(self.tabs)
+        self._build_main_tab()
+        self._build_import_tab()
+        self._build_fix_tab()
+        self._build_spine_tab()
+        self._build_sort_bones_tab()
+        self._build_sort_materials_tab()
+        self._build_sort_bodygroups_tab()
+        self._build_sort_flexes_tab()
+        self._build_sort_collision_tab()
+        self._build_proportion_tab()
+        self._build_carms_tab()
+        self._build_vrd_tab()
+        self._build_texture_tab()
+        self._build_icons_tab()
+        self._build_qc_tab()
+        self._build_release_tab()
+        self._build_future_tabs()
+        self._install_workflow_guidance()
+        self._wrap_tabs_for_small_screens()
+        self._apply_style()
+        self._load_settings()
+        self.apply_i18n()
+        self.set_advanced_steps_visible(False)
+        QtCore.QTimer.singleShot(0, self.populate_pmx_files)
+        QtCore.QTimer.singleShot(0, self.populate_main_pmx_files)
+        QtCore.QTimer.singleShot(0, self.refresh_workflow_statuses)
+        QtCore.QTimer.singleShot(0, self.refresh_workspace_cache_size)
+        self.statusBar().showMessage(self._t("app.status.ready", "Ready"))
+
+    def apply_startup_geometry(self) -> None:
+        app = QtWidgets.QApplication.instance()
+        screen = app.primaryScreen() if app is not None else None
+        if not screen:
+            self.resize(1180, 720)
+            self.setMinimumSize(900, 580)
+            return
+        available = screen.availableGeometry()
+        target_width = min(1180, max(900, available.width() - 60))
+        target_height = min(720, max(580, available.height() - 90))
+        self.resize(target_width, target_height)
+        self.setMinimumSize(min(900, target_width), min(580, target_height))
+        self.move(
+            available.x() + max(0, (available.width() - target_width) // 2),
+            available.y() + max(0, (available.height() - target_height) // 2),
+        )
+
+    def scan_known_category_suggestions(self) -> list[dict[str, object]]:
+        configured_categories, scan_roots, loaded_files = load_category_suggestion_config()
+        self.category_suggestion_sources = [str(path) for path in loaded_files]
+        self.category_scan_roots = scan_roots
+        counts: dict[tuple[str, str], int] = {}
+        model_re = re.compile(r'models[/\\]+sheepylord[/\\]+([^/"\\]+)[/\\]', re.IGNORECASE)
+        category_re = re.compile(r'local\s+Category\s*=\s*"([^"]+)"', re.IGNORECASE)
+
+        def iter_lua_autorun_files(root: Path, max_depth: int = 6, max_seconds: float = 4.0):
+            started = time.monotonic()
+            stack: list[tuple[Path, int]] = [(root, 0)]
+            while stack and time.monotonic() - started <= max_seconds:
+                folder, depth = stack.pop()
+                try:
+                    entries = list(os.scandir(folder))
+                except Exception:
+                    continue
+                if folder.name.lower() == "autorun" and folder.parent.name.lower() == "lua":
+                    for entry in entries:
+                        if entry.is_file() and entry.name.lower().endswith(".lua"):
+                            yield Path(entry.path)
+                    continue
+                if depth >= max_depth:
+                    continue
+                for entry in reversed(entries):
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    name = entry.name.lower()
+                    if name in {"materials", "models", "sound", "resource", "particles", "maps", "data", ".git", "__pycache__"}:
+                        continue
+                    stack.append((Path(entry.path), depth + 1))
+
+        for root in scan_roots:
+            if root is None or not root.exists() or not root.is_dir():
+                continue
+            for lua_path in iter_lua_autorun_files(root):
+                try:
+                    text = lua_path.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    continue
+                display_match = category_re.search(text)
+                display = display_match.group(1).strip() if display_match else ""
+                internals = {
+                    match.group(1).strip()
+                    for match in model_re.finditer(text)
+                    if re.fullmatch(r"[A-Za-z_]+", match.group(1).strip() or "")
+                }
+                for internal in internals:
+                    readable = (
+                        configured_categories.get(internal)
+                        or sanitize_category_display_name_text(display)
+                        or self.qc_display_from_internal(internal, internal)
+                    )
+                    counts[(internal, readable)] = counts.get((internal, readable), 0) + 1
+        for internal, display in configured_categories.items():
+            counts[(internal, display)] = max(1, counts.get((internal, display), 0))
+        best_by_internal: dict[str, dict[str, object]] = {}
+        for (internal, display), count in counts.items():
+            configured_display = configured_categories.get(internal)
+            if configured_display and display != configured_display:
+                continue
+            current = best_by_internal.get(internal)
+            if current is None or count > int(current.get("count", 0)):
+                best_by_internal[internal] = {"internal": internal, "display": display, "count": count}
+        return sorted(
+            best_by_internal.values(),
+            key=lambda item: (str(item.get("display") or "").casefold(), str(item.get("internal") or "").casefold()),
+        )
+
+    def known_category_display_for_internal(self, internal: str) -> str:
+        key = str(internal or "").casefold()
+        for item in self.known_category_pairs:
+            if str(item.get("internal") or "").casefold() == key:
+                return str(item.get("display") or "")
+        return ""
+
+    def category_completion_text(self, item: dict[str, object], display_first: bool = False) -> str:
+        internal = str(item.get("internal") or "")
+        display = str(item.get("display") or "")
+        count = int(item.get("count", 0) or 0)
+        suffix = f" ({count})" if count > 1 else ""
+        if display_first:
+            return f"{display}{CATEGORY_COMPLETER_SEPARATOR}{internal}{suffix}"
+        return f"{internal}{CATEGORY_COMPLETER_SEPARATOR}{display}{suffix}"
+
+    def install_category_completers(self, internal_edit: QtWidgets.QLineEdit, display_edit: QtWidgets.QLineEdit) -> None:
+        if not self.known_category_pairs:
+            return
+        internal_items = [self.category_completion_text(item, display_first=False) for item in self.known_category_pairs]
+        display_items = [self.category_completion_text(item, display_first=True) for item in self.known_category_pairs]
+
+        internal_completer = QtWidgets.QCompleter(internal_items, internal_edit)
+        display_completer = QtWidgets.QCompleter(display_items, display_edit)
+        for completer in (internal_completer, display_completer):
+            completer.setCaseSensitivity(QtCore.Qt.CaseSensitivity.CaseInsensitive)
+            completer.setFilterMode(QtCore.Qt.MatchFlag.MatchContains)
+            completer.setCompletionMode(QtWidgets.QCompleter.CompletionMode.PopupCompletion)
+
+        normalizing_completion = {"active": False}
+
+        def parse_completion_pair(text: str, display_first: bool = False) -> tuple[str, str] | None:
+            parts = text.split(CATEGORY_COMPLETER_SEPARATOR, 1)
+            main_text = parts[0].strip()
+            other_text = parts[1].strip() if len(parts) > 1 else ""
+            if len(parts) > 1:
+                if display_first:
+                    display_value = sanitize_category_display_name_text(main_text).strip()
+                    internal_value = re.sub(r"\s+\(\d+\)$", "", other_text).strip()
+                else:
+                    internal_value = main_text
+                    display_value = sanitize_category_display_name_text(re.sub(r"\s+\(\d+\)$", "", other_text)).strip()
+                if internal_value and display_value:
+                    return internal_value, display_value
+
+            # Qt can insert the completer's visible label before the activated
+            # signal runs. If another validator has already stripped punctuation,
+            # recover from strings like "Arknights Endfield arknight_endfield".
+            collapsed = re.sub(r"\s+", " ", sanitize_category_display_name_text(text)).strip().casefold()
+            raw = str(text or "").strip().casefold()
+            for item in self.known_category_pairs:
+                internal = str(item.get("internal") or "").strip()
+                display = sanitize_category_display_name_text(item.get("display") or "").strip()
+                if not internal or not display:
+                    continue
+                internal_cf = internal.casefold()
+                display_cf = display.casefold()
+                if display_first:
+                    if collapsed == f"{display_cf} {internal_cf}" or (
+                        collapsed.startswith(display_cf + " ") and internal_cf in collapsed[len(display_cf) :].split()
+                    ):
+                        return internal, display
+                elif raw.startswith(internal_cf) and display_cf in raw:
+                    return internal, display
+            return None
+
+        def set_category_pair(internal_value: str, display_value: str) -> None:
+            internal_value = sanitize_internal_identifier_text(internal_value).strip()
+            if not internal_value:
+                return
+            normalizing_completion["active"] = True
+            internal_blocker = QtCore.QSignalBlocker(internal_edit)
+            display_blocker = QtCore.QSignalBlocker(display_edit)
+            try:
+                internal_edit.setText(internal_value)
+                if display_value:
+                    display_edit.setText(sanitize_category_display_name_text(display_value).strip())
+            finally:
+                del internal_blocker
+                del display_blocker
+                normalizing_completion["active"] = False
+            self.update_main_display_placeholders()
+            self.update_qc_display_placeholders()
+            self.save_settings()
+
+        def apply_pair(text: str, display_first: bool = False) -> None:
+            pair = parse_completion_pair(text, display_first)
+            if pair:
+                set_category_pair(pair[0], pair[1])
+
+        def normalize_inserted_completion(text: str, display_first: bool = False) -> None:
+            if normalizing_completion["active"]:
+                return
+            pair = parse_completion_pair(text, display_first)
+            if not pair:
+                return
+            internal_value, display_value = pair
+            if internal_edit.text().strip() == internal_value and display_edit.text().strip() == display_value:
+                return
+            set_category_pair(internal_value, display_value)
+
+        try:
+            internal_completer.activated[str].connect(lambda text: apply_pair(str(text), False))
+            display_completer.activated[str].connect(lambda text: apply_pair(str(text), True))
+        except Exception:
+            internal_completer.activated.connect(lambda text: apply_pair(str(text), False))
+            display_completer.activated.connect(lambda text: apply_pair(str(text), True))
+        internal_edit.textChanged.connect(lambda text: normalize_inserted_completion(str(text), False))
+        display_edit.textChanged.connect(lambda text: normalize_inserted_completion(str(text), True))
+        internal_edit.setCompleter(internal_completer)
+        display_edit.setCompleter(display_completer)
+        source_text = ", ".join(self.category_suggestion_sources) if self.category_suggestion_sources else "built-in defaults"
+        scan_text = ", ".join(str(path) for path in self.category_scan_roots) if self.category_scan_roots else "none"
+        internal_edit.setToolTip(
+            (internal_edit.toolTip() + "\n" if internal_edit.toolTip() else "")
+            + f"Known category suggestions loaded from {source_text}; scan roots: {scan_text} ({len(self.known_category_pairs):,} categories)."
+        )
+        display_edit.setToolTip(
+            (display_edit.toolTip() + "\n" if display_edit.toolTip() else "")
+            + "Selecting a known category fills both the internal and display category names."
+        )
+        self.category_completers.extend([internal_completer, display_completer])
+
+    def install_internal_identifier_filter(self, edit: QtWidgets.QLineEdit) -> None:
+        validator = QtGui.QRegularExpressionValidator(QtCore.QRegularExpression(r"[A-Za-z_]*"), edit)
+        edit.setValidator(validator)
+
+        def clean(value: str) -> None:
+            filtered = sanitize_internal_identifier_text(value)
+            if filtered == value:
+                return
+            cursor = edit.cursorPosition()
+            blocker = QtCore.QSignalBlocker(edit)
+            try:
+                edit.setText(filtered)
+                edit.setCursorPosition(max(0, min(len(filtered), cursor - (len(value) - len(filtered)))))
+            finally:
+                del blocker
+
+        edit.textChanged.connect(clean)
+
+    def install_display_name_filter(self, edit: QtWidgets.QLineEdit) -> None:
+        validator = QtGui.QRegularExpressionValidator(QtCore.QRegularExpression(r"[A-Za-z_ ]*"), edit)
+        edit.setValidator(validator)
+
+        def clean(value: str) -> None:
+            filtered = sanitize_display_name_text(value)
+            if filtered == value:
+                return
+            cursor = edit.cursorPosition()
+            blocker = QtCore.QSignalBlocker(edit)
+            try:
+                edit.setText(filtered)
+                edit.setCursorPosition(max(0, min(len(filtered), cursor - (len(value) - len(filtered)))))
+            finally:
+                del blocker
+
+        edit.textChanged.connect(clean)
+
+    def install_category_display_name_filter(self, edit: QtWidgets.QLineEdit) -> None:
+        validator = QtGui.QRegularExpressionValidator(QtCore.QRegularExpression(r"[\x20-\x7E]*"), edit)
+        edit.setValidator(validator)
+
+        def clean(value: str) -> None:
+            filtered = sanitize_category_display_name_text(value)
+            if filtered == value:
+                return
+            cursor = edit.cursorPosition()
+            blocker = QtCore.QSignalBlocker(edit)
+            try:
+                edit.setText(filtered)
+                edit.setCursorPosition(max(0, min(len(filtered), cursor - (len(value) - len(filtered)))))
+            finally:
+                del blocker
+
+        edit.textChanged.connect(clean)
+
+    def load_i18n_catalog(self, code: str) -> dict[str, object]:
+        candidate = I18N_DIR / f"{code}.json"
+        if not candidate.exists():
+            candidate = I18N_DIR / "en_us.json"
+        try:
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _lookup_i18n(self, catalog: dict[str, object], key: str) -> str | None:
+        node: object = catalog
+        parts = key.split(".")
+        for index, part in enumerate(parts):
+            if not isinstance(node, dict):
+                return None
+            remaining_key = ".".join(parts[index:])
+            if remaining_key in node:
+                value = node[remaining_key]
+                return value if isinstance(value, str) else None
+            if part not in node:
+                return None
+            node = node[part]
+        return node if isinstance(node, str) else None
+
+    def _t(self, key: str, default: str = "", **kwargs: object) -> str:
+        text = self._lookup_i18n(self.i18n_catalog, key) or self._lookup_i18n(self.i18n_fallback, key) or default or key
+        if kwargs:
+            try:
+                return text.format(**kwargs)
+            except Exception:
+                return text
+        return text
+
+    def _flatten_i18n_strings(self, catalog: dict[str, object], prefix: str = "") -> dict[str, str]:
+        flattened: dict[str, str] = {}
+        for key, value in catalog.items():
+            full_key = f"{prefix}.{key}" if prefix else str(key)
+            if isinstance(value, str):
+                flattened[full_key] = value
+            elif isinstance(value, dict):
+                flattened.update(self._flatten_i18n_strings(value, full_key))
+        return flattened
+
+    def rebuild_i18n_runtime_maps(self) -> None:
+        fallback = self._flatten_i18n_strings(self.i18n_fallback)
+        current = self._flatten_i18n_strings(self.i18n_catalog)
+        exact: dict[str, str] = {}
+        prefix_pairs: list[tuple[str, str]] = []
+        for key, source in fallback.items():
+            translated = current.get(key, source)
+            if not source or translated == source:
+                continue
+            exact[source] = translated
+            if "{" not in source and "}" not in source and len(source) >= 4:
+                prefix_pairs.append((source, translated))
+        self._i18n_exact_map = exact
+        self._i18n_prefix_map = sorted(prefix_pairs, key=lambda pair: len(pair[0]), reverse=True)
+
+    def translate_static_text(self, text: str) -> str:
+        if not text:
+            return text
+        return self._i18n_exact_map.get(text, text)
+
+    def translate_runtime_text(self, text: str) -> str:
+        if not text or self.language_code == "en_us":
+            return text
+        exact = self._i18n_exact_map.get(text)
+        if exact:
+            return exact
+        for source, translated in self._i18n_prefix_map:
+            if text.startswith(source):
+                return translated + text[len(source) :]
+        return text
+
+    def set_language(self, code: str) -> None:
+        valid_codes = {item[0] for item in LANGUAGE_OPTIONS}
+        self.language_code = code if code in valid_codes else "en_us"
+        self.i18n_catalog = self.load_i18n_catalog(self.language_code)
+        self.settings_store.setValue("ui_language", self.language_code)
+        self.settings_store.sync()
+        self.apply_i18n()
+        self.statusBar().showMessage(self._t("app.status.ready", "Ready"))
+
+    def on_language_changed(self, _index: int) -> None:
+        combo = getattr(self, "main_language_combo", None)
+        if isinstance(combo, QtWidgets.QComboBox):
+            code = combo.currentData()
+            if code:
+                self.set_language(str(code))
+
+    def _set_path_row_text(self, row: PathRow, label: str, hint: str = "") -> None:
+        row.label.setText(label)
+        row.hint.setText(hint)
+        row.badge.setText(self._t("common.required", "Required") if row.required else self._t("common.optional", "Optional"))
+        row.button.setText(self._t("common.browse", "Browse"))
+
+    def _is_static_i18n_source(self, text: str) -> bool:
+        if not text:
+            return False
+        stripped = text.strip()
+        if not stripped or stripped.startswith("<"):
+            return False
+        if len(stripped) > 220:
+            return False
+        if re.match(r"^[A-Za-z]:[\\/]", stripped) or stripped.startswith("\\\\"):
+            return False
+        if "/" in stripped and re.search(r"\.(blend|json|txt|log|smd|vta|png|jpg|vtf|vmt|npy)\b", stripped, re.IGNORECASE):
+            return False
+        return True
+
+    def _widget_source_text(self, widget: QtCore.QObject, prop_name: str, current_text: str) -> str | None:
+        source = widget.property(prop_name)
+        if isinstance(source, str) and source:
+            return source
+        if not self._is_static_i18n_source(current_text):
+            return None
+        widget.setProperty(prop_name, current_text)
+        return current_text
+
+    def apply_global_i18n(self) -> None:
+        for index in range(self.tabs.count()):
+            source = self.tabs.tabBar().tabData(index)
+            if not isinstance(source, str) or not source:
+                source = self.tabs.tabText(index)
+                if self._is_static_i18n_source(source):
+                    self.tabs.tabBar().setTabData(index, source)
+            if isinstance(source, str) and source:
+                self.tabs.setTabText(index, self.translate_static_text(source))
+        for widget in self.findChildren(QtWidgets.QWidget):
+            if isinstance(widget, QtWidgets.QTabBar):
+                continue
+            if isinstance(widget, QtWidgets.QAbstractButton):
+                source = self._widget_source_text(widget, "_mci_i18n_text", widget.text())
+                if source:
+                    widget.setText(self.translate_static_text(source))
+            elif isinstance(widget, QtWidgets.QGroupBox):
+                source = self._widget_source_text(widget, "_mci_i18n_title", widget.title())
+                if source:
+                    widget.setTitle(self.translate_static_text(source))
+            elif isinstance(widget, QtWidgets.QLabel):
+                source = self._widget_source_text(widget, "_mci_i18n_text", widget.text())
+                if source:
+                    widget.setText(self.translate_static_text(source))
+            if isinstance(widget, QtWidgets.QLineEdit):
+                placeholder = widget.placeholderText()
+                source = self._widget_source_text(widget, "_mci_i18n_placeholder", placeholder)
+                if source:
+                    widget.setPlaceholderText(self.translate_static_text(source))
+            if isinstance(widget, QtWidgets.QTableWidget):
+                for column in range(widget.columnCount()):
+                    item = widget.horizontalHeaderItem(column)
+                    if item is None:
+                        continue
+                    source = item.data(QtCore.Qt.ItemDataRole.UserRole + 50)
+                    if not isinstance(source, str) or not source:
+                        source = item.text()
+                        if self._is_static_i18n_source(source):
+                            item.setData(QtCore.Qt.ItemDataRole.UserRole + 50, source)
+                    if isinstance(source, str) and source:
+                        item.setText(self.translate_static_text(source))
+
+    def apply_workflow_i18n(self) -> None:
+        step_keys = {
+            1: "01_import",
+            2: "02_fix_model",
+            3: "03_spine",
+            4: "04_bones",
+            5: "05_materials",
+            6: "06_bodygroups",
+            7: "07_flexes",
+            8: "08_collision",
+            9: "09_proportion",
+            10: "10_carms",
+            11: "11_vrd",
+            12: "12_textures",
+            13: "13_icons",
+            14: "14_qc",
+            15: "15_release",
+        }
+        for step, step_key in step_keys.items():
+            index = self.step_to_tab_index(step)
+            if 0 <= index < self.tabs.count():
+                self.tabs.setTabText(index, self._t(f"tabs.step_{step:02d}", self.tabs.tabText(index)))
+            spec = self.workflow_specs.get(step, {})
+            if spec:
+                spec["title"] = self._t(f"steps.{step_key}.title", str(spec.get("title", "")))
+        self.refresh_workflow_statuses()
+
+    def apply_i18n(self) -> None:
+        self.rebuild_i18n_runtime_maps()
+        self.apply_global_i18n()
+        self.apply_preview_i18n()
+        self.apply_main_i18n()
+        self.apply_workflow_i18n()
+
+    def apply_preview_i18n(self) -> None:
+        texts = {
+            "material_empty": self._t("preview.material_empty", "Scan a blend to preview material regions."),
+            "material_opengl_unavailable": self._t("preview.material_opengl_unavailable", "OpenGL material preview is unavailable."),
+            "material_textured_disabled": self._t("preview.material_textured_disabled", "Textured preview disabled; using solid material colors."),
+        }
+        for widget in self.findChildren(QtWidgets.QWidget):
+            setter = getattr(widget, "set_i18n_texts", None)
+            if callable(setter):
+                try:
+                    setter(texts)
+                except Exception:
+                    pass
+
+    def apply_main_i18n(self) -> None:
+        self.setWindowTitle(self._t("app.title", "MMD Character Importer"))
+        if hasattr(self, "main_tab"):
+            index = self.tabs.indexOf(self.main_tab)
+            if index >= 0:
+                self.tabs.setTabText(index, self._t("tabs.main", "Main Import to GMod"))
+        combo = getattr(self, "main_language_combo", None)
+        if isinstance(combo, QtWidgets.QComboBox):
+            language_index = combo.findData(self.language_code)
+            if language_index >= 0:
+                blocker = QtCore.QSignalBlocker(combo)
+                try:
+                    combo.setCurrentIndex(language_index)
+                finally:
+                    del blocker
+        label = getattr(self, "main_language_label", None)
+        if isinstance(label, QtWidgets.QLabel):
+            label.setText(self._t("main.language", "Language"))
+        intro = getattr(self, "main_intro_label", None)
+        if isinstance(intro, QtWidgets.QLabel):
+            intro.setText(
+                self._t(
+                    "main.intro",
+                    "One-click import runs the default workflow from PMX import through QC compile and addon packaging. "
+                    "Advanced tabs remain available for manual correction when a step needs attention.",
+                )
+            )
+        if hasattr(self, "main_source_row"):
+            self._set_path_row_text(
+                self.main_source_row,
+                self._t("main.mmd_folder", "MMD model folder"),
+                self._t("main.mmd_folder_hint", "Folder containing the selected PMX and texture files"),
+            )
+        if hasattr(self, "main_gmod_row"):
+            self._set_path_row_text(
+                self.main_gmod_row,
+                self._t("main.gmod_studiomdl", "GMod / StudioMDL"),
+                self._t("main.gmod_hint", "Browse to studiomdl.exe or the Garry's Mod install folder"),
+            )
+        if hasattr(self, "main_pmx_label"):
+            self.main_pmx_label.setText(self._t("main.pmx_model", "PMX model"))
+        if hasattr(self, "main_pmx_badge"):
+            self.main_pmx_badge.setText(self._t("common.required", "Required"))
+        if hasattr(self, "main_pmx_hint"):
+            self.main_pmx_hint.setText(self._t("main.pmx_model_hint", "Defaults to the largest PMX in the selected folder"))
+        if hasattr(self, "main_refresh_pmx_button"):
+            self.main_refresh_pmx_button.setText(self._t("common.refresh", "Refresh"))
+        for key, widget in getattr(self, "main_form_labels", {}).items():
+            if isinstance(widget, QtWidgets.QLabel):
+                widget.setText(
+                    {
+                        "workspace": self._t("main.workspace", "Workspace"),
+                        "category_internal": self._t("main.category_internal", "Category internal name"),
+                        "category_display": self._t("main.category_display", "Category display name"),
+                        "character_internal": self._t("main.character_internal", "Character internal name"),
+                        "character_display": self._t("main.character_display", "Character display name"),
+                        "rtx_vertex_limit": self._t("main.rtx_vertex_limit_label", "RTX vertex limit"),
+                        "clear_custom_normals": self._t("main.clear_custom_normals_label", "Custom normals"),
+                    }.get(key, widget.text())
+                )
+        if hasattr(self, "main_category_edit"):
+            self.main_category_edit.setPlaceholderText(self._t("main.category_internal_placeholder", "English letters and _ only"))
+        if hasattr(self, "main_category_display_edit"):
+            self.main_category_display_edit.setPlaceholderText(self._t("main.category_display_placeholder", "Auto: Sheepy Lord"))
+        if hasattr(self, "main_model_name_edit"):
+            self.main_model_name_edit.setPlaceholderText(self._t("main.character_internal_placeholder", "Optional internal character name, English letters and _ only"))
+        if hasattr(self, "main_model_display_edit"):
+            self.main_model_display_edit.setPlaceholderText(self._t("main.character_display_placeholder", "Auto from internal character name"))
+        if hasattr(self, "main_category_display_edit"):
+            self.update_main_display_placeholders()
+        if hasattr(self, "main_preflight_group"):
+            self.main_preflight_group.setTitle(self._t("main.preflight", "Preflight"))
+        if hasattr(self, "main_preview_group"):
+            self.main_preview_group.setTitle(self._t("main.model_preview", "Model Preview"))
+        if hasattr(self, "main_progress_group"):
+            self.main_progress_group.setTitle(self._t("common.progress", "Progress"))
+        if hasattr(self, "main_output_group"):
+            self.main_output_group.setTitle(self._t("common.outputs", "Outputs"))
+        if hasattr(self, "main_log_group"):
+            self.main_log_group.setTitle(self._t("common.log", "Log"))
+        button_texts = {
+            "main_detect_gmod_button": self._t("main.detect_gmod", "1. Detect GMod"),
+            "main_preflight_button": self._t("main.run_preflight", "2. Run Preflight"),
+            "main_import_button": self._t("main.import_to_gmod", "3. Import Model into GMod"),
+            "main_cancel_button": self._t("common.cancel", "Cancel"),
+            "main_open_output_button": self._t("main.open_output_folder", "Open Output Folder"),
+            "main_reload_preview_button": self._t("preview.reload", "Reload Preview"),
+            "main_reset_preview_button": self._t("preview.reset_view", "Reset View"),
+            "main_copy_log_button": self._t("common.copy_log", "Copy Log"),
+            "main_clear_workspace_cache_button": self._t("main.clear_workspace_cache", "Clear All Cache and Intermediate Files"),
+        }
+        for attr, text in button_texts.items():
+            widget = getattr(self, attr, None)
+            if isinstance(widget, QtWidgets.QAbstractButton):
+                widget.setText(text)
+        for attr, text in {
+            "main_preview_bones_check": self._t("preview.bones", "Bones"),
+            "main_preview_bone_names_check": self._t("preview.bone_names", "Bone Names"),
+            "main_preview_wireframe_check": self._t("preview.wireframe", "Wireframe"),
+            "main_rtx_bodygroup_limit_check": self._t("main.rtx_bodygroup_limit", "Enforce 32,767 vertex bodygroup limit (RTX Remix)"),
+            "main_clear_custom_normals_check": self._t("main.clear_custom_normals", "Clear custom split normals in Step 2"),
+        }.items():
+            widget = getattr(self, attr, None)
+            if isinstance(widget, QtWidgets.QAbstractButton):
+                widget.setText(text)
+        if hasattr(self, "main_clear_custom_normals_check"):
+            self.main_clear_custom_normals_check.setToolTip(
+                self._t("main.clear_custom_normals_tip", "Default on. Disable to preserve imported custom split normals during the Step 2 model fix.")
+            )
+        if hasattr(self, "main_clear_workspace_cache_button"):
+            self.main_clear_workspace_cache_button.setToolTip(
+                self._t(
+                    "main.clear_workspace_cache_tip",
+                    "Delete all generated folders and loose files inside the MMD Character Importer workspaces folder.",
+                )
+            )
+        self.update_workspace_cache_size_label()
+        if hasattr(self, "main_outputs_toggle"):
+            self.main_outputs_toggle.setText(
+                self._t("common.hide_outputs", "Hide Outputs")
+                if self.main_outputs_toggle.isChecked()
+                else self._t("common.show_outputs", "Show Outputs")
+            )
+        if hasattr(self, "main_log_toggle"):
+            self.main_log_toggle.setText(
+                self._t("common.hide_log", "Hide Log") if self.main_log_toggle.isChecked() else self._t("common.show_log", "Show Log")
+            )
+        if hasattr(self, "main_files_table"):
+            self.main_files_table.setHorizontalHeaderLabels(
+                [
+                    self._t("common.name", "Name"),
+                    self._t("common.type", "Type"),
+                    self._t("common.size", "Size"),
+                    self._t("common.stage", "Stage"),
+                    self._t("common.path", "Path"),
+                ]
+            )
+        advanced_button = getattr(self, "main_advanced_steps_button", None)
+        if isinstance(advanced_button, QtWidgets.QPushButton):
+            advanced_button.setText(
+                self._t("app.advanced.hide", "Hide advanced porting steps")
+                if self.advanced_steps_visible
+                else self._t("app.advanced.show", "Show advanced porting steps")
+            )
+
+    def _make_workflow_specs(self) -> dict[int, dict[str, object]]:
+        return {
+            1: {"title": "Import MMD Model", "requires": [], "next": 2, "ready": ["analyze_button", "import_button"], "run": ["import_button"], "numbered": [("analyze_button", "1. Analyze"), ("import_button", "2. Import to Blender")]},
+            2: {"title": "Fix Model", "requires": [1], "next": 3, "ready": ["fix_button"], "run": ["fix_button"], "numbered": [("detect_import_blend_button", "1. Detect Step 1 Output"), ("fix_button", "2. Fix Model")]},
+            3: {"title": "Fix Spine Bones", "requires": [2], "next": 4, "ready": ["spine_analyze_button"], "run": ["spine_analyze_button", "spine_apply_button"], "numbered": [("detect_fixed_blend_button", "1. Detect Step 2 Output"), ("spine_analyze_button", "2. Analyze Spine"), ("spine_apply_button", "3. Apply Spine Fix")]},
+            4: {"title": "Sort Bones", "requires": [3], "next": 5, "ready": ["sort_analyze_button"], "run": ["sort_analyze_button", "sort_manual_merge_button", "sort_apply_button"], "numbered": [("detect_spine_blend_button", "1. Detect Step 3 Output"), ("sort_analyze_button", "2. Analyze Bones"), ("sort_manual_merge_button", "2B. Apply Manual Merge"), ("sort_apply_button", "3. Apply Auto Merge")]},
+            5: {"title": "Sort Materials", "requires": [4], "next": 6, "ready": ["material_scan_button"], "run": ["material_scan_button", "material_apply_button", "material_merge_button"], "numbered": [("detect_sort_blend_button", "1. Detect Step 4 Output"), ("material_scan_button", "2. Scan Materials"), ("material_apply_button", "3. Proceed"), ("material_merge_button", "4. Apply Material Merge")]},
+            6: {"title": "Sort Bodygroups", "requires": [5], "next": 7, "ready": ["bodygroup_analyze_button"], "run": ["bodygroup_analyze_button", "bodygroup_apply_button", "bodygroup_manual_button"], "numbered": [("detect_material_blend_button", "1. Detect Step 5 Output"), ("bodygroup_analyze_button", "2. Analyze Bodygroups"), ("bodygroup_apply_button", "3A. Proceed Automatically"), ("bodygroup_manual_button", "3B. Proceed Manually")]},
+            7: {"title": "Sort Flexes", "requires": [6], "next": 8, "ready": ["flex_analyze_button"], "run": ["flex_analyze_button", "flex_apply_button"], "numbered": [("detect_bodygroup_blend_button", "1. Detect Step 6 Output"), ("flex_analyze_button", "2. Analyze Flexes"), ("flex_apply_button", "3. Apply Flexes")]},
+            8: {"title": "Sort Collision", "requires": [7], "next": 9, "ready": ["collision_bones_button", "collision_sources_button", "collision_analyze_button"], "run": ["collision_bones_button", "collision_sources_button", "collision_analyze_button", "collision_apply_button"], "numbered": [("detect_flex_blend_button", "1. Detect Step 7 Output"), ("collision_bones_button", "2. Select CoACD Bones"), ("collision_sources_button", "3. Select CoACD Bodygroups"), ("collision_analyze_button", "4. Analyze Collision"), ("collision_apply_button", "5. Apply Collision")]},
+            9: {"title": "Export Proportion Trick", "requires": [8], "next": 10, "ready": ["proportion_run_button"], "run": ["proportion_run_button"], "numbered": [("detect_collision_blend_button", "1. Detect Step 8 Output"), ("proportion_run_button", "2. Run Step 9")]},
+            10: {"title": "Sort c_arms", "requires": [9], "next": 11, "ready": ["carms_run_button"], "run": ["carms_run_button"], "numbered": [("detect_proportion_export_button", "1. Detect Step 9 Output"), ("carms_run_button", "2. Run Step 10")]},
+            11: {"title": "Sort VRD", "requires": [9], "next": 12, "ready": ["vrd_analyze_button"], "run": ["vrd_analyze_button", "vrd_apply_button"], "numbered": [("detect_vrd_step9_button", "1. Detect Step 9 Output"), ("vrd_analyze_button", "2. Analyze VRD"), ("vrd_apply_button", "3. Apply / Export VRD")]},
+            12: {"title": "Param Texture", "requires": [5], "next": 13, "ready": ["texture_analyze_button"], "run": ["texture_analyze_button", "texture_process_button"], "numbered": [("detect_texture_mapping_button", "1. Detect Material Mapping"), ("texture_analyze_button", "2. Analyze Textures"), ("texture_process_button", "3. Process Textures")]},
+            13: {"title": "Sort Icons and Arts", "requires": [1], "next": 14, "ready": ["icon_generate_button", "icon_custom_button"], "run": ["icon_generate_button", "icon_custom_button"], "numbered": [("detect_icon_step1_button", "1. Detect Step 1 Output"), ("icon_generate_button", "2. Generate Icons"), ("icon_custom_button", "2B. Use Custom Image")]},
+            14: {"title": "Sort QC and Compile", "requires": [9], "optional": [10, 11, 12, 13], "next": 15, "ready": ["qc_analyze_button"], "run": ["qc_analyze_button", "qc_compile_button"], "numbered": [("detect_qc_outputs_button", "1. Detect Step Outputs"), ("detect_qc_gmod_button", "2. Detect GMod"), ("qc_analyze_button", "3. Analyze QC"), ("qc_compile_button", "4. Compile And Compose")]},
+            15: {"title": "Sort Release Description", "requires": [14], "next": None, "ready": ["release_chatgpt_button", "release_translate_button", "release_template_button"], "run": ["release_chatgpt_button", "release_translate_button", "release_template_button"], "numbered": [("detect_release_step14_button", "1. Detect Step 14 Output"), ("release_chatgpt_button", "2. Generate English With ChatGPT"), ("release_translate_button", "3. Translate With DeepL"), ("release_template_button", "4. Write Template")]},
+        }
+
+    def _install_workflow_guidance(self) -> None:
+        self.workflow_specs = self._make_workflow_specs()
+        for row_attr in (
+            "fix_input_row",
+            "spine_input_row",
+            "sort_input_row",
+            "material_input_row",
+            "bodygroup_input_row",
+            "flex_input_row",
+            "collision_input_row",
+            "proportion_input_row",
+            "carms_input_row",
+            "vrd_input_row",
+            "texture_input_row",
+            "icon_input_row",
+            "qc_input_row",
+            "release_input_row",
+        ):
+            row = getattr(self, row_attr, None)
+            if hasattr(row, "changed"):
+                row.changed.connect(self.queue_workflow_status_refresh)
+        for step, spec in self.workflow_specs.items():
+            for attr, label in spec.get("numbered", []):
+                button = getattr(self, str(attr), None)
+                if isinstance(button, QtWidgets.QAbstractButton):
+                    button.setText(str(label))
+            layout = self._content_layout_for_step(step)
+            if layout is None:
+                continue
+            banner = QtWidgets.QFrame()
+            banner.setObjectName("workflowBanner")
+            banner_layout = QtWidgets.QHBoxLayout(banner)
+            banner_layout.setContentsMargins(10, 8, 10, 8)
+            status_label = QtWidgets.QLabel("")
+            status_label.setObjectName("workflowStatus")
+            status_label.setWordWrap(True)
+            status_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+            jump_button = QtWidgets.QPushButton("Jump to Next Step")
+            jump_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_ArrowForward))
+            jump_button.setEnabled(False)
+            jump_button.clicked.connect(lambda _checked=False, s=step: self.jump_to_next_step(s))
+            banner_layout.addWidget(status_label, 1)
+            banner_layout.addWidget(jump_button, 0)
+            layout.insertWidget(0, banner)
+            self.workflow_status_labels[step] = status_label
+            self.workflow_jump_buttons[step] = jump_button
+
+    def queue_workflow_status_refresh(self, *_args: object) -> None:
+        QtCore.QTimer.singleShot(0, self.refresh_workflow_statuses)
+
+    def step_to_tab_index(self, step: int) -> int:
+        prefix = f"{int(step)} "
+        for index in range(self.tabs.count()):
+            if self.tabs.tabText(index).startswith(prefix):
+                return index
+        return int(step)
+
+    def switch_to_step(self, step: int) -> None:
+        index = self.step_to_tab_index(step)
+        if 0 <= index < self.tabs.count():
+            if not self.advanced_steps_visible:
+                self.set_advanced_steps_visible(True)
+            self.tabs.setCurrentIndex(index)
+
+    def set_advanced_steps_visible(self, visible: bool) -> None:
+        visible = bool(visible)
+        self.advanced_steps_visible = visible
+        for index in range(self.tabs.count()):
+            is_main = index == 0
+            try:
+                self.tabs.setTabVisible(index, is_main or visible)
+            except AttributeError:
+                self.tabs.tabBar().setTabVisible(index, is_main or visible)
+        if not visible and self.tabs.currentIndex() != 0:
+            self.tabs.setCurrentIndex(0)
+        button = getattr(self, "main_advanced_steps_button", None)
+        if isinstance(button, QtWidgets.QPushButton):
+            blocker = QtCore.QSignalBlocker(button)
+            try:
+                button.setChecked(visible)
+                button.setText(
+                    self._t("app.advanced.hide", "Hide advanced porting steps")
+                    if visible
+                    else self._t("app.advanced.show", "Show advanced porting steps")
+                )
+                icon = QtWidgets.QStyle.StandardPixmap.SP_ArrowBack if visible else QtWidgets.QStyle.StandardPixmap.SP_ArrowForward
+                button.setIcon(self.style().standardIcon(icon))
+            finally:
+                del blocker
+        if visible:
+            self.statusBar().showMessage(self._t("app.status.advanced_visible", "Advanced porting steps are visible."))
+        else:
+            self.statusBar().showMessage(
+                self._t("app.status.main_only", "Main import interface only. Use Show advanced porting steps for manual correction.")
+            )
+
+    def _content_layout_for_step(self, step: int) -> QtWidgets.QBoxLayout | None:
+        index = self.step_to_tab_index(step)
+        if index < 0 or index >= self.tabs.count():
+            return None
+        widget = self.tabs.widget(index)
+        if widget is None:
+            return None
+        layout = widget.layout()
+        if layout is None:
+            return None
+        if layout.count() == 1 and isinstance(layout.itemAt(0).widget(), QtWidgets.QScrollArea):
+            scroll = layout.itemAt(0).widget()
+            content = scroll.widget()
+            content_layout = content.layout() if content is not None else None
+            return content_layout if isinstance(content_layout, QtWidgets.QBoxLayout) else None
+        return layout if isinstance(layout, QtWidgets.QBoxLayout) else None
+
+    def workflow_step_folder_name(self, step: int) -> str:
+        return {
+            1: "1_import_mmd_model",
+            2: "2_fix_model_source_skeleton",
+            3: "3_fix_spine_bones",
+            4: "4_sort_bones",
+            5: "5_sort_materials",
+            6: "6_sort_bodygroups",
+            7: "7_sort_flexes",
+            8: "8_sort_collision",
+            9: "9_export_proportion_trick",
+            10: "10_sort_carms",
+            11: "11_sort_vrd",
+            12: "12_param_texture_render_materials",
+            13: "13_sort_icons_and_arts",
+            14: "14_sort_qc_compile",
+            15: "15_sort_release_description",
+        }.get(int(step), "")
+
+    def input_values_for_dependency(self, step: int, required_step: int) -> list[str]:
+        input_attrs = {
+            (2, 1): ["fix_input_row"],
+            (3, 2): ["spine_input_row"],
+            (4, 3): ["sort_input_row"],
+            (5, 4): ["material_input_row"],
+            (6, 5): ["bodygroup_input_row"],
+            (7, 6): ["flex_input_row"],
+            (8, 7): ["collision_input_row"],
+            (9, 8): ["proportion_input_row"],
+            (10, 9): ["carms_input_row"],
+            (11, 9): ["vrd_input_row"],
+            (12, 5): ["texture_input_row"],
+            (13, 1): ["icon_input_row"],
+            (14, 9): ["qc_input_row"],
+            (15, 14): ["release_input_row"],
+        }.get((int(step), int(required_step)), [])
+        values: list[str] = []
+        for attr in input_attrs:
+            widget = getattr(self, attr, None)
+            if hasattr(widget, "value"):
+                value = str(widget.value() or "").strip()
+                if value:
+                    values.append(value)
+        return values
+
+    def marker_dir_candidates_from_input(self, raw_path: str, required_step: int) -> list[Path]:
+        raw_path = str(raw_path or "").strip()
+        if not raw_path:
+            return []
+        path = Path(raw_path)
+        candidates: list[Path] = []
+        required_folder = self.workflow_step_folder_name(required_step)
+        if path.exists() and path.is_dir():
+            candidates.append(path)
+            if required_folder:
+                candidates.append(path / required_folder)
+        if path.exists() and path.is_file():
+            candidates.append(path.parent)
+        if not path.exists() and path.suffix:
+            candidates.append(path.parent)
+        candidates.append(path.parent)
+        candidates.extend(list(path.parents)[:5])
+        if required_folder:
+            for parent in list(path.parents)[:4]:
+                candidates.append(parent / required_folder)
+        unique: list[Path] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            try:
+                resolved = str(candidate.resolve())
+            except Exception:
+                resolved = str(candidate)
+            if resolved not in seen:
+                seen.add(resolved)
+                unique.append(candidate)
+        return unique
+
+    def dependency_complete_from_selected_input(self, step: int, required_step: int) -> bool:
+        for raw_path in self.input_values_for_dependency(step, required_step):
+            for candidate_dir in self.marker_dir_candidates_from_input(raw_path, required_step):
+                if core.is_step_complete(candidate_dir, required_step):
+                    return True
+        return False
+
+    def step_output_dir(self, step: int) -> Path | None:
+        try:
+            if step == 1:
+                blend = Path(self.output_blend_label.text().strip()) if self.output_blend_label.text().strip() else None
+                if blend:
+                    return blend.parent
+                workspace = Path(self.workspace_edit.text().strip()) if self.workspace_edit.text().strip() else None
+                return workspace / "1_import_mmd_model" if workspace else None
+            field_by_step = {
+                2: "fix_output_edit",
+                3: "spine_output_edit",
+                4: "sort_output_edit",
+                5: "material_output_edit",
+                6: "bodygroup_output_edit",
+                7: "flex_output_edit",
+                8: "collision_output_edit",
+                9: "proportion_output_edit",
+                10: "carms_output_edit",
+                11: "vrd_output_edit",
+                12: "texture_output_edit",
+                13: "icon_output_edit",
+                14: "qc_output_edit",
+                15: "release_output_edit",
+            }
+            attr = field_by_step.get(step)
+            widget = getattr(self, attr, None) if attr else None
+            if isinstance(widget, QtWidgets.QLineEdit) and widget.text().strip():
+                return Path(widget.text().strip())
+            folder_by_step = {
+                2: "2_fix_model_source_skeleton",
+                3: "3_fix_spine_bones",
+                4: "4_sort_bones",
+                5: "5_sort_materials",
+                6: "6_sort_bodygroups",
+                7: "7_sort_flexes",
+                8: "8_sort_collision",
+                9: "9_export_proportion_trick",
+                14: "14_sort_qc_compile",
+            }
+            row_fallbacks = {
+                1: ["icon_input_row"],
+                2: ["spine_input_row"],
+                3: ["sort_input_row"],
+                4: ["material_input_row"],
+                5: ["bodygroup_input_row", "texture_input_row"],
+                6: ["flex_input_row"],
+                7: ["collision_input_row"],
+                8: ["proportion_input_row"],
+                9: ["carms_input_row", "vrd_input_row", "qc_input_row"],
+                14: ["release_input_row"],
+            }
+            for row_attr in row_fallbacks.get(step, []):
+                row = getattr(self, row_attr, None)
+                raw_value = row.value().strip() if hasattr(row, "value") else ""
+                if not raw_value:
+                    continue
+                path = Path(raw_value)
+                if step == 1:
+                    try:
+                        workspace = core.workspace_root_for_step1_input(path)
+                    except Exception:
+                        continue
+                    return workspace / "1_import_mmd_model"
+                folder_name = folder_by_step.get(step)
+                if step == 9 and path.name == "2_proportion_export":
+                    return path.parent
+                if step == 14 and path.name == "14_sort_qc_compile":
+                    return path
+                if folder_name:
+                    if path.name == folder_name:
+                        return path
+                    if path.parent.name == folder_name:
+                        return path.parent
+                    candidate = path / folder_name if path.is_dir() else path.parent / folder_name
+                    if candidate.exists():
+                        return candidate
+        except Exception:
+            return None
+        return None
+
+    def step_expected_outputs(self, step: int) -> tuple[list[Path], Path | None]:
+        def label_path(attr: str) -> Path | None:
+            label = getattr(self, attr, None)
+            if isinstance(label, QtWidgets.QLabel) and label.text().strip():
+                return Path(label.text().strip())
+            return None
+
+        outputs: list[Path] = []
+        report: Path | None = None
+        if step == 1:
+            for attr in ("output_blend_label",):
+                path = label_path(attr)
+                if path:
+                    outputs.append(path)
+            report = label_path("output_report_label")
+        elif step == 2:
+            path = label_path("fixed_blend_label")
+            if path:
+                outputs.append(path)
+            report = label_path("fix_report_label")
+        elif step == 3:
+            path = label_path("spine_fixed_blend_label")
+            if path:
+                outputs.append(path)
+            report = label_path("spine_report_label")
+        elif step == 4:
+            path = label_path("sort_blend_label")
+            if path:
+                outputs.append(path)
+            report = label_path("sort_report_label")
+        elif step == 5:
+            for attr in ("material_final_blend_label", "material_sorted_blend_label", "material_mapping_label"):
+                path = label_path(attr)
+                if path:
+                    outputs.append(path)
+            report = label_path("material_report_label")
+        elif step == 6:
+            path = label_path("bodygroup_blend_label")
+            if path:
+                outputs.append(path)
+            report = label_path("bodygroup_report_label")
+        elif step == 7:
+            for attr in ("flex_blend_label", "flex_json_label"):
+                path = label_path(attr)
+                if path:
+                    outputs.append(path)
+            report = label_path("flex_report_label")
+        elif step == 8:
+            for attr in ("collision_blend_label", "collision_smd_label", "collision_settings_label"):
+                path = label_path(attr)
+                if path:
+                    outputs.append(path)
+            report = label_path("collision_report_label")
+        elif step == 9:
+            path = label_path("proportion_final_label")
+            if path:
+                outputs.append(path)
+            report = label_path("proportion_report_label")
+        elif step == 10:
+            path = label_path("carms_files_json_label")
+            if path:
+                outputs.append(path)
+            report = label_path("carms_report_label")
+        elif step == 11:
+            path = label_path("vrd_file_label")
+            if path:
+                outputs.append(path)
+            report = label_path("vrd_report_label")
+        elif step == 12:
+            path = label_path("texture_manifest_label")
+            if path:
+                outputs.append(path)
+            report = label_path("texture_report_label")
+        elif step == 13:
+            path = label_path("icon_files_label")
+            if path:
+                outputs.append(path)
+            report = label_path("icon_report_label")
+        elif step == 14:
+            path = label_path("qc_files_label")
+            if path:
+                outputs.append(path)
+            report = label_path("qc_report_label")
+        elif step == 15:
+            path = label_path("release_template_label")
+            if path:
+                outputs.append(path)
+            report = label_path("release_report_label")
+        step_dir = self.step_output_dir(step)
+        if step_dir and step_dir.exists():
+            report_names = {
+                1: "blender_import_report.json",
+                2: "blender_fix_model_report.json",
+                3: "blender_fix_spine_bones_report.json",
+                4: "blender_sort_bones_report.json",
+                5: "material_merge_report.json",
+                6: "blender_sort_bodygroups_report.json",
+                7: "blender_sort_flexes_report.json",
+                8: "blender_sort_collision_report.json",
+                9: "proportion_export_report.json",
+                10: "c_arms_report.json",
+                11: "blender_sort_vrd_report.json",
+                12: "textures_report.json",
+                13: "icons_report.json",
+                14: "qc_report.json",
+                15: "release_description_report.json",
+            }
+            if report is None:
+                candidate_report = step_dir / report_names.get(step, "")
+                if step == 5 and not candidate_report.exists():
+                    candidate_report = step_dir / "material_initial_report.json"
+                if candidate_report.exists():
+                    report = candidate_report
+            if not outputs:
+                patterns = {
+                    1: ["*_import.blend"],
+                    2: ["*_fixed.blend"],
+                    3: ["*_spine_fixed.blend"],
+                    4: ["*_bones_sorted.blend"],
+                    5: ["*_materials_merged.blend", "*_materials_sorted.blend", "materials.json", "materials.npy"],
+                    6: ["*_bodygroups_sorted.blend"],
+                    7: ["*_flexes_sorted.blend", "flexes.json"],
+                    8: ["*_collision_sorted.blend", "Physics.smd", "physics_settings.json"],
+                    9: ["2_proportion_export"],
+                    10: ["c_arms_files.json"],
+                    11: ["vrd.vrd"],
+                    12: ["textures_manifest.json"],
+                    13: ["icons_files.json", "release_icon.png"],
+                    14: ["qc_files.json"],
+                    15: ["Translation Templates Write.txt"],
+                }
+                for pattern in patterns.get(step, []):
+                    matches = sorted(step_dir.glob(pattern))
+                    outputs.extend(matches[:1])
+        return outputs, report
+
+    def report_is_clean_for_completion(self, report_path: Path | None) -> tuple[bool, dict[str, object]]:
+        if not report_path or not report_path.exists():
+            return False, {"ok": False, "reason": "report_missing"}
+        try:
+            data = json.loads(report_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            return False, {"ok": False, "reason": f"report_unreadable: {exc}"}
+        if not isinstance(data, dict):
+            return False, {"ok": False, "reason": "report_not_object"}
+        validation = data.get("validation") if isinstance(data.get("validation"), dict) else {}
+        validation_errors = data.get("validation_errors") if isinstance(data.get("validation_errors"), list) else []
+        errors = data.get("errors") if isinstance(data.get("errors"), list) else []
+        if validation and validation.get("ok") is False:
+            return False, {"ok": False, "validation": validation}
+        if validation_errors:
+            return False, {"ok": False, "validation_errors": validation_errors}
+        if errors:
+            return False, {"ok": False, "errors": errors}
+        status = str(data.get("status") or "").lower()
+        if status in {"failed", "failure", "error", "incomplete"}:
+            return False, {"ok": False, "status": status}
+        summary: dict[str, object] = {"ok": True}
+        if validation:
+            summary["validation"] = validation
+        if status:
+            summary["status"] = status
+        return True, summary
+
+    def try_backfill_step_completion(self, step: int) -> bool:
+        step_dir = self.step_output_dir(step)
+        if not step_dir:
+            return False
+        if core.is_step_complete(step_dir, step):
+            return True
+        outputs, report = self.step_expected_outputs(step)
+        if not outputs or any(not path.exists() for path in outputs):
+            return False
+        clean, validation = self.report_is_clean_for_completion(report)
+        if not clean:
+            return False
+        self.write_step_complete(step, step_dir, outputs={path.name: str(path) for path in outputs}, report_path=report, validation=validation, refresh=False)
+        return True
+
+    def step_is_complete(self, step: int) -> bool:
+        step_dir = self.step_output_dir(step)
+        if step_dir and core.is_step_complete(step_dir, step):
+            return True
+        return self.try_backfill_step_completion(step)
+
+    def first_missing_dependency(self, step: int) -> int | None:
+        spec = self.workflow_specs.get(step, {})
+        for required in spec.get("requires", []):
+            required_step = int(required)
+            if self.step_is_complete(required_step):
+                continue
+            if self.dependency_complete_from_selected_input(step, required_step):
+                continue
+            return required_step
+        return None
+
+    def workflow_state_for_step(self, step: int) -> str:
+        if self.workflow_states.get(step) == "working":
+            return "working"
+        if self.workflow_states.get(step) == "failed":
+            return "failed"
+        if self.step_is_complete(step):
+            return "complete"
+        if self.first_missing_dependency(step) is not None:
+            return "locked"
+        return "ready"
+
+    def refresh_workflow_statuses(self) -> None:
+        state_text = {
+            "locked": (self.translate_static_text("Locked"), "#8f98a3"),
+            "ready": (self.translate_static_text("Ready"), "#58a6ff"),
+            "working": (self.translate_static_text("Working"), "#d29922"),
+            "complete": (self.translate_static_text("Complete"), "#2ea043"),
+            "failed": (self.translate_static_text("Needs Attention"), "#f85149"),
+        }
+        for step, spec in self.workflow_specs.items():
+            state = self.workflow_state_for_step(step)
+            title, color = state_text.get(state, ("Ready", "#58a6ff"))
+            missing = self.first_missing_dependency(step)
+            dep_text = ""
+            if missing is not None:
+                dep_title = self.workflow_specs.get(missing, {}).get("title", f"Step {missing}")
+                dep_text = " " + self._t(
+                    "workflow.missing_upstream_short",
+                    "Required upstream missing: Step {step} {step_title}.",
+                    step=missing,
+                    step_title=dep_title,
+                )
+            elif spec.get("requires"):
+                dep_text = " " + self._t("workflow.required_upstream_short", "Required upstream complete.")
+            optional = [int(value) for value in spec.get("optional", [])]
+            optional_missing = [value for value in optional if not self.step_is_complete(value)]
+            if optional_missing:
+                dep_text += " " + self._t(
+                    "workflow.optional_missing_short",
+                    "Optional outputs missing: {steps}.",
+                    steps=", ".join(f"Step {value}" for value in optional_missing),
+                )
+            marker_text = ""
+            step_dir = self.step_output_dir(step)
+            if step_dir:
+                marker_text = " " + self._t("workflow.marker_short", "Marker: {marker_path}", marker_path=core.step_complete_marker_path(step_dir))
+            label = self.workflow_status_labels.get(step)
+            if label:
+                label.setText(
+                    f'<span style="color:{color}; font-weight:700;">Step {step}: {html.escape(str(spec.get("title", "")))} - {title}</span>'
+                    f'<br><span style="color:#8f98a3;">{html.escape(dep_text + marker_text)}</span>'
+                )
+            jump = self.workflow_jump_buttons.get(step)
+            if jump:
+                jump.setEnabled(state == "complete" and spec.get("next") is not None)
+            locked = state == "locked"
+            for attr in spec.get("run", []):
+                button = getattr(self, str(attr), None)
+                if isinstance(button, QtWidgets.QAbstractButton) and locked:
+                    button.setEnabled(False)
+            if state in {"ready", "complete", "failed"} and missing is None:
+                for attr in spec.get("ready", []):
+                    button = getattr(self, str(attr), None)
+                    if isinstance(button, QtWidgets.QAbstractButton):
+                        button.setEnabled(True)
+
+    def ensure_step_can_run(self, step: int) -> bool:
+        missing = self.first_missing_dependency(step)
+        if missing is None:
+            return True
+        missing_spec = self.workflow_specs.get(missing, {})
+        dialog = QtWidgets.QMessageBox(self)
+        dialog.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+        dialog.setWindowTitle("Upstream step incomplete")
+        dialog.setText(f"Step {step} cannot run until Step {missing} is complete.")
+        dialog.setInformativeText(f"Complete Step {missing}: {missing_spec.get('title', '')}, then return here.")
+        jump = dialog.addButton(f"Jump to Step {missing}", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        dialog.addButton("Cancel", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+        dialog.exec()
+        if dialog.clickedButton() == jump:
+            self.switch_to_step(missing)
+        self.refresh_workflow_statuses()
+        return False
+
+    def set_step_working(self, step: int, detail: str = "") -> None:
+        self.workflow_states[step] = "working"
+        self.statusBar().showMessage(detail or f"Step {step} working")
+        self.refresh_workflow_statuses()
+
+    def set_step_failed(self, step: int, detail: str = "") -> None:
+        self.workflow_states[step] = "failed"
+        self.statusBar().showMessage(detail or f"Step {step} needs attention")
+        self.refresh_workflow_statuses()
+
+    def clear_step_state(self, step: int, detail: str = "") -> None:
+        self.workflow_states.pop(step, None)
+        if detail:
+            self.statusBar().showMessage(detail)
+        self.refresh_workflow_statuses()
+
+    def write_step_complete(
+        self,
+        step: int,
+        step_dir: Path | str | None = None,
+        inputs: dict[str, object] | None = None,
+        outputs: dict[str, object] | None = None,
+        report_path: Path | str | None = None,
+        validation: dict[str, object] | None = None,
+        refresh: bool = True,
+    ) -> None:
+        spec = self.workflow_specs.get(step, {})
+        resolved_dir = Path(step_dir) if step_dir else self.step_output_dir(step)
+        if resolved_dir is None:
+            return
+        core.write_step_complete_marker(
+            resolved_dir,
+            step,
+            str(spec.get("title") or f"Step {step}"),
+            inputs=inputs,
+            outputs=outputs,
+            report_path=report_path,
+            validation=validation,
+        )
+        self.workflow_states.pop(step, None)
+        if refresh:
+            self.refresh_workflow_statuses()
+        QtCore.QTimer.singleShot(0, self.refresh_workspace_cache_size)
+
+    def complete_step_from_result(
+        self,
+        step: int,
+        result: dict,
+        step_dir_key: str,
+        output_keys: list[str],
+        report_key: str = "report",
+        validation: dict[str, object] | None = None,
+    ) -> None:
+        step_dir = Path(str(result.get(step_dir_key) or "")) if result.get(step_dir_key) else self.step_output_dir(step)
+        outputs = {key: str(result.get(key, "")) for key in output_keys if result.get(key)}
+        report_path = result.get(report_key)
+        self.write_step_complete(step, step_dir, outputs=outputs, report_path=str(report_path or ""), validation=validation or {"ok": True})
+
+    def jump_to_next_step(self, step: int) -> None:
+        spec = self.workflow_specs.get(step, {})
+        next_step = spec.get("next")
+        if not isinstance(next_step, int):
+            return
+        self.switch_to_step(next_step)
+        detect_calls: dict[int, Callable[[], None]] = {
+            2: self.detect_step1_output,
+            3: self.detect_step2_output,
+            4: self.detect_step3_output,
+            5: self.detect_step4_output,
+            6: self.detect_step5_output,
+            7: self.detect_step6_output,
+            8: self.detect_step7_output,
+            9: self.detect_step8_output,
+            10: lambda: self.detect_step9_output("carms"),
+            11: lambda: self.detect_step9_output("vrd"),
+            12: self.detect_material_mapping,
+            13: self.detect_step1_output_for_icons,
+            14: self.detect_qc_step_outputs,
+            15: self.detect_release_step14_output,
+        }
+        try:
+            detect = detect_calls.get(next_step)
+            if detect:
+                detect()
+        finally:
+            self.refresh_workflow_statuses()
+
+    def _tab_has_top_level_scroll_area(self, widget: QtWidgets.QWidget) -> bool:
+        layout = widget.layout()
+        if layout is None or layout.count() != 1:
+            return False
+        return isinstance(layout.itemAt(0).widget(), QtWidgets.QScrollArea)
+
+    def _wrap_tabs_for_small_screens(self) -> None:
+        current_index = self.tabs.currentIndex()
+        for index in range(self.tabs.count()):
+            widget = self.tabs.widget(index)
+            if widget is None or isinstance(widget, QtWidgets.QScrollArea) or self._tab_has_top_level_scroll_area(widget):
+                continue
+            label = self.tabs.tabText(index)
+            icon = self.tabs.tabIcon(index)
+            tooltip = self.tabs.tabToolTip(index)
+            enabled = self.tabs.isTabEnabled(index)
+            self.tabs.removeTab(index)
+            widget.setParent(None)
+            scroll = QtWidgets.QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+            scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            scroll.setWidget(widget)
+            self.tabs.insertTab(index, scroll, icon, label)
+            self.tabs.setTabToolTip(index, tooltip)
+            self.tabs.setTabEnabled(index, enabled)
+        if 0 <= current_index < self.tabs.count():
+            self.tabs.setCurrentIndex(current_index)
+
+    def _apply_style(self) -> None:
+        self.setStyleSheet(
+            """
+            QLabel#requiredBadge {
+                background: #1f6feb;
+                color: white;
+                border-radius: 4px;
+                padding: 2px 7px;
+                font-weight: 600;
+                min-height: 18px;
+                max-height: 22px;
+            }
+            QLabel#optionalBadge {
+                background: #3a3a3a;
+                color: #d7d7d7;
+                border-radius: 4px;
+                padding: 2px 7px;
+                min-height: 18px;
+                max-height: 22px;
+            }
+            QLabel#fieldHint {
+                color: #8f98a3;
+            }
+            QLabel#progressStatus {
+                font-weight: 600;
+            }
+            QFrame#workflowBanner {
+                border: 1px solid #3a3f46;
+                border-radius: 6px;
+                background: #1b1f24;
+            }
+            QLabel#workflowStatus {
+                color: #c9d1d9;
+            }
+            QPushButton#importButton {
+                font-size: 16px;
+                font-weight: 700;
+                padding: 10px 18px;
+            }
+            QPlainTextEdit {
+                font-family: Consolas, monospace;
+            }
+            """
+        )
+
+    def default_sample_dir(self) -> str:
+        sample = (
+            core.ROOT
+            / "reference"
+            / "li_sushan (human workflow)"
+            / "1_PMX"
+            / "\u661f\u7a79\u94c1\u9053_\u674e\u7d20\u88f3"
+        )
+        return str(sample) if sample.exists() else ""
+
+    def _build_main_tab(self) -> None:
+        tab = QtWidgets.QWidget()
+        self.main_tab = tab
+        tab_layout = QtWidgets.QVBoxLayout(tab)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        content = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(content)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        self.main_intro_label = QtWidgets.QLabel(
+            "One-click import runs the default workflow from PMX import through QC compile and addon packaging. "
+            "Advanced tabs remain available for manual correction when a step needs attention."
+        )
+        self.main_intro_label.setObjectName("fieldHint")
+        self.main_intro_label.setWordWrap(True)
+        layout.addWidget(self.main_intro_label)
+
+        language_layout = QtWidgets.QHBoxLayout()
+        self.main_language_label = QtWidgets.QLabel("Language")
+        self.main_language_combo = QtWidgets.QComboBox()
+        for code, display in LANGUAGE_OPTIONS:
+            self.main_language_combo.addItem(display, code)
+        language_layout.addWidget(self.main_language_label)
+        language_layout.addWidget(self.main_language_combo, 0)
+        language_layout.addStretch(1)
+        layout.addLayout(language_layout)
+
+        self.main_source_row = PathRow(
+            "MMD model folder",
+            "dir",
+            required=True,
+            hint="Folder containing the selected PMX and texture files",
+        )
+        layout.addWidget(self.main_source_row)
+
+        pmx_layout = QtWidgets.QGridLayout()
+        pmx_header = QtWidgets.QHBoxLayout()
+        self.main_pmx_label = QtWidgets.QLabel("PMX model")
+        self.main_pmx_badge = QtWidgets.QLabel("Required")
+        self.main_pmx_badge.setObjectName("requiredBadge")
+        self.main_pmx_hint = QtWidgets.QLabel("Defaults to the largest PMX in the selected folder")
+        self.main_pmx_hint.setObjectName("fieldHint")
+        pmx_header.addWidget(self.main_pmx_label)
+        pmx_header.addWidget(self.main_pmx_badge)
+        pmx_header.addWidget(self.main_pmx_hint, 1)
+        self.main_pmx_combo = QtWidgets.QComboBox()
+        self.main_pmx_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.main_refresh_pmx_button = QtWidgets.QPushButton("Refresh")
+        self.main_refresh_pmx_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_BrowserReload))
+        pmx_layout.addLayout(pmx_header, 0, 0, 1, 2)
+        pmx_layout.addWidget(self.main_pmx_combo, 1, 0)
+        pmx_layout.addWidget(self.main_refresh_pmx_button, 1, 1)
+        pmx_layout.setColumnStretch(0, 1)
+        layout.addLayout(pmx_layout)
+
+        self.main_workspace_edit = QtWidgets.QLineEdit()
+        self.main_workspace_edit.setReadOnly(True)
+        self.main_workspace_edit.setPlaceholderText(str(core.workspaces_root()))
+        self.main_gmod_row = PathRow(
+            "GMod / StudioMDL",
+            "file",
+            "StudioMDL (studiomdl.exe);;All files (*.*)",
+            required=True,
+            hint="Browse to studiomdl.exe or the Garry's Mod install folder",
+        )
+        self.main_category_edit = QtWidgets.QLineEdit("SheepyLord")
+        self.main_category_edit.setPlaceholderText("English letters and _ only")
+        self.install_internal_identifier_filter(self.main_category_edit)
+        self.main_category_display_edit = QtWidgets.QLineEdit()
+        self.main_category_display_edit.setPlaceholderText("Auto: Sheepy Lord")
+        self.install_category_display_name_filter(self.main_category_display_edit)
+        self.install_category_completers(self.main_category_edit, self.main_category_display_edit)
+        self.main_model_name_edit = QtWidgets.QLineEdit()
+        self.main_model_name_edit.setPlaceholderText("Optional internal character name, English letters and _ only")
+        self.install_internal_identifier_filter(self.main_model_name_edit)
+        self.main_model_display_edit = QtWidgets.QLineEdit()
+        self.main_model_display_edit.setPlaceholderText("Auto from internal character name")
+        self.install_display_name_filter(self.main_model_display_edit)
+        self.main_category_display_edit.setToolTip("Category display name shown in Garry's Mod menus. Printable ASCII punctuation is allowed, for example Honkai: Star Rail.")
+        self.main_model_display_edit.setToolTip("Character display name shown in Garry's Mod menus. English letters, spaces, and underscores only.")
+        self.main_rtx_bodygroup_limit_check = QtWidgets.QCheckBox("Enforce 32,767 vertex bodygroup limit (RTX Remix)")
+        self.main_rtx_bodygroup_limit_check.setToolTip("Default GMod builds allow 65,535 vertices per bodygroup. Enable this for RTX Remix builds that require 32,767.")
+        self.main_clear_custom_normals_check = QtWidgets.QCheckBox("Clear custom split normals in Step 2")
+        self.main_clear_custom_normals_check.setChecked(True)
+        self.main_clear_custom_normals_check.setToolTip("Default on. Disable to preserve imported custom split normals during the Step 2 model fix.")
+        self.main_form_labels = {
+            "workspace": QtWidgets.QLabel("Workspace"),
+            "category_internal": QtWidgets.QLabel("Category internal name"),
+            "category_display": QtWidgets.QLabel("Category display name"),
+            "character_internal": QtWidgets.QLabel("Character internal name"),
+            "character_display": QtWidgets.QLabel("Character display name"),
+            "rtx_vertex_limit": QtWidgets.QLabel("RTX vertex limit"),
+            "clear_custom_normals": QtWidgets.QLabel("Custom normals"),
+        }
+        form = QtWidgets.QFormLayout()
+        form.addRow(self.main_form_labels["workspace"], self.main_workspace_edit)
+        form.addRow(self.main_form_labels["category_internal"], self.main_category_edit)
+        form.addRow(self.main_form_labels["category_display"], self.main_category_display_edit)
+        form.addRow(self.main_form_labels["character_internal"], self.main_model_name_edit)
+        form.addRow(self.main_form_labels["character_display"], self.main_model_display_edit)
+        form.addRow(self.main_form_labels["rtx_vertex_limit"], self.main_rtx_bodygroup_limit_check)
+        form.addRow(self.main_form_labels["clear_custom_normals"], self.main_clear_custom_normals_check)
+        layout.addLayout(form)
+        layout.addWidget(self.main_gmod_row)
+
+        self.main_preflight_group = QtWidgets.QGroupBox("Preflight")
+        preflight_layout = QtWidgets.QVBoxLayout(self.main_preflight_group)
+        self.main_stats_label = QtWidgets.QLabel("Select a PMX and run preflight.")
+        self.main_stats_label.setWordWrap(True)
+        self.main_stats_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.main_warning_label = QtWidgets.QLabel("")
+        self.main_warning_label.setWordWrap(True)
+        self.main_warning_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self.main_warning_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        preflight_layout.addWidget(self.main_stats_label)
+        preflight_layout.addWidget(self.main_warning_label)
+        layout.addWidget(self.main_preflight_group)
+
+        self.main_preview_group = QtWidgets.QGroupBox("Model Preview")
+        preview_layout = QtWidgets.QVBoxLayout(self.main_preview_group)
+        if StaticModelPreviewWidget is not None:
+            self.main_model_preview = StaticModelPreviewWidget()
+            self.main_preview_status_label = QtWidgets.QLabel("Preview idle")
+            self.main_preview_status_label.setObjectName("fieldHint")
+            self.main_model_preview.statsChanged.connect(self.main_preview_status_label.setText)
+            preview_layout.addWidget(self.main_model_preview, 1)
+            preview_controls = QtWidgets.QHBoxLayout()
+            self.main_reload_preview_button = QtWidgets.QPushButton("Reload Preview")
+            self.main_reload_preview_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_BrowserReload))
+            self.main_reset_preview_button = QtWidgets.QPushButton("Reset View")
+            self.main_reset_preview_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_ArrowBack))
+            self.main_preview_bones_check = QtWidgets.QCheckBox("Bones")
+            self.main_preview_bones_check.setChecked(True)
+            self.main_preview_bone_names_check = QtWidgets.QCheckBox("Bone Names")
+            self.main_preview_wireframe_check = QtWidgets.QCheckBox("Wireframe")
+            preview_controls.addWidget(self.main_reload_preview_button)
+            preview_controls.addWidget(self.main_reset_preview_button)
+            preview_controls.addWidget(self.main_preview_bones_check)
+            preview_controls.addWidget(self.main_preview_bone_names_check)
+            preview_controls.addWidget(self.main_preview_wireframe_check)
+            preview_controls.addStretch(1)
+            preview_layout.addLayout(preview_controls)
+            preview_layout.addWidget(self.main_preview_status_label)
+            self.main_reload_preview_button.clicked.connect(lambda: self.load_main_preview(silent=False))
+            self.main_reset_preview_button.clicked.connect(lambda: self.main_model_preview.reset_front_view())
+            self.main_preview_bones_check.toggled.connect(self.main_model_preview.set_bones_visible)
+            self.main_preview_bone_names_check.toggled.connect(self.main_model_preview.set_bone_names_visible)
+            self.main_preview_wireframe_check.toggled.connect(self.main_model_preview.set_wireframe_visible)
+        else:
+            self.main_model_preview = None
+            self.main_preview_status_label = QtWidgets.QLabel("OpenGL preview dependencies are unavailable.")
+            self.main_preview_status_label.setObjectName("fieldHint")
+            preview_layout.addWidget(self.main_preview_status_label)
+        layout.addWidget(self.main_preview_group, 1)
+
+        actions = QtWidgets.QHBoxLayout()
+        self.main_detect_gmod_button = QtWidgets.QPushButton("1. Detect GMod")
+        self.main_detect_gmod_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_ComputerIcon))
+        self.main_preflight_button = QtWidgets.QPushButton("2. Run Preflight")
+        self.main_preflight_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogContentsView))
+        self.main_import_button = QtWidgets.QPushButton("3. Import Model into GMod")
+        self.main_import_button.setObjectName("importButton")
+        self.main_import_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_MediaPlay))
+        self.main_advanced_steps_button = QtWidgets.QPushButton("Show advanced portting steps")
+        self.main_advanced_steps_button.setCheckable(True)
+        self.main_advanced_steps_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_ArrowForward))
+        self.main_cancel_button = QtWidgets.QPushButton("Cancel")
+        self.main_cancel_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogCancelButton))
+        self.main_cancel_button.setEnabled(False)
+        self.main_open_output_button = QtWidgets.QPushButton("Open Output Folder")
+        self.main_open_output_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DirOpenIcon))
+        self.main_open_output_button.setEnabled(False)
+        actions.addWidget(self.main_detect_gmod_button)
+        actions.addWidget(self.main_preflight_button)
+        actions.addWidget(self.main_import_button)
+        actions.addWidget(self.main_advanced_steps_button)
+        actions.addWidget(self.main_cancel_button)
+        actions.addWidget(self.main_open_output_button)
+        actions.addStretch(1)
+        layout.insertLayout(5, actions)
+
+        self.main_progress_group = QtWidgets.QGroupBox("Progress")
+        main_progress_layout = QtWidgets.QVBoxLayout(self.main_progress_group)
+        self.main_progress_bar = QtWidgets.QProgressBar()
+        self.main_progress_bar.setRange(0, 100)
+        self.main_progress_label = QtWidgets.QLabel("Idle")
+        self.main_progress_label.setObjectName("progressStatus")
+        self.main_progress_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self.main_progress_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.main_warnings_label = QtWidgets.QLabel("")
+        self.main_warnings_label.setWordWrap(True)
+        self.main_warnings_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        main_progress_layout.addWidget(self.main_progress_bar)
+        main_progress_layout.addWidget(self.main_progress_label)
+        main_progress_layout.addWidget(self.main_warnings_label)
+        layout.addWidget(self.main_progress_group)
+
+        toggles = QtWidgets.QHBoxLayout()
+        self.main_outputs_toggle = QtWidgets.QToolButton()
+        self.main_outputs_toggle.setText("Show Outputs")
+        self.main_outputs_toggle.setCheckable(True)
+        self.main_outputs_toggle.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogDetailedView))
+        self.main_log_toggle = QtWidgets.QToolButton()
+        self.main_log_toggle.setText("Show Log")
+        self.main_log_toggle.setCheckable(True)
+        self.main_log_toggle.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogInfoView))
+        toggles.addWidget(self.main_outputs_toggle)
+        toggles.addWidget(self.main_log_toggle)
+        toggles.addStretch(1)
+        layout.addLayout(toggles)
+
+        self.main_output_group = QtWidgets.QGroupBox("Outputs")
+        main_output_layout = QtWidgets.QVBoxLayout(self.main_output_group)
+        self.main_files_table = QtWidgets.QTableWidget(0, 5)
+        self.main_files_table.setHorizontalHeaderLabels(["Name", "Type", "Size", "Stage", "Path"])
+        self.main_files_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.main_files_table.horizontalHeader().setStretchLastSection(True)
+        self.main_files_table.verticalHeader().setVisible(False)
+        self.main_files_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        main_output_layout.addWidget(self.main_files_table)
+        self.main_output_group.setVisible(False)
+        layout.addWidget(self.main_output_group)
+
+        self.main_log_group = QtWidgets.QGroupBox("Log")
+        main_log_layout = QtWidgets.QVBoxLayout(self.main_log_group)
+        self.main_log = QtWidgets.QPlainTextEdit()
+        self.main_log.setReadOnly(True)
+        self.main_log.setMinimumHeight(180)
+        self.main_copy_log_button = QtWidgets.QPushButton("Copy Log")
+        self.main_copy_log_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogSaveButton))
+        self.main_copy_log_button.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(self.main_log.toPlainText()))
+        main_log_layout.addWidget(self.main_log, 1)
+        main_log_layout.addWidget(self.main_copy_log_button, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+        self.main_log_group.setVisible(False)
+        layout.addWidget(self.main_log_group, 1)
+
+        cache_cleanup_layout = QtWidgets.QHBoxLayout()
+        self.main_clear_workspace_cache_button = QtWidgets.QPushButton("Clear All Cache and Intermediate Files")
+        self.main_clear_workspace_cache_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogDiscardButton))
+        self.main_clear_workspace_cache_button.setToolTip(
+            "Delete all generated folders and loose files inside the MMD Character Importer workspaces folder."
+        )
+        self.main_workspace_cache_size_label = QtWidgets.QLabel("Workspace cache: calculating...")
+        self.main_workspace_cache_size_label.setObjectName("fieldHint")
+        self.main_workspace_cache_size_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.main_workspace_cache_size_label.setToolTip(str(core.workspaces_root()))
+        cache_cleanup_layout.addWidget(self.main_clear_workspace_cache_button, 0)
+        cache_cleanup_layout.addWidget(self.main_workspace_cache_size_label, 0)
+        cache_cleanup_layout.addStretch(1)
+        layout.addLayout(cache_cleanup_layout)
+
+        self.main_source_row.changed.connect(self.on_main_source_changed)
+        self.main_language_combo.currentIndexChanged.connect(self.on_language_changed)
+        self.main_gmod_row.changed.connect(lambda _value: self.save_settings())
+        self.main_refresh_pmx_button.clicked.connect(self.populate_main_pmx_files)
+        self.main_pmx_combo.currentIndexChanged.connect(self.on_main_pmx_changed)
+        self.main_detect_gmod_button.clicked.connect(self.detect_gmod_for_main)
+        self.main_preflight_button.clicked.connect(lambda: self.analyze_main_pmx(silent=False))
+        self.main_import_button.clicked.connect(self.start_full_import)
+        self.main_advanced_steps_button.toggled.connect(self.set_advanced_steps_visible)
+        self.main_cancel_button.clicked.connect(self.cancel_full_import)
+        self.main_open_output_button.clicked.connect(self.open_main_output_folder)
+        self.main_outputs_toggle.toggled.connect(self.set_main_outputs_visible)
+        self.main_log_toggle.toggled.connect(self.set_main_log_visible)
+        self.main_clear_workspace_cache_button.clicked.connect(self.clear_workspace_cache)
+        self.main_category_edit.textChanged.connect(lambda _value: self.update_main_display_placeholders())
+        self.main_model_name_edit.textChanged.connect(lambda _value: self.update_main_display_placeholders())
+        self.main_rtx_bodygroup_limit_check.toggled.connect(self.on_bodygroup_rtx_limit_changed)
+        self.main_clear_custom_normals_check.toggled.connect(self.on_clear_custom_normals_changed)
+        self.main_category_edit.editingFinished.connect(self.save_settings)
+        self.main_category_display_edit.editingFinished.connect(self.save_settings)
+        self.main_model_name_edit.editingFinished.connect(self.save_settings)
+        self.main_model_display_edit.editingFinished.connect(self.save_settings)
+
+        scroll.setWidget(content)
+        tab_layout.addWidget(scroll)
+        self.tabs.addTab(tab, "Main Import to GMod")
+
+    def _build_import_tab(self) -> None:
+        tab = QtWidgets.QWidget()
+        tab_layout = QtWidgets.QVBoxLayout(tab)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        content = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(content)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        self.source_row = PathRow(
+            "MMD model folder",
+            "dir",
+            required=True,
+            hint="Folder containing the selected PMX and texture files",
+        )
+        layout.addWidget(self.source_row)
+
+        pmx_layout = QtWidgets.QGridLayout()
+        pmx_header = QtWidgets.QHBoxLayout()
+        self.pmx_label = QtWidgets.QLabel("PMX model")
+        pmx_badge = QtWidgets.QLabel("Required")
+        pmx_badge.setObjectName("requiredBadge")
+        self.pmx_hint = QtWidgets.QLabel("Defaults to the largest PMX in the selected folder")
+        self.pmx_hint.setObjectName("fieldHint")
+        pmx_header.addWidget(self.pmx_label)
+        pmx_header.addWidget(pmx_badge)
+        pmx_header.addWidget(self.pmx_hint, 1)
+        self.pmx_combo = QtWidgets.QComboBox()
+        self.pmx_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.refresh_pmx_button = QtWidgets.QPushButton("Refresh")
+        self.refresh_pmx_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_BrowserReload))
+        pmx_layout.addLayout(pmx_header, 0, 0, 1, 2)
+        pmx_layout.addWidget(self.pmx_combo, 1, 0)
+        pmx_layout.addWidget(self.refresh_pmx_button, 1, 1)
+        pmx_layout.setColumnStretch(0, 1)
+        layout.addLayout(pmx_layout)
+
+        self.workspace_edit = QtWidgets.QLineEdit()
+        self.workspace_edit.setReadOnly(True)
+        self.workspace_edit.setPlaceholderText(str(core.workspaces_root()))
+        workspace_layout = QtWidgets.QFormLayout()
+        workspace_layout.addRow("Workspace", self.workspace_edit)
+        layout.addLayout(workspace_layout)
+
+        self.preflight_group = QtWidgets.QGroupBox("Preflight")
+        preflight_layout = QtWidgets.QVBoxLayout(self.preflight_group)
+        self.stats_label = QtWidgets.QLabel("Select a PMX and run Analyze.")
+        self.stats_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.stats_label.setWordWrap(True)
+        self.warning_label = QtWidgets.QLabel("")
+        self.warning_label.setWordWrap(True)
+        self.warning_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.warning_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        preflight_layout.addWidget(self.stats_label)
+        preflight_layout.addWidget(self.warning_label)
+        layout.addWidget(self.preflight_group)
+
+        self.preview_group = QtWidgets.QGroupBox("Model Preview")
+        preview_layout = QtWidgets.QVBoxLayout(self.preview_group)
+        if StaticModelPreviewWidget is not None:
+            self.model_preview = StaticModelPreviewWidget()
+            self.preview_status_label = QtWidgets.QLabel("Preview idle")
+            self.preview_status_label.setObjectName("fieldHint")
+            self.preview_status_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+            self.model_preview.statsChanged.connect(self.preview_status_label.setText)
+            preview_layout.addWidget(self.model_preview, 1)
+            preview_controls = QtWidgets.QHBoxLayout()
+            self.reload_preview_button = QtWidgets.QPushButton("Reload Preview")
+            self.reload_preview_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_BrowserReload))
+            self.reset_preview_button = QtWidgets.QPushButton("Reset View")
+            self.reset_preview_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_ArrowBack))
+            self.preview_bones_check = QtWidgets.QCheckBox("Bones")
+            self.preview_bones_check.setChecked(True)
+            self.preview_bone_names_check = QtWidgets.QCheckBox("Bone Names")
+            self.preview_wireframe_check = QtWidgets.QCheckBox("Wireframe")
+            preview_controls.addWidget(self.reload_preview_button)
+            preview_controls.addWidget(self.reset_preview_button)
+            preview_controls.addWidget(self.preview_bones_check)
+            preview_controls.addWidget(self.preview_bone_names_check)
+            preview_controls.addWidget(self.preview_wireframe_check)
+            preview_controls.addStretch(1)
+            preview_layout.addLayout(preview_controls)
+            preview_layout.addWidget(self.preview_status_label)
+            self.reload_preview_button.clicked.connect(lambda: self.load_current_preview(silent=False))
+            self.reset_preview_button.clicked.connect(lambda: self.model_preview.reset_front_view())
+            self.preview_bones_check.toggled.connect(self.model_preview.set_bones_visible)
+            self.preview_bone_names_check.toggled.connect(self.model_preview.set_bone_names_visible)
+            self.preview_wireframe_check.toggled.connect(self.model_preview.set_wireframe_visible)
+        else:
+            self.model_preview = None
+            self.preview_status_label = QtWidgets.QLabel("OpenGL preview dependencies are unavailable.")
+            self.preview_status_label.setObjectName("fieldHint")
+            preview_layout.addWidget(self.preview_status_label)
+        layout.addWidget(self.preview_group, 1)
+
+        actions = QtWidgets.QHBoxLayout()
+        self.analyze_button = QtWidgets.QPushButton("Analyze")
+        self.analyze_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogContentsView))
+        self.import_button = QtWidgets.QPushButton("Import to Blender")
+        self.import_button.setObjectName("importButton")
+        self.import_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_MediaPlay))
+        self.cancel_button = QtWidgets.QPushButton("Cancel")
+        self.cancel_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogCancelButton))
+        self.cancel_button.setEnabled(False)
+        self.open_workspace_button = QtWidgets.QPushButton("Open Workspace")
+        self.open_workspace_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DirOpenIcon))
+        self.open_workspace_button.setEnabled(False)
+        actions.addWidget(self.analyze_button)
+        actions.addWidget(self.import_button)
+        actions.addWidget(self.cancel_button)
+        actions.addWidget(self.open_workspace_button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+
+        self.progress_group = QtWidgets.QGroupBox("Progress")
+        progress_layout = QtWidgets.QVBoxLayout(self.progress_group)
+        self.progress_bar = QtWidgets.QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_label = QtWidgets.QLabel("Idle")
+        self.progress_label.setObjectName("progressStatus")
+        self.progress_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self.progress_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        progress_layout.addWidget(self.progress_bar)
+        progress_layout.addWidget(self.progress_label)
+        layout.addWidget(self.progress_group)
+
+        import_toggles = QtWidgets.QHBoxLayout()
+        self.import_outputs_toggle = QtWidgets.QToolButton()
+        self.import_outputs_toggle.setText("Show Outputs")
+        self.import_outputs_toggle.setCheckable(True)
+        self.import_outputs_toggle.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogDetailedView))
+        self.import_log_toggle = QtWidgets.QToolButton()
+        self.import_log_toggle.setText("Show Log")
+        self.import_log_toggle.setCheckable(True)
+        self.import_log_toggle.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogInfoView))
+        import_toggles.addWidget(self.import_outputs_toggle)
+        import_toggles.addWidget(self.import_log_toggle)
+        import_toggles.addStretch(1)
+        layout.addLayout(import_toggles)
+
+        self.output_group = QtWidgets.QGroupBox("Outputs")
+        output_layout = QtWidgets.QFormLayout(self.output_group)
+        self.output_blend_label = QtWidgets.QLabel("")
+        self.output_log_label = QtWidgets.QLabel("")
+        self.output_report_label = QtWidgets.QLabel("")
+        for label in (self.output_blend_label, self.output_log_label, self.output_report_label):
+            label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+            label.setWordWrap(True)
+        output_layout.addRow(".blend", self.output_blend_label)
+        output_layout.addRow("Log", self.output_log_label)
+        output_layout.addRow("Report", self.output_report_label)
+        self.output_group.setVisible(False)
+        layout.addWidget(self.output_group)
+
+        self.log_group = QtWidgets.QGroupBox("Log")
+        log_layout = QtWidgets.QVBoxLayout(self.log_group)
+        self.log = QtWidgets.QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMinimumHeight(160)
+        self.copy_log_button = QtWidgets.QPushButton("Copy Log")
+        self.copy_log_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogSaveButton))
+        self.copy_log_button.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(self.log.toPlainText()))
+        log_layout.addWidget(self.log, 1)
+        log_layout.addWidget(self.copy_log_button, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+        self.log_group.setVisible(False)
+        layout.addWidget(self.log_group, 1)
+
+        self.source_row.changed.connect(self.on_source_changed)
+        self.refresh_pmx_button.clicked.connect(self.populate_pmx_files)
+        self.pmx_combo.currentIndexChanged.connect(self.on_pmx_changed)
+        self.analyze_button.clicked.connect(self.analyze_current_pmx)
+        self.import_button.clicked.connect(self.start_import)
+        self.cancel_button.clicked.connect(self.cancel_import)
+        self.open_workspace_button.clicked.connect(self.open_workspace)
+        self.import_outputs_toggle.toggled.connect(self.set_import_outputs_visible)
+        self.import_log_toggle.toggled.connect(self.set_import_log_visible)
+
+        scroll.setWidget(content)
+        tab_layout.addWidget(scroll)
+        self.tabs.addTab(tab, "1 Import MMD Model")
+
+    def _build_fix_tab(self) -> None:
+        tab = QtWidgets.QWidget()
+        tab_layout = QtWidgets.QVBoxLayout(tab)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        content = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(content)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        self.fix_input_row = PathRow(
+            "Imported .blend",
+            "file",
+            "Blender files (*.blend);;All files (*.*)",
+            required=True,
+            hint="Use the .blend produced by step 1",
+        )
+        layout.addWidget(self.fix_input_row)
+
+        self.fix_output_edit = QtWidgets.QLineEdit()
+        self.fix_output_edit.setReadOnly(True)
+        fix_output_layout = QtWidgets.QFormLayout()
+        fix_output_layout.addRow("Output folder", self.fix_output_edit)
+        layout.addLayout(fix_output_layout)
+
+        self.fix_summary_group = QtWidgets.QGroupBox("Fix Operations")
+        fix_summary_layout = QtWidgets.QVBoxLayout(self.fix_summary_group)
+        self.fix_summary_label = QtWidgets.QLabel(
+            "This step makes the imported model single-user, optionally clears custom split normals, runs CATS Fix Model twice, translates names, and converts the armature to ValveBiped bone names."
+        )
+        self.fix_summary_label.setWordWrap(True)
+        self.fix_summary_label.setObjectName("fieldHint")
+        fix_summary_layout.addWidget(self.fix_summary_label)
+        self.fix_clear_custom_normals_check = QtWidgets.QCheckBox("Clear custom split normals")
+        self.fix_clear_custom_normals_check.setChecked(True)
+        self.fix_clear_custom_normals_check.setToolTip("Default on. Disable to preserve imported mesh custom split normals during Step 2.")
+        fix_summary_layout.addWidget(self.fix_clear_custom_normals_check)
+        layout.addWidget(self.fix_summary_group)
+
+        fix_actions = QtWidgets.QHBoxLayout()
+        self.detect_import_blend_button = QtWidgets.QPushButton("Detect Step 1 Output")
+        self.detect_import_blend_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogContentsView))
+        self.fix_button = QtWidgets.QPushButton("Fix Model")
+        self.fix_button.setObjectName("importButton")
+        self.fix_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_MediaPlay))
+        self.fix_cancel_button = QtWidgets.QPushButton("Cancel")
+        self.fix_cancel_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogCancelButton))
+        self.fix_cancel_button.setEnabled(False)
+        self.open_fix_folder_button = QtWidgets.QPushButton("Open Fix Folder")
+        self.open_fix_folder_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DirOpenIcon))
+        self.open_fix_folder_button.setEnabled(False)
+        fix_actions.addWidget(self.detect_import_blend_button)
+        fix_actions.addWidget(self.fix_button)
+        fix_actions.addWidget(self.fix_cancel_button)
+        fix_actions.addWidget(self.open_fix_folder_button)
+        fix_actions.addStretch(1)
+        layout.addLayout(fix_actions)
+
+        self.fix_progress_group = QtWidgets.QGroupBox("Progress")
+        fix_progress_layout = QtWidgets.QVBoxLayout(self.fix_progress_group)
+        self.fix_progress_bar = QtWidgets.QProgressBar()
+        self.fix_progress_bar.setRange(0, 100)
+        self.fix_progress_label = QtWidgets.QLabel("Idle")
+        self.fix_progress_label.setObjectName("progressStatus")
+        self.fix_progress_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self.fix_progress_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        fix_progress_layout.addWidget(self.fix_progress_bar)
+        fix_progress_layout.addWidget(self.fix_progress_label)
+        layout.addWidget(self.fix_progress_group)
+
+        fix_toggles = QtWidgets.QHBoxLayout()
+        self.fix_outputs_toggle = QtWidgets.QToolButton()
+        self.fix_outputs_toggle.setText("Show Outputs")
+        self.fix_outputs_toggle.setCheckable(True)
+        self.fix_outputs_toggle.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogDetailedView))
+        self.fix_log_toggle = QtWidgets.QToolButton()
+        self.fix_log_toggle.setText("Show Log")
+        self.fix_log_toggle.setCheckable(True)
+        self.fix_log_toggle.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogInfoView))
+        fix_toggles.addWidget(self.fix_outputs_toggle)
+        fix_toggles.addWidget(self.fix_log_toggle)
+        fix_toggles.addStretch(1)
+        layout.addLayout(fix_toggles)
+
+        self.fix_output_group = QtWidgets.QGroupBox("Outputs")
+        fix_outputs = QtWidgets.QFormLayout(self.fix_output_group)
+        self.fixed_blend_label = QtWidgets.QLabel("")
+        self.fix_log_label = QtWidgets.QLabel("")
+        self.fix_report_label = QtWidgets.QLabel("")
+        for label in (self.fixed_blend_label, self.fix_log_label, self.fix_report_label):
+            label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+            label.setWordWrap(True)
+        fix_outputs.addRow("Fixed .blend", self.fixed_blend_label)
+        fix_outputs.addRow("Log", self.fix_log_label)
+        fix_outputs.addRow("Report", self.fix_report_label)
+        self.fix_output_group.setVisible(False)
+        layout.addWidget(self.fix_output_group)
+
+        self.fix_log_group = QtWidgets.QGroupBox("Log")
+        fix_log_layout = QtWidgets.QVBoxLayout(self.fix_log_group)
+        self.fix_log = QtWidgets.QPlainTextEdit()
+        self.fix_log.setReadOnly(True)
+        self.fix_log.setMinimumHeight(160)
+        self.copy_fix_log_button = QtWidgets.QPushButton("Copy Log")
+        self.copy_fix_log_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogSaveButton))
+        self.copy_fix_log_button.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(self.fix_log.toPlainText()))
+        fix_log_layout.addWidget(self.fix_log, 1)
+        fix_log_layout.addWidget(self.copy_fix_log_button, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+        self.fix_log_group.setVisible(False)
+        layout.addWidget(self.fix_log_group, 1)
+
+        self.fix_input_row.changed.connect(self.on_fix_input_changed)
+        self.detect_import_blend_button.clicked.connect(self.detect_step1_output)
+        self.fix_button.clicked.connect(self.start_fix)
+        self.fix_cancel_button.clicked.connect(self.cancel_fix)
+        self.open_fix_folder_button.clicked.connect(self.open_fix_folder)
+        self.fix_outputs_toggle.toggled.connect(self.set_fix_outputs_visible)
+        self.fix_log_toggle.toggled.connect(self.set_fix_log_visible)
+        self.fix_clear_custom_normals_check.toggled.connect(self.on_clear_custom_normals_changed)
+
+        scroll.setWidget(content)
+        tab_layout.addWidget(scroll)
+        self.tabs.addTab(tab, "2 Fix Model")
+
+    def _build_spine_tab(self) -> None:
+        tab = QtWidgets.QWidget()
+        tab_layout = QtWidgets.QVBoxLayout(tab)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        content = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(content)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        self.spine_input_row = PathRow(
+            "Step 2 fixed .blend",
+            "file",
+            "Blender files (*.blend);;All files (*.*)",
+            required=True,
+            hint="Use the .blend produced by step 2",
+        )
+        layout.addWidget(self.spine_input_row)
+
+        self.spine_output_edit = QtWidgets.QLineEdit()
+        self.spine_output_edit.setReadOnly(True)
+        spine_output_layout = QtWidgets.QFormLayout()
+        spine_output_layout.addRow("Output folder", self.spine_output_edit)
+        layout.addLayout(spine_output_layout)
+
+        self.spine_summary_group = QtWidgets.QGroupBox("Spine Plan")
+        spine_summary_layout = QtWidgets.QVBoxLayout(self.spine_summary_group)
+        self.spine_summary_label = QtWidgets.QLabel(
+            "Analyze the step-2 armature, confirm or override the detected Source spine chain, then apply the repair."
+        )
+        self.spine_summary_label.setWordWrap(True)
+        self.spine_summary_label.setObjectName("fieldHint")
+        spine_summary_layout.addWidget(self.spine_summary_label)
+        layout.addWidget(self.spine_summary_group)
+
+        spine_actions = QtWidgets.QHBoxLayout()
+        self.detect_fixed_blend_button = QtWidgets.QPushButton("Detect Step 2 Output")
+        self.detect_fixed_blend_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogContentsView))
+        self.spine_analyze_button = QtWidgets.QPushButton("Analyze Spine")
+        self.spine_analyze_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogContentsView))
+        self.spine_apply_button = QtWidgets.QPushButton("Apply Spine Fix")
+        self.spine_apply_button.setObjectName("importButton")
+        self.spine_apply_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_MediaPlay))
+        self.spine_apply_button.setEnabled(False)
+        self.spine_validate_button = QtWidgets.QPushButton("Validate")
+        self.spine_validate_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogApplyButton))
+        self.spine_cancel_button = QtWidgets.QPushButton("Cancel")
+        self.spine_cancel_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogCancelButton))
+        self.spine_cancel_button.setEnabled(False)
+        self.open_spine_folder_button = QtWidgets.QPushButton("Open Spine Folder")
+        self.open_spine_folder_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DirOpenIcon))
+        self.open_spine_folder_button.setEnabled(False)
+        spine_actions.addWidget(self.detect_fixed_blend_button)
+        spine_actions.addWidget(self.spine_analyze_button)
+        spine_actions.addWidget(self.spine_apply_button)
+        spine_actions.addWidget(self.spine_validate_button)
+        spine_actions.addWidget(self.spine_cancel_button)
+        spine_actions.addWidget(self.open_spine_folder_button)
+        spine_actions.addStretch(1)
+        layout.addLayout(spine_actions)
+
+        self.spine_preview_group = QtWidgets.QGroupBox("Spine Preview")
+        spine_preview_layout = QtWidgets.QVBoxLayout(self.spine_preview_group)
+        if SkeletonPlanPreviewWidget is not None:
+            self.spine_preview = SkeletonPlanPreviewWidget()
+            self.spine_preview_status_label = QtWidgets.QLabel("Spine preview idle")
+            self.spine_preview_status_label.setObjectName("fieldHint")
+            self.spine_preview_status_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+            self.spine_preview.statsChanged.connect(self.spine_preview_status_label.setText)
+            spine_preview_layout.addWidget(self.spine_preview, 1)
+            preview_controls = QtWidgets.QHBoxLayout()
+            self.spine_reset_preview_button = QtWidgets.QPushButton("Reset View")
+            self.spine_reset_preview_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_ArrowBack))
+            self.spine_model_check = QtWidgets.QCheckBox("Model")
+            self.spine_model_check.setChecked(True)
+            self.spine_bone_names_check = QtWidgets.QCheckBox("Bone Names")
+            preview_controls.addWidget(self.spine_reset_preview_button)
+            preview_controls.addWidget(self.spine_model_check)
+            preview_controls.addWidget(self.spine_bone_names_check)
+            preview_controls.addStretch(1)
+            spine_preview_layout.addLayout(preview_controls)
+            spine_preview_layout.addWidget(self.spine_preview_status_label)
+            self.spine_reset_preview_button.clicked.connect(lambda: self.spine_preview.reset_front_view())
+            self.spine_model_check.toggled.connect(self.spine_preview.set_model_visible)
+            self.spine_bone_names_check.toggled.connect(self.spine_preview.set_bone_names_visible)
+        else:
+            self.spine_preview = None
+            self.spine_preview_status_label = QtWidgets.QLabel("Spine preview dependencies are unavailable.")
+            self.spine_preview_status_label.setObjectName("fieldHint")
+            spine_preview_layout.addWidget(self.spine_preview_status_label)
+        layout.addWidget(self.spine_preview_group, 1)
+
+        self.spine_table_group = QtWidgets.QGroupBox("Detected Bones")
+        spine_table_layout = QtWidgets.QVBoxLayout(self.spine_table_group)
+        self.spine_table = QtWidgets.QTableWidget(0, 6)
+        self.spine_table.setHorizontalHeaderLabels(["Target", "Source / Override", "Action", "Parent After Fix", "Confidence", "Warnings"])
+        self.spine_table.horizontalHeader().setStretchLastSection(True)
+        self.spine_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.spine_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.spine_table.setMinimumHeight(230)
+        self.spine_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        spine_table_layout.addWidget(self.spine_table)
+        layout.addWidget(self.spine_table_group)
+
+        self.spine_progress_group = QtWidgets.QGroupBox("Progress")
+        spine_progress_layout = QtWidgets.QVBoxLayout(self.spine_progress_group)
+        self.spine_progress_bar = QtWidgets.QProgressBar()
+        self.spine_progress_bar.setRange(0, 100)
+        self.spine_progress_label = QtWidgets.QLabel("Idle")
+        self.spine_progress_label.setObjectName("progressStatus")
+        self.spine_progress_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self.spine_progress_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        spine_progress_layout.addWidget(self.spine_progress_bar)
+        spine_progress_layout.addWidget(self.spine_progress_label)
+        layout.addWidget(self.spine_progress_group)
+
+        spine_toggles = QtWidgets.QHBoxLayout()
+        self.spine_outputs_toggle = QtWidgets.QToolButton()
+        self.spine_outputs_toggle.setText("Show Outputs")
+        self.spine_outputs_toggle.setCheckable(True)
+        self.spine_outputs_toggle.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogDetailedView))
+        self.spine_log_toggle = QtWidgets.QToolButton()
+        self.spine_log_toggle.setText("Show Log")
+        self.spine_log_toggle.setCheckable(True)
+        self.spine_log_toggle.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogInfoView))
+        spine_toggles.addWidget(self.spine_outputs_toggle)
+        spine_toggles.addWidget(self.spine_log_toggle)
+        spine_toggles.addStretch(1)
+        layout.addLayout(spine_toggles)
+
+        self.spine_output_group = QtWidgets.QGroupBox("Outputs")
+        spine_outputs = QtWidgets.QFormLayout(self.spine_output_group)
+        self.spine_fixed_blend_label = QtWidgets.QLabel("")
+        self.spine_analysis_label = QtWidgets.QLabel("")
+        self.spine_plan_label = QtWidgets.QLabel("")
+        self.spine_log_label = QtWidgets.QLabel("")
+        self.spine_report_label = QtWidgets.QLabel("")
+        for label in (self.spine_fixed_blend_label, self.spine_analysis_label, self.spine_plan_label, self.spine_log_label, self.spine_report_label):
+            label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+            label.setWordWrap(True)
+        spine_outputs.addRow("Spine-fixed .blend", self.spine_fixed_blend_label)
+        spine_outputs.addRow("Analysis", self.spine_analysis_label)
+        spine_outputs.addRow("Plan", self.spine_plan_label)
+        spine_outputs.addRow("Log", self.spine_log_label)
+        spine_outputs.addRow("Report", self.spine_report_label)
+        self.spine_output_group.setVisible(False)
+        layout.addWidget(self.spine_output_group)
+
+        self.spine_log_group = QtWidgets.QGroupBox("Log")
+        spine_log_layout = QtWidgets.QVBoxLayout(self.spine_log_group)
+        self.spine_log = QtWidgets.QPlainTextEdit()
+        self.spine_log.setReadOnly(True)
+        self.spine_log.setMinimumHeight(160)
+        self.copy_spine_log_button = QtWidgets.QPushButton("Copy Log")
+        self.copy_spine_log_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogSaveButton))
+        self.copy_spine_log_button.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(self.spine_log.toPlainText()))
+        spine_log_layout.addWidget(self.spine_log, 1)
+        spine_log_layout.addWidget(self.copy_spine_log_button, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+        self.spine_log_group.setVisible(False)
+        layout.addWidget(self.spine_log_group, 1)
+
+        self.spine_input_row.changed.connect(self.on_spine_input_changed)
+        self.detect_fixed_blend_button.clicked.connect(self.detect_step2_output)
+        self.spine_analyze_button.clicked.connect(self.start_spine_analyze)
+        self.spine_apply_button.clicked.connect(self.start_spine_fix)
+        self.spine_validate_button.clicked.connect(self.validate_spine_plan)
+        self.spine_cancel_button.clicked.connect(self.cancel_spine)
+        self.open_spine_folder_button.clicked.connect(self.open_spine_folder)
+        self.spine_outputs_toggle.toggled.connect(self.set_spine_outputs_visible)
+        self.spine_log_toggle.toggled.connect(self.set_spine_log_visible)
+
+        scroll.setWidget(content)
+        tab_layout.addWidget(scroll)
+        self.tabs.addTab(tab, "3 Fix Spine Bones")
+
+    def _build_sort_bones_tab(self) -> None:
+        tab = QtWidgets.QWidget()
+        tab_layout = QtWidgets.QVBoxLayout(tab)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        content = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(content)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        self.sort_input_row = PathRow(
+            "Step 3 spine-fixed .blend",
+            "file",
+            "Blender files (*.blend);;All files (*.*)",
+            required=True,
+            hint="Use the .blend produced by step 3",
+        )
+        layout.addWidget(self.sort_input_row)
+
+        sort_settings = QtWidgets.QFormLayout()
+        self.sort_output_edit = QtWidgets.QLineEdit()
+        self.sort_output_edit.setReadOnly(True)
+        self.sort_limit_spin = QtWidgets.QSpinBox()
+        self.sort_limit_spin.setRange(1, 254)
+        self.sort_limit_spin.setValue(254)
+        self.sort_limit_spin.setToolTip("Source/GMod hard bone limit. Leave at 254 unless you need a lower target.")
+        sort_settings.addRow("Output folder", self.sort_output_edit)
+        sort_settings.addRow("Bone limit", self.sort_limit_spin)
+        layout.addLayout(sort_settings)
+
+        self.sort_summary_group = QtWidgets.QGroupBox("Bone Merge Plan")
+        sort_summary_layout = QtWidgets.QVBoxLayout(self.sort_summary_group)
+        self.sort_summary_label = QtWidgets.QLabel(
+            "Analyze the step-3 armature, review or edit the proposed merges, then apply until the model is under the Source bone limit."
+        )
+        self.sort_summary_label.setWordWrap(True)
+        self.sort_summary_label.setObjectName("fieldHint")
+        sort_summary_layout.addWidget(self.sort_summary_label)
+        layout.addWidget(self.sort_summary_group)
+
+        sort_actions = QtWidgets.QHBoxLayout()
+        self.detect_spine_blend_button = QtWidgets.QPushButton("Detect Step 3 Output")
+        self.detect_spine_blend_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogContentsView))
+        self.sort_analyze_button = QtWidgets.QPushButton("Analyze Bones")
+        self.sort_analyze_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogContentsView))
+        self.sort_manual_merge_button = QtWidgets.QPushButton("Apply Manual Merge")
+        self.sort_manual_merge_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogOpenButton))
+        self.sort_manual_merge_button.setEnabled(False)
+        self.sort_apply_button = QtWidgets.QPushButton("Apply Auto Merge")
+        self.sort_apply_button.setObjectName("importButton")
+        self.sort_apply_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_MediaPlay))
+        self.sort_apply_button.setEnabled(False)
+        self.sort_validate_button = QtWidgets.QPushButton("Validate")
+        self.sort_validate_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogApplyButton))
+        self.sort_cancel_button = QtWidgets.QPushButton("Cancel")
+        self.sort_cancel_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogCancelButton))
+        self.sort_cancel_button.setEnabled(False)
+        self.open_sort_folder_button = QtWidgets.QPushButton("Open Folder")
+        self.open_sort_folder_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DirOpenIcon))
+        self.open_sort_folder_button.setEnabled(False)
+        sort_actions.addWidget(self.detect_spine_blend_button)
+        sort_actions.addWidget(self.sort_analyze_button)
+        sort_actions.addWidget(self.sort_manual_merge_button)
+        sort_actions.addWidget(self.sort_apply_button)
+        sort_actions.addWidget(self.sort_validate_button)
+        sort_actions.addWidget(self.sort_cancel_button)
+        sort_actions.addWidget(self.open_sort_folder_button)
+        sort_actions.addStretch(1)
+        layout.addLayout(sort_actions)
+
+        self.sort_preview_group = QtWidgets.QGroupBox("Merge Preview")
+        sort_preview_layout = QtWidgets.QVBoxLayout(self.sort_preview_group)
+        if SkeletonPlanPreviewWidget is not None:
+            self.sort_preview = SkeletonPlanPreviewWidget()
+            self.sort_preview_status_label = QtWidgets.QLabel("Bone merge preview idle")
+            self.sort_preview_status_label.setObjectName("fieldHint")
+            self.sort_preview_status_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+            self.sort_preview.statsChanged.connect(self.sort_preview_status_label.setText)
+            sort_preview_layout.addWidget(self.sort_preview, 1)
+            sort_preview_controls = QtWidgets.QHBoxLayout()
+            self.sort_reset_preview_button = QtWidgets.QPushButton("Reset View")
+            self.sort_reset_preview_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_ArrowBack))
+            self.sort_model_check = QtWidgets.QCheckBox("Model")
+            self.sort_model_check.setChecked(True)
+            self.sort_bone_names_check = QtWidgets.QCheckBox("Bone Names")
+            sort_preview_controls.addWidget(self.sort_reset_preview_button)
+            sort_preview_controls.addWidget(self.sort_model_check)
+            sort_preview_controls.addWidget(self.sort_bone_names_check)
+            sort_preview_controls.addStretch(1)
+            sort_preview_layout.addLayout(sort_preview_controls)
+            sort_preview_layout.addWidget(self.sort_preview_status_label)
+            self.sort_reset_preview_button.clicked.connect(lambda: self.sort_preview.reset_front_view())
+            self.sort_model_check.toggled.connect(self.sort_preview.set_model_visible)
+            self.sort_bone_names_check.toggled.connect(self.sort_preview.set_bone_names_visible)
+            self.sort_preview.boneContextActionRequested.connect(self.handle_sort_preview_bone_action)
+        else:
+            self.sort_preview = None
+            self.sort_preview_status_label = QtWidgets.QLabel("Merge preview dependencies are unavailable.")
+            self.sort_preview_status_label.setObjectName("fieldHint")
+            sort_preview_layout.addWidget(self.sort_preview_status_label)
+        layout.addWidget(self.sort_preview_group, 1)
+
+        manual_group = QtWidgets.QGroupBox("Manual Overrides")
+        manual_layout = QtWidgets.QGridLayout(manual_group)
+        self.sort_protect_combo = QtWidgets.QComboBox()
+        self.sort_source_combo = QtWidgets.QComboBox()
+        self.sort_target_combo = QtWidgets.QComboBox()
+        self.sort_add_protected_button = QtWidgets.QPushButton("Protect Bone")
+        self.sort_add_protected_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogApplyButton))
+        self.sort_add_manual_button = QtWidgets.QPushButton("Add Manual Merge")
+        self.sort_add_manual_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogNewFolder))
+        manual_layout.addWidget(QtWidgets.QLabel("Protect"), 0, 0)
+        manual_layout.addWidget(self.sort_protect_combo, 0, 1)
+        manual_layout.addWidget(self.sort_add_protected_button, 0, 2)
+        manual_layout.addWidget(QtWidgets.QLabel("Merge source"), 1, 0)
+        manual_layout.addWidget(self.sort_source_combo, 1, 1)
+        manual_layout.addWidget(QtWidgets.QLabel("Target"), 1, 2)
+        manual_layout.addWidget(self.sort_target_combo, 1, 3)
+        manual_layout.addWidget(self.sort_add_manual_button, 1, 4)
+        manual_layout.setColumnStretch(1, 1)
+        manual_layout.setColumnStretch(3, 1)
+        layout.addWidget(manual_group)
+
+        self.sort_table_group = QtWidgets.QGroupBox("Merge Operations")
+        sort_table_layout = QtWidgets.QVBoxLayout(self.sort_table_group)
+        self.sort_table = QtWidgets.QTableWidget(0, 7)
+        self.sort_table.setHorizontalHeaderLabels(["Enabled", "Round", "Source", "Target", "Branch", "Reason", "Warnings"])
+        self.sort_table.horizontalHeader().setStretchLastSection(True)
+        self.sort_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.sort_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.sort_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.sort_table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.sort_table.setMinimumHeight(260)
+        self.sort_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        sort_table_layout.addWidget(self.sort_table)
+        layout.addWidget(self.sort_table_group)
+
+        self.sort_progress_group = QtWidgets.QGroupBox("Progress")
+        sort_progress_layout = QtWidgets.QVBoxLayout(self.sort_progress_group)
+        self.sort_progress_bar = QtWidgets.QProgressBar()
+        self.sort_progress_bar.setRange(0, 100)
+        self.sort_progress_label = QtWidgets.QLabel("Idle")
+        self.sort_progress_label.setObjectName("progressStatus")
+        self.sort_progress_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self.sort_progress_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        sort_progress_layout.addWidget(self.sort_progress_bar)
+        sort_progress_layout.addWidget(self.sort_progress_label)
+        layout.addWidget(self.sort_progress_group)
+
+        sort_toggles = QtWidgets.QHBoxLayout()
+        self.sort_outputs_toggle = QtWidgets.QToolButton()
+        self.sort_outputs_toggle.setText("Show Outputs")
+        self.sort_outputs_toggle.setCheckable(True)
+        self.sort_outputs_toggle.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogDetailedView))
+        self.sort_log_toggle = QtWidgets.QToolButton()
+        self.sort_log_toggle.setText("Show Log")
+        self.sort_log_toggle.setCheckable(True)
+        self.sort_log_toggle.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogInfoView))
+        sort_toggles.addWidget(self.sort_outputs_toggle)
+        sort_toggles.addWidget(self.sort_log_toggle)
+        sort_toggles.addStretch(1)
+        layout.addLayout(sort_toggles)
+
+        self.sort_output_group = QtWidgets.QGroupBox("Outputs")
+        sort_outputs = QtWidgets.QFormLayout(self.sort_output_group)
+        self.sort_blend_label = QtWidgets.QLabel("")
+        self.sort_manual_blend_label = QtWidgets.QLabel("")
+        self.sort_analysis_label = QtWidgets.QLabel("")
+        self.sort_plan_label = QtWidgets.QLabel("")
+        self.sort_log_label = QtWidgets.QLabel("")
+        self.sort_report_label = QtWidgets.QLabel("")
+        for label in (self.sort_blend_label, self.sort_manual_blend_label, self.sort_analysis_label, self.sort_plan_label, self.sort_log_label, self.sort_report_label):
+            label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+            label.setWordWrap(True)
+        sort_outputs.addRow("Bone-sorted .blend", self.sort_blend_label)
+        sort_outputs.addRow("Manual merge .blend", self.sort_manual_blend_label)
+        sort_outputs.addRow("Analysis", self.sort_analysis_label)
+        sort_outputs.addRow("Plan", self.sort_plan_label)
+        sort_outputs.addRow("Log", self.sort_log_label)
+        sort_outputs.addRow("Report", self.sort_report_label)
+        self.sort_output_group.setVisible(False)
+        layout.addWidget(self.sort_output_group)
+
+        self.sort_log_group = QtWidgets.QGroupBox("Log")
+        sort_log_layout = QtWidgets.QVBoxLayout(self.sort_log_group)
+        self.sort_log = QtWidgets.QPlainTextEdit()
+        self.sort_log.setReadOnly(True)
+        self.sort_log.setMinimumHeight(160)
+        self.copy_sort_log_button = QtWidgets.QPushButton("Copy Log")
+        self.copy_sort_log_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogSaveButton))
+        self.copy_sort_log_button.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(self.sort_log.toPlainText()))
+        sort_log_layout.addWidget(self.sort_log, 1)
+        sort_log_layout.addWidget(self.copy_sort_log_button, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+        self.sort_log_group.setVisible(False)
+        layout.addWidget(self.sort_log_group, 1)
+
+        self.sort_input_row.changed.connect(self.on_sort_input_changed)
+        self.sort_limit_spin.valueChanged.connect(lambda _value: (self.commit_sort_plan_edit(), self.save_settings()))
+        self.detect_spine_blend_button.clicked.connect(self.detect_step3_output)
+        self.sort_analyze_button.clicked.connect(self.start_sort_analyze)
+        self.sort_manual_merge_button.clicked.connect(self.start_sort_manual_merge)
+        self.sort_apply_button.clicked.connect(self.start_sort_bones)
+        self.sort_validate_button.clicked.connect(self.validate_sort_plan)
+        self.sort_cancel_button.clicked.connect(self.cancel_sort)
+        self.open_sort_folder_button.clicked.connect(self.open_sort_folder)
+        self.sort_table.itemChanged.connect(self.on_sort_table_item_changed)
+        self.sort_add_protected_button.clicked.connect(self.add_sort_protected_bone)
+        self.sort_add_manual_button.clicked.connect(self.add_manual_sort_operation)
+        self.sort_outputs_toggle.toggled.connect(self.set_sort_outputs_visible)
+        self.sort_log_toggle.toggled.connect(self.set_sort_log_visible)
+
+        scroll.setWidget(content)
+        tab_layout.addWidget(scroll)
+        self.tabs.addTab(tab, "4 Sort Bones")
+
+    def _build_sort_materials_tab(self) -> None:
+        tab = QtWidgets.QWidget()
+        tab_layout = QtWidgets.QVBoxLayout(tab)
+        tab_layout.setContentsMargins(10, 10, 10, 10)
+
+        self.material_subtabs = QtWidgets.QTabWidget()
+        tab_layout.addWidget(self.material_subtabs, 1)
+
+        scan_tab = QtWidgets.QWidget()
+        scan_layout = QtWidgets.QVBoxLayout(scan_tab)
+        scan_layout.setContentsMargins(0, 0, 0, 0)
+        scan_scroll = QtWidgets.QScrollArea()
+        scan_scroll.setWidgetResizable(True)
+        scan_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        scan_content = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(scan_content)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        self.material_input_row = PathRow(
+            "Step 4 bone-sorted .blend",
+            "file",
+            "Blender files (*.blend);;All files (*.*)",
+            required=True,
+            hint="Use the .blend produced by step 4",
+        )
+        layout.addWidget(self.material_input_row)
+
+        settings = QtWidgets.QFormLayout()
+        self.material_output_edit = QtWidgets.QLineEdit()
+        self.material_output_edit.setReadOnly(True)
+        self.material_limit_spin = QtWidgets.QSpinBox()
+        self.material_limit_spin.setRange(1, 32)
+        self.material_limit_spin.setValue(32)
+        self.material_limit_spin.setToolTip("Source/GMod material target for the final model.")
+        self.material_always_merge_check = QtWidgets.QCheckBox("Always open material merging after initial combine")
+        settings.addRow("Output folder", self.material_output_edit)
+        settings.addRow("Material limit", self.material_limit_spin)
+        settings.addRow("", self.material_always_merge_check)
+        layout.addLayout(settings)
+
+        self.material_summary_group = QtWidgets.QGroupBox("Material Plan")
+        summary_layout = QtWidgets.QVBoxLayout(self.material_summary_group)
+        self.material_summary_label = QtWidgets.QLabel(
+            "Scan the step-4 blend, review which material regions to keep, then proceed to cleanup and texture-based combining."
+        )
+        self.material_summary_label.setWordWrap(True)
+        self.material_summary_label.setObjectName("fieldHint")
+        summary_layout.addWidget(self.material_summary_label)
+        layout.addWidget(self.material_summary_group)
+
+        material_actions = QtWidgets.QHBoxLayout()
+        self.detect_sort_blend_button = QtWidgets.QPushButton("Detect Step 4 Output")
+        self.detect_sort_blend_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogContentsView))
+        self.material_scan_button = QtWidgets.QPushButton("Scan Materials")
+        self.material_scan_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogContentsView))
+        self.material_apply_button = QtWidgets.QPushButton("Proceed")
+        self.material_apply_button.setObjectName("importButton")
+        self.material_apply_button.setEnabled(False)
+        self.material_apply_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_MediaPlay))
+        self.material_validate_button = QtWidgets.QPushButton("Validate")
+        self.material_validate_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogApplyButton))
+        self.material_cancel_button = QtWidgets.QPushButton("Cancel")
+        self.material_cancel_button.setEnabled(False)
+        self.material_cancel_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogCancelButton))
+        self.open_material_folder_button = QtWidgets.QPushButton("Open Folder")
+        self.open_material_folder_button.setEnabled(False)
+        self.open_material_folder_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DirOpenIcon))
+        for widget in (
+            self.detect_sort_blend_button,
+            self.material_scan_button,
+            self.material_apply_button,
+            self.material_validate_button,
+            self.material_cancel_button,
+            self.open_material_folder_button,
+        ):
+            material_actions.addWidget(widget)
+        material_actions.addStretch(1)
+        layout.addLayout(material_actions)
+
+        preview_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        self.material_preview_group = QtWidgets.QGroupBox("Material Preview")
+        preview_layout = QtWidgets.QVBoxLayout(self.material_preview_group)
+        if MaterialPreviewWidget is not None:
+            self.material_preview = MaterialPreviewWidget()
+            self.material_preview_status_label = QtWidgets.QLabel("Material preview idle")
+            self.material_preview_status_label.setObjectName("fieldHint")
+            self.material_preview.statsChanged.connect(self.material_preview_status_label.setText)
+            preview_layout.addWidget(self.material_preview, 1)
+            controls = QtWidgets.QHBoxLayout()
+            self.material_wireframe_check = QtWidgets.QCheckBox("Wireframe")
+            self.material_alpha_check = QtWidgets.QCheckBox("Respect Alpha")
+            controls.addWidget(self.material_wireframe_check)
+            controls.addWidget(self.material_alpha_check)
+            for direction in ("Front", "Back", "Left", "Right", "Top", "Bottom"):
+                button = QtWidgets.QPushButton(direction)
+                button.setMaximumWidth(70)
+                button.clicked.connect(lambda _checked=False, d=direction: self.material_preview.reset_view(d))
+                controls.addWidget(button)
+            controls.addStretch(1)
+            preview_layout.addLayout(controls)
+            preview_layout.addWidget(self.material_preview_status_label)
+            self.material_wireframe_check.toggled.connect(self.material_preview.set_wireframe_visible)
+            self.material_alpha_check.toggled.connect(self.material_preview.set_respect_alpha)
+        else:
+            self.material_preview = None
+            self.material_preview_status_label = QtWidgets.QLabel("Material preview dependencies are unavailable.")
+            self.material_preview_status_label.setObjectName("fieldHint")
+            preview_layout.addWidget(self.material_preview_status_label)
+        preview_splitter.addWidget(self.material_preview_group)
+
+        self.material_table_group = QtWidgets.QGroupBox("Scanned Materials")
+        table_layout = QtWidgets.QVBoxLayout(self.material_table_group)
+        table_layout.setSpacing(8)
+        self.material_texture_preview_strip = QtWidgets.QWidget()
+        self.material_texture_preview_strip.setFixedHeight(178)
+        texture_preview_layout = QtWidgets.QHBoxLayout()
+        texture_preview_layout.setContentsMargins(0, 0, 0, 0)
+        self.material_texture_preview_label = QtWidgets.QLabel("Hover a material row")
+        self.material_texture_preview_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.material_texture_preview_label.setFixedSize(220, 160)
+        self.material_texture_preview_label.setStyleSheet("border: 1px solid #444; background: #191b1f; color: #8f98a3;")
+        self.material_texture_info_label = FixedHintLabel("Base color texture preview", width=420, height=160)
+        self.material_texture_info_label.setObjectName("fieldHint")
+        self.material_texture_info_label.setWordWrap(False)
+        self.material_texture_info_label.setFixedHeight(160)
+        self.material_texture_info_label.setMinimumWidth(0)
+        self.material_texture_info_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignLeft)
+        self.material_texture_info_label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Fixed)
+        self.material_texture_info_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        texture_preview_layout.addWidget(self.material_texture_preview_label, 0)
+        texture_preview_layout.addWidget(self.material_texture_info_label, 1)
+        self.material_texture_preview_strip.setLayout(texture_preview_layout)
+        table_layout.addWidget(self.material_texture_preview_strip)
+        self.material_table = QtWidgets.QTableWidget(0, 8)
+        self.material_table.setHorizontalHeaderLabels(["Keep", "Material", "Proposed Name", "Vertices", "Faces", "Base Color", "Texture", "Warnings"])
+        self.material_table.horizontalHeader().setStretchLastSection(True)
+        self.material_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.material_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.material_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.material_table.horizontalHeader().setSectionResizeMode(6, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.material_table.setWordWrap(False)
+        self.material_table.verticalHeader().setDefaultSectionSize(38)
+        self.material_table.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Fixed)
+        self.material_table.setMinimumHeight(360)
+        self.material_table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked
+            | QtWidgets.QAbstractItemView.EditTrigger.SelectedClicked
+            | QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed
+        )
+        self.material_table.setMouseTracking(True)
+        self.material_table.viewport().setMouseTracking(True)
+        self.material_table.viewport().installEventFilter(self)
+        table_layout.addWidget(self.material_table)
+        preview_splitter.addWidget(self.material_table_group)
+        preview_splitter.setStretchFactor(0, 3)
+        preview_splitter.setStretchFactor(1, 4)
+        layout.addWidget(preview_splitter, 1)
+
+        self.material_progress_group = QtWidgets.QGroupBox("Progress")
+        progress_layout = QtWidgets.QVBoxLayout(self.material_progress_group)
+        self.material_progress_bar = QtWidgets.QProgressBar()
+        self.material_progress_bar.setRange(0, 100)
+        self.material_progress_label = QtWidgets.QLabel("Idle")
+        self.material_progress_label.setObjectName("progressStatus")
+        self.material_progress_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self.material_progress_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        progress_layout.addWidget(self.material_progress_bar)
+        progress_layout.addWidget(self.material_progress_label)
+
+        self.material_output_group = QtWidgets.QGroupBox("Outputs")
+        outputs = QtWidgets.QFormLayout(self.material_output_group)
+        self.material_sorted_blend_label = QtWidgets.QLabel("")
+        self.material_final_blend_label = QtWidgets.QLabel("")
+        self.material_scan_label = QtWidgets.QLabel("")
+        self.material_plan_label = QtWidgets.QLabel("")
+        self.material_merge_plan_label = QtWidgets.QLabel("")
+        self.material_log_label = QtWidgets.QLabel("")
+        self.material_report_label = QtWidgets.QLabel("")
+        self.material_mapping_label = QtWidgets.QLabel("")
+        for label in (
+            self.material_sorted_blend_label,
+            self.material_final_blend_label,
+            self.material_scan_label,
+            self.material_plan_label,
+            self.material_merge_plan_label,
+            self.material_log_label,
+            self.material_report_label,
+            self.material_mapping_label,
+        ):
+            label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+            label.setWordWrap(True)
+        outputs.addRow("Intermediate .blend", self.material_sorted_blend_label)
+        outputs.addRow("Final .blend", self.material_final_blend_label)
+        outputs.addRow("Scan", self.material_scan_label)
+        outputs.addRow("Plan", self.material_plan_label)
+        outputs.addRow("Merge plan", self.material_merge_plan_label)
+        outputs.addRow("Log", self.material_log_label)
+        outputs.addRow("Report", self.material_report_label)
+        outputs.addRow("Mapping", self.material_mapping_label)
+
+        self.material_log_group = QtWidgets.QGroupBox("Log")
+        log_layout = QtWidgets.QVBoxLayout(self.material_log_group)
+        self.material_log = QtWidgets.QPlainTextEdit()
+        self.material_log.setReadOnly(True)
+        self.material_log.setMinimumHeight(160)
+        self.copy_material_log_button = QtWidgets.QPushButton("Copy Log")
+        self.copy_material_log_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogSaveButton))
+        self.copy_material_log_button.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(self.material_log.toPlainText()))
+        log_layout.addWidget(self.material_log, 1)
+        log_layout.addWidget(self.copy_material_log_button, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+        self.material_log.setMaximumHeight(220)
+
+        scan_scroll.setWidget(scan_content)
+        scan_layout.addWidget(scan_scroll)
+        self.material_subtabs.addTab(scan_tab, "Scan / Combine")
+
+        merge_tab = QtWidgets.QWidget()
+        merge_layout = QtWidgets.QVBoxLayout(merge_tab)
+        merge_layout.setContentsMargins(0, 0, 0, 0)
+        self.material_merge_summary_label = QtWidgets.QLabel("Run the first material cleanup step to generate an editable merge plan.")
+        self.material_merge_summary_label.setObjectName("fieldHint")
+        self.material_merge_summary_label.setWordWrap(True)
+        merge_layout.addWidget(self.material_merge_summary_label)
+        merge_actions = QtWidgets.QHBoxLayout()
+        self.material_merge_button = QtWidgets.QPushButton("Apply Material Merge")
+        self.material_merge_button.setObjectName("importButton")
+        self.material_merge_button.setEnabled(False)
+        self.material_merge_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_MediaPlay))
+        self.material_merge_validate_button = QtWidgets.QPushButton("Validate Merge Plan")
+        self.material_merge_validate_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogApplyButton))
+        merge_actions.addWidget(self.material_merge_button)
+        merge_actions.addWidget(self.material_merge_validate_button)
+        merge_actions.addStretch(1)
+        merge_layout.addLayout(merge_actions)
+
+        merge_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        self.material_merge_preview_group = QtWidgets.QGroupBox("Material Preview")
+        merge_preview_layout = QtWidgets.QVBoxLayout(self.material_merge_preview_group)
+        if MaterialPreviewWidget is not None:
+            self.material_merge_preview = MaterialPreviewWidget()
+            self.material_merge_preview_status_label = QtWidgets.QLabel("Material preview idle")
+            self.material_merge_preview_status_label.setObjectName("fieldHint")
+            self.material_merge_preview.statsChanged.connect(self.material_merge_preview_status_label.setText)
+            merge_preview_layout.addWidget(self.material_merge_preview, 1)
+            merge_preview_controls = QtWidgets.QHBoxLayout()
+            self.material_merge_wireframe_check = QtWidgets.QCheckBox("Wireframe")
+            self.material_merge_alpha_check = QtWidgets.QCheckBox("Respect Alpha")
+            merge_preview_controls.addWidget(self.material_merge_wireframe_check)
+            merge_preview_controls.addWidget(self.material_merge_alpha_check)
+            for direction in ("Front", "Back", "Left", "Right", "Top", "Bottom"):
+                button = QtWidgets.QPushButton(direction)
+                button.setMaximumWidth(70)
+                button.clicked.connect(lambda _checked=False, d=direction: self.material_merge_preview.reset_view(d))
+                merge_preview_controls.addWidget(button)
+            merge_preview_controls.addStretch(1)
+            merge_preview_layout.addLayout(merge_preview_controls)
+            merge_preview_layout.addWidget(self.material_merge_preview_status_label)
+            self.material_merge_wireframe_check.toggled.connect(self.material_merge_preview.set_wireframe_visible)
+            self.material_merge_alpha_check.toggled.connect(self.material_merge_preview.set_respect_alpha)
+        else:
+            self.material_merge_preview = None
+            self.material_merge_preview_status_label = QtWidgets.QLabel("Material preview dependencies are unavailable.")
+            self.material_merge_preview_status_label.setObjectName("fieldHint")
+            merge_preview_layout.addWidget(self.material_merge_preview_status_label)
+        merge_splitter.addWidget(self.material_merge_preview_group)
+
+        self.material_merge_table_group = QtWidgets.QGroupBox("Merge Materials")
+        merge_table_layout = QtWidgets.QVBoxLayout(self.material_merge_table_group)
+        merge_table_layout.setSpacing(8)
+        self.material_merge_texture_preview_strip = QtWidgets.QWidget()
+        self.material_merge_texture_preview_strip.setFixedHeight(178)
+        merge_texture_preview_layout = QtWidgets.QHBoxLayout()
+        merge_texture_preview_layout.setContentsMargins(0, 0, 0, 0)
+        self.material_merge_texture_preview_label = QtWidgets.QLabel("Hover a material row")
+        self.material_merge_texture_preview_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.material_merge_texture_preview_label.setFixedSize(220, 160)
+        self.material_merge_texture_preview_label.setStyleSheet("border: 1px solid #444; background: #191b1f; color: #8f98a3;")
+        self.material_merge_texture_info_label = FixedHintLabel("Base color texture preview", width=420, height=160)
+        self.material_merge_texture_info_label.setObjectName("fieldHint")
+        self.material_merge_texture_info_label.setWordWrap(False)
+        self.material_merge_texture_info_label.setFixedHeight(160)
+        self.material_merge_texture_info_label.setMinimumWidth(0)
+        self.material_merge_texture_info_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignLeft)
+        self.material_merge_texture_info_label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Fixed)
+        self.material_merge_texture_info_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        merge_texture_preview_layout.addWidget(self.material_merge_texture_preview_label, 0)
+        merge_texture_preview_layout.addWidget(self.material_merge_texture_info_label, 1)
+        self.material_merge_texture_preview_strip.setLayout(merge_texture_preview_layout)
+        merge_table_layout.addWidget(self.material_merge_texture_preview_strip)
+
+        self.material_merge_table = QtWidgets.QTableWidget(0, 8)
+        self.material_merge_table.setHorizontalHeaderLabels(["Use", "Group", "Final Name", "Material", "Vertices", "Faces", "Base Color", "Warnings"])
+        self.material_merge_table.horizontalHeader().setStretchLastSection(True)
+        self.material_merge_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.material_merge_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.material_merge_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.material_merge_table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.material_merge_table.setWordWrap(False)
+        self.material_merge_table.verticalHeader().setDefaultSectionSize(38)
+        self.material_merge_table.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Fixed)
+        self.material_merge_table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked
+            | QtWidgets.QAbstractItemView.EditTrigger.SelectedClicked
+            | QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed
+        )
+        self.material_merge_table.setMouseTracking(True)
+        self.material_merge_table.viewport().setMouseTracking(True)
+        self.material_merge_table.viewport().installEventFilter(self)
+        merge_table_layout.addWidget(self.material_merge_table, 1)
+        merge_splitter.addWidget(self.material_merge_table_group)
+        merge_splitter.setStretchFactor(0, 3)
+        merge_splitter.setStretchFactor(1, 4)
+        merge_layout.addWidget(merge_splitter, 1)
+        self.material_subtabs.addTab(merge_tab, "Merging Material")
+
+        tab_layout.addWidget(self.material_progress_group)
+        self.material_details_toggle_row = QtWidgets.QWidget()
+        details_layout = QtWidgets.QHBoxLayout(self.material_details_toggle_row)
+        details_layout.setContentsMargins(0, 0, 0, 0)
+        details_layout.setSpacing(8)
+        self.material_outputs_toggle = QtWidgets.QToolButton()
+        self.material_outputs_toggle.setText("Show Outputs")
+        self.material_outputs_toggle.setCheckable(True)
+        self.material_outputs_toggle.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.material_outputs_toggle.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogDetailedView))
+        self.material_log_toggle = QtWidgets.QToolButton()
+        self.material_log_toggle.setText("Show Log")
+        self.material_log_toggle.setCheckable(True)
+        self.material_log_toggle.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.material_log_toggle.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogInfoView))
+        details_layout.addWidget(self.material_outputs_toggle)
+        details_layout.addWidget(self.material_log_toggle)
+        details_layout.addStretch(1)
+        tab_layout.addWidget(self.material_details_toggle_row)
+        tab_layout.addWidget(self.material_output_group)
+        tab_layout.addWidget(self.material_log_group)
+        self.material_output_group.setVisible(False)
+        self.material_log_group.setVisible(False)
+        self.material_outputs_toggle.toggled.connect(self.set_material_outputs_visible)
+        self.material_log_toggle.toggled.connect(self.set_material_log_visible)
+
+        self.material_input_row.changed.connect(self.on_material_input_changed)
+        self.material_limit_spin.valueChanged.connect(lambda _value: (self.update_material_summary(), self.save_settings()))
+        self.detect_sort_blend_button.clicked.connect(self.detect_step4_output)
+        self.material_scan_button.clicked.connect(self.start_material_scan)
+        self.material_apply_button.clicked.connect(self.start_material_apply)
+        self.material_validate_button.clicked.connect(self.validate_material_plan)
+        self.material_cancel_button.clicked.connect(self.cancel_material)
+        self.open_material_folder_button.clicked.connect(self.open_material_folder)
+        self.material_table.itemChanged.connect(self.on_material_table_item_changed)
+        self.material_merge_table.itemChanged.connect(self.on_material_merge_table_item_changed)
+        self.material_merge_button.clicked.connect(self.start_material_merge)
+        self.material_merge_validate_button.clicked.connect(self.validate_material_merge_plan)
+
+        self.tabs.addTab(tab, "5 Sort Materials")
+
+    def _build_sort_bodygroups_tab(self) -> None:
+        tab = QtWidgets.QWidget()
+        tab_layout = QtWidgets.QVBoxLayout(tab)
+        tab_layout.setContentsMargins(10, 10, 10, 10)
+
+        self.bodygroup_input_row = PathRow(
+            "Step 5 final .blend",
+            "file",
+            "Blender files (*.blend);;All files (*.*)",
+            required=True,
+            hint="Use the material-sorted or material-merged .blend produced by step 5",
+        )
+        tab_layout.addWidget(self.bodygroup_input_row)
+
+        settings = QtWidgets.QFormLayout()
+        self.bodygroup_output_edit = QtWidgets.QLineEdit()
+        self.bodygroup_output_edit.setReadOnly(True)
+        self.bodygroup_scale_spin = QtWidgets.QDoubleSpinBox()
+        self.bodygroup_scale_spin.setRange(0.001, 1000.0)
+        self.bodygroup_scale_spin.setDecimals(3)
+        self.bodygroup_scale_spin.setSingleStep(0.1)
+        self.bodygroup_scale_spin.setValue(float(getattr(core, "DEFAULT_BODYGROUP_SCALE_FACTOR", 40.457)))
+        self.bodygroup_scale_spin.setToolTip("Used only when the character height is still below 10 Blender units.")
+        self.bodygroup_scale_preset_label = QtWidgets.QLabel("Default scale factor")
+        self.bodygroup_scale_preset_label.setObjectName("fieldHint")
+        self.bodygroup_scale_factor_button = QtWidgets.QPushButton("Use Factor")
+        self.bodygroup_scale_tall_button = QtWidgets.QPushButton("Scale to Tall")
+        self.bodygroup_scale_normal_button = QtWidgets.QPushButton("Scale to Normal")
+        self.bodygroup_scale_short_button = QtWidgets.QPushButton("Scale to Short")
+        self.bodygroup_scale_preset_buttons = {
+            "factor": self.bodygroup_scale_factor_button,
+            "tall": self.bodygroup_scale_tall_button,
+            "normal": self.bodygroup_scale_normal_button,
+            "short": self.bodygroup_scale_short_button,
+        }
+        preset_layout = QtWidgets.QHBoxLayout()
+        for preset_name, button in self.bodygroup_scale_preset_buttons.items():
+            button.setCheckable(True)
+            button.clicked.connect(lambda _checked=False, p=preset_name: self.set_bodygroup_scale_preset(p))
+            preset_layout.addWidget(button)
+        preset_layout.addWidget(self.bodygroup_scale_preset_label, 1)
+        self.bodygroup_always_auto_split_check = QtWidgets.QCheckBox("Always run auto-split clustering")
+        self.bodygroup_always_auto_split_check.setToolTip(
+            "Off: show material-split bodygroups and only run advanced splitting when a separated mesh exceeds 65,535 vertices."
+        )
+        self.bodygroup_rtx_limit_check = QtWidgets.QCheckBox("Enforce 32,767 vertex limit (RTX Remix)")
+        self.bodygroup_rtx_limit_check.setToolTip(
+            "Default GMod builds allow 65,535 vertices per bodygroup. Enable this for RTX Remix builds that require 32,767."
+        )
+        settings.addRow("Output folder", self.bodygroup_output_edit)
+        settings.addRow("Scale factor", self.bodygroup_scale_spin)
+        settings.addRow("Scale preset", preset_layout)
+        settings.addRow("Auto split", self.bodygroup_always_auto_split_check)
+        settings.addRow("Vertex limit", self.bodygroup_rtx_limit_check)
+        tab_layout.addLayout(settings)
+
+        actions = QtWidgets.QHBoxLayout()
+        self.detect_material_blend_button = QtWidgets.QPushButton("Detect Step 5 Output")
+        self.detect_material_blend_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogContentsView))
+        self.bodygroup_analyze_button = QtWidgets.QPushButton("Analyze Bodygroups")
+        self.bodygroup_analyze_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogContentsView))
+        self.bodygroup_apply_button = QtWidgets.QPushButton("Proceed Automatically")
+        self.bodygroup_apply_button.setObjectName("importButton")
+        self.bodygroup_apply_button.setEnabled(False)
+        self.bodygroup_apply_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_MediaPlay))
+        self.bodygroup_manual_button = QtWidgets.QPushButton("Proceed Manually")
+        self.bodygroup_manual_button.setEnabled(False)
+        self.bodygroup_manual_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogOpenButton))
+        self.bodygroup_cancel_button = QtWidgets.QPushButton("Cancel")
+        self.bodygroup_cancel_button.setEnabled(False)
+        self.bodygroup_cancel_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogCancelButton))
+        self.open_bodygroup_folder_button = QtWidgets.QPushButton("Open Folder")
+        self.open_bodygroup_folder_button.setEnabled(False)
+        self.open_bodygroup_folder_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DirOpenIcon))
+        for widget in (
+            self.detect_material_blend_button,
+            self.bodygroup_analyze_button,
+            self.bodygroup_apply_button,
+            self.bodygroup_manual_button,
+            self.bodygroup_cancel_button,
+            self.open_bodygroup_folder_button,
+        ):
+            actions.addWidget(widget)
+        actions.addStretch(1)
+        tab_layout.addLayout(actions)
+
+        self.bodygroup_summary_label = QtWidgets.QLabel("Detect a Step 5 blend and analyze bodygroups.")
+        self.bodygroup_summary_label.setObjectName("fieldHint")
+        self.bodygroup_summary_label.setWordWrap(True)
+        tab_layout.addWidget(self.bodygroup_summary_label)
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        preview_group = QtWidgets.QGroupBox("Bodygroup Preview")
+        preview_layout = QtWidgets.QVBoxLayout(preview_group)
+        if MaterialPreviewWidget is not None:
+            self.bodygroup_preview = MaterialPreviewWidget()
+            self.bodygroup_preview_status_label = QtWidgets.QLabel("Bodygroup preview idle")
+            self.bodygroup_preview_status_label.setObjectName("fieldHint")
+            self.bodygroup_preview.statsChanged.connect(self.bodygroup_preview_status_label.setText)
+            preview_layout.addWidget(self.bodygroup_preview, 1)
+            preview_controls = QtWidgets.QHBoxLayout()
+            self.bodygroup_wireframe_check = QtWidgets.QCheckBox("Wireframe")
+            self.bodygroup_alpha_check = QtWidgets.QCheckBox("Respect Alpha")
+            preview_controls.addWidget(self.bodygroup_wireframe_check)
+            preview_controls.addWidget(self.bodygroup_alpha_check)
+            for direction in ("Front", "Back", "Left", "Right", "Top", "Bottom"):
+                button = QtWidgets.QPushButton(direction)
+                button.setMaximumWidth(70)
+                button.clicked.connect(lambda _checked=False, d=direction: self.bodygroup_preview.reset_view(d))
+                preview_controls.addWidget(button)
+            preview_controls.addStretch(1)
+            preview_layout.addLayout(preview_controls)
+            preview_layout.addWidget(self.bodygroup_preview_status_label)
+            self.bodygroup_wireframe_check.toggled.connect(self.bodygroup_preview.set_wireframe_visible)
+            self.bodygroup_alpha_check.toggled.connect(self.bodygroup_preview.set_respect_alpha)
+        else:
+            self.bodygroup_preview = None
+            self.bodygroup_preview_status_label = QtWidgets.QLabel("Bodygroup preview dependencies are unavailable.")
+            self.bodygroup_preview_status_label.setObjectName("fieldHint")
+            preview_layout.addWidget(self.bodygroup_preview_status_label)
+        splitter.addWidget(preview_group)
+
+        table_group = QtWidgets.QGroupBox("Bodygroups")
+        table_layout = QtWidgets.QVBoxLayout(table_group)
+        table_actions = QtWidgets.QHBoxLayout()
+        table_actions.addStretch(1)
+        self.bodygroup_merge_button = QtWidgets.QPushButton("Merge Selected")
+        self.bodygroup_merge_button.setEnabled(False)
+        self.bodygroup_merge_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogApplyButton))
+        table_actions.addWidget(self.bodygroup_merge_button)
+        table_layout.addLayout(table_actions)
+        self.bodygroup_table = QtWidgets.QTableWidget(0, 10)
+        self.bodygroup_table.setHorizontalHeaderLabels(
+            ["Use", "Name", "Category", "Confidence", "Source", "Objects", "Vertices", "Faces", "Tracking Groups", "Warnings"]
+        )
+        self.bodygroup_table.horizontalHeader().setStretchLastSection(True)
+        self.bodygroup_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.bodygroup_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.bodygroup_table.horizontalHeader().setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.bodygroup_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.bodygroup_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.bodygroup_table.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.bodygroup_table.setMouseTracking(True)
+        self.bodygroup_table.viewport().setMouseTracking(True)
+        self.bodygroup_table.viewport().installEventFilter(self)
+        self.bodygroup_table.verticalHeader().setDefaultSectionSize(38)
+        self.bodygroup_table.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Fixed)
+        self.bodygroup_table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked
+            | QtWidgets.QAbstractItemView.EditTrigger.SelectedClicked
+            | QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed
+        )
+        table_layout.addWidget(self.bodygroup_table)
+        splitter.addWidget(table_group)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 4)
+        tab_layout.addWidget(splitter, 1)
+
+        self.bodygroup_progress_group = QtWidgets.QGroupBox("Progress")
+        bodygroup_progress_layout = QtWidgets.QVBoxLayout(self.bodygroup_progress_group)
+        self.bodygroup_progress_bar = QtWidgets.QProgressBar()
+        self.bodygroup_progress_bar.setRange(0, 100)
+        self.bodygroup_progress_label = QtWidgets.QLabel("Idle")
+        self.bodygroup_progress_label.setObjectName("progressStatus")
+        self.bodygroup_progress_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self.bodygroup_progress_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        bodygroup_progress_layout.addWidget(self.bodygroup_progress_bar)
+        bodygroup_progress_layout.addWidget(self.bodygroup_progress_label)
+        tab_layout.addWidget(self.bodygroup_progress_group)
+
+        toggles = QtWidgets.QHBoxLayout()
+        self.bodygroup_outputs_toggle = QtWidgets.QToolButton()
+        self.bodygroup_outputs_toggle.setText("Show Outputs")
+        self.bodygroup_outputs_toggle.setCheckable(True)
+        self.bodygroup_outputs_toggle.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogDetailedView))
+        self.bodygroup_log_toggle = QtWidgets.QToolButton()
+        self.bodygroup_log_toggle.setText("Show Log")
+        self.bodygroup_log_toggle.setCheckable(True)
+        self.bodygroup_log_toggle.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogInfoView))
+        toggles.addWidget(self.bodygroup_outputs_toggle)
+        toggles.addWidget(self.bodygroup_log_toggle)
+        toggles.addStretch(1)
+        tab_layout.addLayout(toggles)
+
+        self.bodygroup_output_group = QtWidgets.QGroupBox("Outputs")
+        bodygroup_outputs = QtWidgets.QFormLayout(self.bodygroup_output_group)
+        self.bodygroup_blend_label = QtWidgets.QLabel("")
+        self.bodygroup_manual_blend_label = QtWidgets.QLabel("")
+        self.bodygroup_analysis_label = QtWidgets.QLabel("")
+        self.bodygroup_plan_label = QtWidgets.QLabel("")
+        self.bodygroup_log_label = QtWidgets.QLabel("")
+        self.bodygroup_report_label = QtWidgets.QLabel("")
+        for label in (self.bodygroup_blend_label, self.bodygroup_manual_blend_label, self.bodygroup_analysis_label, self.bodygroup_plan_label, self.bodygroup_log_label, self.bodygroup_report_label):
+            label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+            label.setWordWrap(True)
+        bodygroup_outputs.addRow("Output .blend", self.bodygroup_blend_label)
+        bodygroup_outputs.addRow("Manual edit .blend", self.bodygroup_manual_blend_label)
+        bodygroup_outputs.addRow("Analysis", self.bodygroup_analysis_label)
+        bodygroup_outputs.addRow("Plan", self.bodygroup_plan_label)
+        bodygroup_outputs.addRow("Log", self.bodygroup_log_label)
+        bodygroup_outputs.addRow("Report", self.bodygroup_report_label)
+        self.bodygroup_output_group.setVisible(False)
+        tab_layout.addWidget(self.bodygroup_output_group)
+
+        self.bodygroup_log_group = QtWidgets.QGroupBox("Log")
+        bodygroup_log_layout = QtWidgets.QVBoxLayout(self.bodygroup_log_group)
+        self.bodygroup_log = QtWidgets.QPlainTextEdit()
+        self.bodygroup_log.setReadOnly(True)
+        self.bodygroup_log.setMaximumHeight(220)
+        self.copy_bodygroup_log_button = QtWidgets.QPushButton("Copy Log")
+        self.copy_bodygroup_log_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogSaveButton))
+        self.copy_bodygroup_log_button.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(self.bodygroup_log.toPlainText()))
+        bodygroup_log_layout.addWidget(self.bodygroup_log, 1)
+        bodygroup_log_layout.addWidget(self.copy_bodygroup_log_button, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+        self.bodygroup_log_group.setVisible(False)
+        tab_layout.addWidget(self.bodygroup_log_group)
+
+        self.bodygroup_input_row.changed.connect(self.on_bodygroup_input_changed)
+        self.bodygroup_scale_spin.valueChanged.connect(lambda _value: self.save_settings())
+        self.bodygroup_always_auto_split_check.toggled.connect(lambda _checked: self.save_settings())
+        self.bodygroup_rtx_limit_check.toggled.connect(self.on_bodygroup_rtx_limit_changed)
+        self.detect_material_blend_button.clicked.connect(self.detect_step5_output)
+        self.bodygroup_analyze_button.clicked.connect(self.start_bodygroup_analyze)
+        self.bodygroup_apply_button.clicked.connect(self.start_bodygroup_apply)
+        self.bodygroup_manual_button.clicked.connect(self.start_bodygroup_manual)
+        self.bodygroup_cancel_button.clicked.connect(self.cancel_bodygroup)
+        self.bodygroup_merge_button.clicked.connect(self.merge_selected_bodygroups)
+        self.open_bodygroup_folder_button.clicked.connect(self.open_bodygroup_folder)
+        self.bodygroup_table.itemChanged.connect(self.on_bodygroup_table_item_changed)
+        self.bodygroup_table.itemSelectionChanged.connect(self.on_bodygroup_table_selection_changed)
+        self.bodygroup_table.customContextMenuRequested.connect(self.show_bodygroup_context_menu)
+        self.bodygroup_outputs_toggle.toggled.connect(self.set_bodygroup_outputs_visible)
+        self.bodygroup_log_toggle.toggled.connect(self.set_bodygroup_log_visible)
+
+        self.tabs.addTab(tab, "6 Sort Bodygroups")
+
+    def _build_sort_flexes_tab(self) -> None:
+        tab = QtWidgets.QWidget()
+        tab_layout = QtWidgets.QVBoxLayout(tab)
+        tab_layout.setContentsMargins(10, 10, 10, 10)
+
+        self.flex_input_row = PathRow(
+            "Step 6 .blend",
+            "file",
+            "Blender files (*.blend);;All files (*.*)",
+            required=True,
+            hint="Use the bodygroup-sorted .blend produced by step 6",
+        )
+        tab_layout.addWidget(self.flex_input_row)
+
+        settings = QtWidgets.QFormLayout()
+        self.flex_output_edit = QtWidgets.QLineEdit()
+        self.flex_output_edit.setReadOnly(True)
+        self.flex_isolate_bodygroup_check = QtWidgets.QCheckBox("Preview selected bodygroup only")
+        self.flex_isolate_bodygroup_check.setToolTip("Off: preview the whole model. On: hide other bodygroups while previewing a flex.")
+        settings.addRow("Output folder", self.flex_output_edit)
+        settings.addRow("Preview", self.flex_isolate_bodygroup_check)
+        tab_layout.addLayout(settings)
+
+        actions = QtWidgets.QHBoxLayout()
+        self.detect_bodygroup_blend_button = QtWidgets.QPushButton("Detect Step 6 Output")
+        self.detect_bodygroup_blend_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogContentsView))
+        self.flex_analyze_button = QtWidgets.QPushButton("Analyze Flexes")
+        self.flex_analyze_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogContentsView))
+        self.flex_apply_button = QtWidgets.QPushButton("Apply Flexes")
+        self.flex_apply_button.setObjectName("importButton")
+        self.flex_apply_button.setEnabled(False)
+        self.flex_apply_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_MediaPlay))
+        self.flex_cancel_button = QtWidgets.QPushButton("Cancel")
+        self.flex_cancel_button.setEnabled(False)
+        self.flex_cancel_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogCancelButton))
+        self.open_flex_folder_button = QtWidgets.QPushButton("Open Folder")
+        self.open_flex_folder_button.setEnabled(False)
+        self.open_flex_folder_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DirOpenIcon))
+        for widget in (
+            self.detect_bodygroup_blend_button,
+            self.flex_analyze_button,
+            self.flex_apply_button,
+            self.flex_cancel_button,
+            self.open_flex_folder_button,
+        ):
+            actions.addWidget(widget)
+        actions.addStretch(1)
+        tab_layout.addLayout(actions)
+
+        self.flex_summary_label = QtWidgets.QLabel("Detect a Step 6 blend and analyze flexes.")
+        self.flex_summary_label.setObjectName("fieldHint")
+        self.flex_summary_label.setWordWrap(True)
+        tab_layout.addWidget(self.flex_summary_label)
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        preview_group = QtWidgets.QGroupBox("Flex Preview")
+        preview_layout = QtWidgets.QVBoxLayout(preview_group)
+        if MaterialPreviewWidget is not None:
+            self.flex_preview = MaterialPreviewWidget()
+            self.flex_preview_status_label = QtWidgets.QLabel("Flex preview idle")
+            self.flex_preview_status_label.setObjectName("fieldHint")
+            self.flex_preview.statsChanged.connect(self.flex_preview_status_label.setText)
+            preview_layout.addWidget(self.flex_preview, 1)
+            preview_controls = QtWidgets.QHBoxLayout()
+            self.flex_wireframe_check = QtWidgets.QCheckBox("Wireframe")
+            self.flex_alpha_check = QtWidgets.QCheckBox("Respect Alpha")
+            preview_controls.addWidget(self.flex_wireframe_check)
+            preview_controls.addWidget(self.flex_alpha_check)
+            for direction in ("Front", "Back", "Left", "Right", "Top", "Bottom"):
+                button = QtWidgets.QPushButton(direction)
+                button.setMaximumWidth(70)
+                button.clicked.connect(lambda _checked=False, d=direction: self.flex_preview.reset_view(d))
+                preview_controls.addWidget(button)
+            preview_controls.addStretch(1)
+            preview_layout.addLayout(preview_controls)
+            preview_layout.addWidget(self.flex_preview_status_label)
+            self.flex_wireframe_check.toggled.connect(self.flex_preview.set_wireframe_visible)
+            self.flex_alpha_check.toggled.connect(self.flex_preview.set_respect_alpha)
+            self.flex_isolate_bodygroup_check.toggled.connect(lambda _checked: self.refresh_flex_preview_state())
+        else:
+            self.flex_preview = None
+            self.flex_preview_status_label = QtWidgets.QLabel("Flex preview dependencies are unavailable.")
+            self.flex_preview_status_label.setObjectName("fieldHint")
+            preview_layout.addWidget(self.flex_preview_status_label)
+        splitter.addWidget(preview_group)
+
+        table_group = QtWidgets.QGroupBox("Flexes")
+        table_layout = QtWidgets.QVBoxLayout(table_group)
+        table_actions = QtWidgets.QHBoxLayout()
+        self.flex_merge_button = QtWidgets.QPushButton("Merge Selected")
+        self.flex_merge_button.setEnabled(False)
+        self.flex_merge_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogApplyButton))
+        table_actions.addWidget(self.flex_merge_button)
+        self.flex_remove_button = QtWidgets.QPushButton("Remove Selected")
+        self.flex_remove_button.setEnabled(False)
+        self.flex_remove_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogCancelButton))
+        table_actions.addWidget(self.flex_remove_button)
+        table_actions.addStretch(1)
+        table_layout.addLayout(table_actions)
+        self.flex_table = QtWidgets.QTableWidget(0, 10)
+        self.flex_table.setHorizontalHeaderLabels(
+            ["Use", "Final Name", "Original Name", "Bodygroup", "Category", "Confidence", "Rest", "Max", "Source/Merge", "Warnings"]
+        )
+        self.flex_table.horizontalHeader().setStretchLastSection(True)
+        self.flex_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.flex_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.flex_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.flex_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.flex_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.flex_table.setMouseTracking(True)
+        self.flex_table.viewport().setMouseTracking(True)
+        self.flex_table.viewport().installEventFilter(self)
+        self.flex_table.verticalHeader().setDefaultSectionSize(38)
+        self.flex_table.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Fixed)
+        self.flex_table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked
+            | QtWidgets.QAbstractItemView.EditTrigger.SelectedClicked
+            | QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed
+        )
+        table_layout.addWidget(self.flex_table)
+        splitter.addWidget(table_group)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 4)
+        tab_layout.addWidget(splitter, 1)
+
+        self.flex_progress_group = QtWidgets.QGroupBox("Progress")
+        flex_progress_layout = QtWidgets.QVBoxLayout(self.flex_progress_group)
+        self.flex_progress_bar = QtWidgets.QProgressBar()
+        self.flex_progress_bar.setRange(0, 100)
+        self.flex_progress_label = QtWidgets.QLabel("Idle")
+        self.flex_progress_label.setObjectName("progressStatus")
+        self.flex_progress_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self.flex_progress_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        flex_progress_layout.addWidget(self.flex_progress_bar)
+        flex_progress_layout.addWidget(self.flex_progress_label)
+        tab_layout.addWidget(self.flex_progress_group)
+
+        toggles = QtWidgets.QHBoxLayout()
+        self.flex_outputs_toggle = QtWidgets.QToolButton()
+        self.flex_outputs_toggle.setText("Show Outputs")
+        self.flex_outputs_toggle.setCheckable(True)
+        self.flex_outputs_toggle.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogDetailedView))
+        self.flex_log_toggle = QtWidgets.QToolButton()
+        self.flex_log_toggle.setText("Show Log")
+        self.flex_log_toggle.setCheckable(True)
+        self.flex_log_toggle.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogInfoView))
+        toggles.addWidget(self.flex_outputs_toggle)
+        toggles.addWidget(self.flex_log_toggle)
+        toggles.addStretch(1)
+        tab_layout.addLayout(toggles)
+
+        self.flex_output_group = QtWidgets.QGroupBox("Outputs")
+        flex_outputs = QtWidgets.QFormLayout(self.flex_output_group)
+        self.flex_blend_label = QtWidgets.QLabel("")
+        self.flex_analysis_label = QtWidgets.QLabel("")
+        self.flex_plan_label = QtWidgets.QLabel("")
+        self.flex_log_label = QtWidgets.QLabel("")
+        self.flex_report_label = QtWidgets.QLabel("")
+        self.flex_json_label = QtWidgets.QLabel("")
+        for label in (self.flex_blend_label, self.flex_analysis_label, self.flex_plan_label, self.flex_log_label, self.flex_report_label, self.flex_json_label):
+            label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+            label.setWordWrap(True)
+        flex_outputs.addRow("Output .blend", self.flex_blend_label)
+        flex_outputs.addRow("Analysis", self.flex_analysis_label)
+        flex_outputs.addRow("Plan", self.flex_plan_label)
+        flex_outputs.addRow("Log", self.flex_log_label)
+        flex_outputs.addRow("Report", self.flex_report_label)
+        flex_outputs.addRow("Flexes JSON", self.flex_json_label)
+        self.flex_output_group.setVisible(False)
+        tab_layout.addWidget(self.flex_output_group)
+
+        self.flex_log_group = QtWidgets.QGroupBox("Log")
+        flex_log_layout = QtWidgets.QVBoxLayout(self.flex_log_group)
+        self.flex_log = QtWidgets.QPlainTextEdit()
+        self.flex_log.setReadOnly(True)
+        self.flex_log.setMaximumHeight(220)
+        self.copy_flex_log_button = QtWidgets.QPushButton("Copy Log")
+        self.copy_flex_log_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogSaveButton))
+        self.copy_flex_log_button.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(self.flex_log.toPlainText()))
+        flex_log_layout.addWidget(self.flex_log, 1)
+        flex_log_layout.addWidget(self.copy_flex_log_button, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+        self.flex_log_group.setVisible(False)
+        tab_layout.addWidget(self.flex_log_group)
+
+        self.flex_input_row.changed.connect(self.on_flex_input_changed)
+        self.detect_bodygroup_blend_button.clicked.connect(self.detect_step6_output)
+        self.flex_analyze_button.clicked.connect(self.start_flex_analyze)
+        self.flex_apply_button.clicked.connect(self.start_flex_apply)
+        self.flex_cancel_button.clicked.connect(self.cancel_flex)
+        self.flex_merge_button.clicked.connect(self.merge_selected_flexes)
+        self.flex_remove_button.clicked.connect(self.remove_selected_flexes)
+        self.open_flex_folder_button.clicked.connect(self.open_flex_folder)
+        self.flex_table.itemChanged.connect(self.on_flex_table_item_changed)
+        self.flex_table.itemSelectionChanged.connect(self.on_flex_table_selection_changed)
+        self.flex_outputs_toggle.toggled.connect(self.set_flex_outputs_visible)
+        self.flex_log_toggle.toggled.connect(self.set_flex_log_visible)
+
+        self.tabs.addTab(tab, "7 Sort Flexes")
+
+    def _build_sort_collision_tab(self) -> None:
+        tab = QtWidgets.QWidget()
+        tab_layout = QtWidgets.QVBoxLayout(tab)
+        tab_layout.setContentsMargins(10, 10, 10, 10)
+
+        self.collision_input_row = PathRow(
+            "Step 7 .blend",
+            "file",
+            "Blender files (*.blend);;All files (*.*)",
+            required=True,
+            hint="Use the flex-sorted .blend produced by step 7",
+        )
+        tab_layout.addWidget(self.collision_input_row)
+
+        settings = QtWidgets.QFormLayout()
+        self.collision_output_edit = QtWidgets.QLineEdit()
+        self.collision_output_edit.setReadOnly(True)
+        self.collision_quality_combo = QtWidgets.QComboBox()
+        self.collision_quality_combo.addItem("Fast Preview", "fast_preview")
+        self.collision_quality_combo.addItem("Balanced", "balanced")
+        self.collision_quality_combo.addItem("High Quality", "high_quality")
+        self.collision_quality_combo.setToolTip("Fast Preview is much quicker for table/overlay review. Balanced and High Quality spend more time in CoACD.")
+        settings.addRow("Output folder", self.collision_output_edit)
+        settings.addRow("CoACD quality", self.collision_quality_combo)
+        tab_layout.addLayout(settings)
+
+        actions = QtWidgets.QHBoxLayout()
+        self.detect_flex_blend_button = QtWidgets.QPushButton("Detect Step 7 Output")
+        self.detect_flex_blend_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogContentsView))
+        self.collision_bones_button = QtWidgets.QPushButton("Select CoACD Bones")
+        self.collision_bones_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogDetailedView))
+        self.collision_sources_button = QtWidgets.QPushButton("Select CoACD Bodygroups")
+        self.collision_sources_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogListView))
+        self.collision_analyze_button = QtWidgets.QPushButton("Analyze Collision")
+        self.collision_analyze_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogContentsView))
+        self.collision_apply_button = QtWidgets.QPushButton("Apply Collision")
+        self.collision_apply_button.setObjectName("importButton")
+        self.collision_apply_button.setEnabled(False)
+        self.collision_apply_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_MediaPlay))
+        self.collision_validate_button = QtWidgets.QPushButton("Validate")
+        self.collision_validate_button.setEnabled(False)
+        self.collision_validate_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogApplyButton))
+        self.collision_cancel_button = QtWidgets.QPushButton("Cancel")
+        self.collision_cancel_button.setEnabled(False)
+        self.collision_cancel_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogCancelButton))
+        self.open_collision_folder_button = QtWidgets.QPushButton("Open Folder")
+        self.open_collision_folder_button.setEnabled(False)
+        self.open_collision_folder_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DirOpenIcon))
+        for widget in (
+            self.detect_flex_blend_button,
+            self.collision_bones_button,
+            self.collision_sources_button,
+            self.collision_analyze_button,
+            self.collision_apply_button,
+            self.collision_validate_button,
+            self.collision_cancel_button,
+            self.open_collision_folder_button,
+        ):
+            actions.addWidget(widget)
+        actions.addStretch(1)
+        tab_layout.addLayout(actions)
+
+        self.collision_summary_label = QtWidgets.QLabel("Detect a Step 7 blend and analyze collision volumes.")
+        self.collision_summary_label.setObjectName("fieldHint")
+        self.collision_summary_label.setWordWrap(True)
+        tab_layout.addWidget(self.collision_summary_label)
+
+        self.collision_bone_group = QtWidgets.QGroupBox("CoACD Bones")
+        bone_layout = QtWidgets.QVBoxLayout(self.collision_bone_group)
+        self.collision_bone_hint_label = QtWidgets.QLabel(
+            "Optional. Assign group numbers 1-14 to additional direct parent-child bone chains, then choose a rotation type for each group."
+        )
+        self.collision_bone_hint_label.setObjectName("fieldHint")
+        self.collision_bone_hint_label.setWordWrap(True)
+        bone_layout.addWidget(self.collision_bone_hint_label)
+        self.collision_bone_table = QtWidgets.QTableWidget(0, 7)
+        self.collision_bone_table.setHorizontalHeaderLabels(
+            ["Group", "Rotation Type", "Bone", "Parent", "Children", "Default Target", "Warnings"]
+        )
+        self.collision_bone_table.horizontalHeader().setStretchLastSection(True)
+        self.collision_bone_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.collision_bone_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.collision_bone_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.collision_bone_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.collision_bone_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.collision_bone_table.setMouseTracking(True)
+        self.collision_bone_table.viewport().setMouseTracking(True)
+        self.collision_bone_table.viewport().installEventFilter(self)
+        self.collision_bone_table.verticalHeader().setDefaultSectionSize(34)
+        self.collision_bone_table.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Fixed)
+        self.collision_bone_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        bone_layout.addWidget(self.collision_bone_table)
+        self.collision_bone_group.setVisible(False)
+        tab_layout.addWidget(self.collision_bone_group)
+
+        self.collision_source_group = QtWidgets.QGroupBox("CoACD Source Bodygroups")
+        source_layout = QtWidgets.QVBoxLayout(self.collision_source_group)
+        self.collision_source_hint_label = QtWidgets.QLabel(
+            "All bodygroups are enabled by default. Uncheck bodygroups that should not seed the CoACD collision generator."
+        )
+        self.collision_source_hint_label.setObjectName("fieldHint")
+        self.collision_source_hint_label.setWordWrap(True)
+        source_layout.addWidget(self.collision_source_hint_label)
+        self.collision_source_table = QtWidgets.QTableWidget(0, 7)
+        self.collision_source_table.setHorizontalHeaderLabels(
+            ["Use", "Bodygroup", "Vertices", "Faces", "Materials", "Target-Weighted Verts", "Warnings"]
+        )
+        self.collision_source_table.horizontalHeader().setStretchLastSection(True)
+        self.collision_source_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.collision_source_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.collision_source_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.collision_source_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.collision_source_table.setMouseTracking(True)
+        self.collision_source_table.viewport().setMouseTracking(True)
+        self.collision_source_table.viewport().installEventFilter(self)
+        self.collision_source_table.verticalHeader().setDefaultSectionSize(32)
+        self.collision_source_table.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Fixed)
+        self.collision_source_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        source_layout.addWidget(self.collision_source_table)
+        self.collision_source_group.setVisible(False)
+        tab_layout.addWidget(self.collision_source_group)
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        preview_group = QtWidgets.QGroupBox("Collision Preview")
+        preview_layout = QtWidgets.QVBoxLayout(preview_group)
+        if MaterialPreviewWidget is not None:
+            self.collision_preview = MaterialPreviewWidget()
+            self.collision_preview_status_label = QtWidgets.QLabel("Collision preview idle")
+            self.collision_preview_status_label.setObjectName("fieldHint")
+            self.collision_preview.statsChanged.connect(self.collision_preview_status_label.setText)
+            preview_layout.addWidget(self.collision_preview, 1)
+            preview_controls = QtWidgets.QHBoxLayout()
+            self.collision_wireframe_check = QtWidgets.QCheckBox("Wireframe")
+            self.collision_alpha_check = QtWidgets.QCheckBox("Respect Alpha")
+            preview_controls.addWidget(self.collision_wireframe_check)
+            preview_controls.addWidget(self.collision_alpha_check)
+            for direction in ("Front", "Back", "Left", "Right", "Top", "Bottom"):
+                button = QtWidgets.QPushButton(direction)
+                button.setMaximumWidth(70)
+                button.clicked.connect(lambda _checked=False, d=direction: self.collision_preview.reset_view(d))
+                preview_controls.addWidget(button)
+            preview_controls.addStretch(1)
+            preview_layout.addLayout(preview_controls)
+            preview_layout.addWidget(self.collision_preview_status_label)
+            self.collision_wireframe_check.toggled.connect(self.collision_preview.set_wireframe_visible)
+            self.collision_alpha_check.toggled.connect(self.collision_preview.set_respect_alpha)
+        else:
+            self.collision_preview = None
+            self.collision_preview_status_label = QtWidgets.QLabel("Collision preview dependencies are unavailable.")
+            self.collision_preview_status_label.setObjectName("fieldHint")
+            preview_layout.addWidget(self.collision_preview_status_label)
+        splitter.addWidget(preview_group)
+
+        table_group = QtWidgets.QGroupBox("Physics Parts")
+        table_layout = QtWidgets.QVBoxLayout(table_group)
+        self.collision_table = QtWidgets.QTableWidget(0, 10)
+        self.collision_table.setHorizontalHeaderLabels(
+            ["Use", "Bone", "Shape", "Shrink", "Volume", "Vertices", "Faces", "Source Verts", "Confidence", "Settings / Warnings"]
+        )
+        self.collision_table.horizontalHeader().setStretchLastSection(True)
+        self.collision_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.collision_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.collision_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.collision_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.collision_table.setMouseTracking(True)
+        self.collision_table.viewport().setMouseTracking(True)
+        self.collision_table.viewport().installEventFilter(self)
+        self.collision_table.verticalHeader().setDefaultSectionSize(38)
+        self.collision_table.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Fixed)
+        self.collision_table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked
+            | QtWidgets.QAbstractItemView.EditTrigger.SelectedClicked
+            | QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed
+        )
+        table_layout.addWidget(self.collision_table)
+        splitter.addWidget(table_group)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 4)
+        tab_layout.addWidget(splitter, 1)
+
+        self.collision_progress_group = QtWidgets.QGroupBox("Progress")
+        collision_progress_layout = QtWidgets.QVBoxLayout(self.collision_progress_group)
+        self.collision_progress_bar = QtWidgets.QProgressBar()
+        self.collision_progress_bar.setRange(0, 100)
+        self.collision_progress_label = QtWidgets.QLabel("Idle")
+        self.collision_progress_label.setObjectName("progressStatus")
+        self.collision_progress_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self.collision_progress_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        collision_progress_layout.addWidget(self.collision_progress_bar)
+        collision_progress_layout.addWidget(self.collision_progress_label)
+        tab_layout.addWidget(self.collision_progress_group)
+
+        toggles = QtWidgets.QHBoxLayout()
+        self.collision_outputs_toggle = QtWidgets.QToolButton()
+        self.collision_outputs_toggle.setText("Show Outputs")
+        self.collision_outputs_toggle.setCheckable(True)
+        self.collision_outputs_toggle.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogDetailedView))
+        self.collision_log_toggle = QtWidgets.QToolButton()
+        self.collision_log_toggle.setText("Show Log")
+        self.collision_log_toggle.setCheckable(True)
+        self.collision_log_toggle.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogInfoView))
+        toggles.addWidget(self.collision_outputs_toggle)
+        toggles.addWidget(self.collision_log_toggle)
+        toggles.addStretch(1)
+        tab_layout.addLayout(toggles)
+
+        self.collision_output_group = QtWidgets.QGroupBox("Outputs")
+        collision_outputs = QtWidgets.QFormLayout(self.collision_output_group)
+        self.collision_blend_label = QtWidgets.QLabel("")
+        self.collision_analysis_label = QtWidgets.QLabel("")
+        self.collision_plan_label = QtWidgets.QLabel("")
+        self.collision_log_label = QtWidgets.QLabel("")
+        self.collision_report_label = QtWidgets.QLabel("")
+        self.collision_settings_label = QtWidgets.QLabel("")
+        self.collision_smd_label = QtWidgets.QLabel("")
+        for label in (
+            self.collision_blend_label,
+            self.collision_analysis_label,
+            self.collision_plan_label,
+            self.collision_log_label,
+            self.collision_report_label,
+            self.collision_settings_label,
+            self.collision_smd_label,
+        ):
+            label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+            label.setWordWrap(True)
+        collision_outputs.addRow("Output .blend", self.collision_blend_label)
+        collision_outputs.addRow("Analysis", self.collision_analysis_label)
+        collision_outputs.addRow("Plan", self.collision_plan_label)
+        collision_outputs.addRow("Log", self.collision_log_label)
+        collision_outputs.addRow("Report", self.collision_report_label)
+        collision_outputs.addRow("Physics Settings", self.collision_settings_label)
+        collision_outputs.addRow("Physics.smd", self.collision_smd_label)
+        self.collision_output_group.setVisible(False)
+        tab_layout.addWidget(self.collision_output_group)
+
+        self.collision_log_group = QtWidgets.QGroupBox("Log")
+        collision_log_layout = QtWidgets.QVBoxLayout(self.collision_log_group)
+        self.collision_log = QtWidgets.QPlainTextEdit()
+        self.collision_log.setReadOnly(True)
+        self.collision_log.setMaximumHeight(220)
+        self.copy_collision_log_button = QtWidgets.QPushButton("Copy Log")
+        self.copy_collision_log_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogSaveButton))
+        self.copy_collision_log_button.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(self.collision_log.toPlainText()))
+        collision_log_layout.addWidget(self.collision_log, 1)
+        collision_log_layout.addWidget(self.copy_collision_log_button, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+        self.collision_log_group.setVisible(False)
+        tab_layout.addWidget(self.collision_log_group)
+
+        self.collision_input_row.changed.connect(self.on_collision_input_changed)
+        self.detect_flex_blend_button.clicked.connect(self.detect_step7_output)
+        self.collision_bones_button.clicked.connect(self.start_collision_bone_scan)
+        self.collision_sources_button.clicked.connect(self.start_collision_source_scan)
+        self.collision_analyze_button.clicked.connect(self.start_collision_analyze)
+        self.collision_apply_button.clicked.connect(self.start_collision_apply)
+        self.collision_validate_button.clicked.connect(self.show_collision_validation)
+        self.collision_cancel_button.clicked.connect(self.cancel_collision)
+        self.open_collision_folder_button.clicked.connect(self.open_collision_folder)
+        self.collision_bone_table.itemSelectionChanged.connect(self.on_collision_bone_table_selection_changed)
+        self.collision_source_table.itemChanged.connect(self.on_collision_source_table_item_changed)
+        self.collision_source_table.itemSelectionChanged.connect(self.on_collision_source_table_selection_changed)
+        self.collision_table.itemChanged.connect(self.on_collision_table_item_changed)
+        self.collision_table.itemSelectionChanged.connect(self.on_collision_table_selection_changed)
+        self.collision_outputs_toggle.toggled.connect(self.set_collision_outputs_visible)
+        self.collision_log_toggle.toggled.connect(self.set_collision_log_visible)
+
+        self.tabs.addTab(tab, "8 Sort Collision")
+
+    def _build_proportion_tab(self) -> None:
+        tab = QtWidgets.QWidget()
+        tab_layout = QtWidgets.QVBoxLayout(tab)
+
+        self.proportion_input_row = PathRow(
+            "Step 8 .blend",
+            "file",
+            "Blender files (*.blend)",
+            hint="Use the collision-sorted blend produced by Step 8.",
+        )
+        tab_layout.addWidget(self.proportion_input_row)
+
+        settings = QtWidgets.QFormLayout()
+        self.proportion_output_edit = QtWidgets.QLineEdit()
+        self.proportion_output_edit.setReadOnly(True)
+        self.proportion_remove_zero_weight_check = QtWidgets.QCheckBox("Remove zero-weight bones")
+        self.proportion_remove_zero_weight_check.setChecked(True)
+        self.proportion_remove_zero_weight_check.setToolTip(
+            "Before raw Source export, delete non-essential bones that have no weights on exported bodygroups and reparent their children."
+        )
+        settings.addRow("Output folder", self.proportion_output_edit)
+        settings.addRow("Export cleanup", self.proportion_remove_zero_weight_check)
+        self.detect_collision_blend_button = QtWidgets.QPushButton("Detect Step 8 Output")
+        self.detect_collision_blend_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogContentsView))
+        settings.addRow("", self.detect_collision_blend_button)
+        tab_layout.addLayout(settings)
+
+        buttons = QtWidgets.QHBoxLayout()
+        self.proportion_run_button = QtWidgets.QPushButton("Run Step 9")
+        self.proportion_run_button.setObjectName("importButton")
+        self.proportion_run_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_MediaPlay))
+        self.proportion_cancel_button = QtWidgets.QPushButton("Cancel")
+        self.proportion_cancel_button.setEnabled(False)
+        self.proportion_cancel_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogCancelButton))
+        self.open_proportion_folder_button = QtWidgets.QPushButton("Open Folder")
+        self.open_proportion_folder_button.setEnabled(False)
+        self.open_proportion_folder_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DirOpenIcon))
+        for button in (self.proportion_run_button, self.proportion_cancel_button, self.open_proportion_folder_button):
+            buttons.addWidget(button)
+        buttons.addStretch(1)
+        tab_layout.addLayout(buttons)
+
+        self.proportion_summary_label = QtWidgets.QLabel("Detect a Step 8 blend, then run the raw SMD export and proportion trick.")
+        self.proportion_summary_label.setObjectName("fieldHint")
+        self.proportion_summary_label.setWordWrap(True)
+        tab_layout.addWidget(self.proportion_summary_label)
+
+        files_group = QtWidgets.QGroupBox("Final Exported Files")
+        files_layout = QtWidgets.QVBoxLayout(files_group)
+        self.proportion_files_table = QtWidgets.QTableWidget(0, 5)
+        self.proportion_files_table.setHorizontalHeaderLabels(["File", "Type", "Size", "Source", "Warnings"])
+        self.proportion_files_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.proportion_files_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.proportion_files_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.proportion_files_table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.proportion_files_table.horizontalHeader().setStretchLastSection(True)
+        self.proportion_files_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.proportion_files_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        files_layout.addWidget(self.proportion_files_table)
+        tab_layout.addWidget(files_group, 1)
+
+        self.proportion_progress_group = QtWidgets.QGroupBox("Progress")
+        progress_layout = QtWidgets.QVBoxLayout(self.proportion_progress_group)
+        self.proportion_progress_bar = QtWidgets.QProgressBar()
+        self.proportion_progress_bar.setRange(0, 100)
+        self.proportion_progress_label = QtWidgets.QLabel("Idle")
+        self.proportion_progress_label.setObjectName("progressStatus")
+        self.proportion_progress_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self.proportion_progress_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        progress_layout.addWidget(self.proportion_progress_bar)
+        progress_layout.addWidget(self.proportion_progress_label)
+        tab_layout.addWidget(self.proportion_progress_group)
+
+        toggles = QtWidgets.QHBoxLayout()
+        self.proportion_outputs_toggle = QtWidgets.QToolButton()
+        self.proportion_outputs_toggle.setText("Show Outputs")
+        self.proportion_outputs_toggle.setCheckable(True)
+        self.proportion_outputs_toggle.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogDetailedView))
+        self.proportion_log_toggle = QtWidgets.QToolButton()
+        self.proportion_log_toggle.setText("Show Log")
+        self.proportion_log_toggle.setCheckable(True)
+        self.proportion_log_toggle.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogInfoView))
+        toggles.addWidget(self.proportion_outputs_toggle)
+        toggles.addWidget(self.proportion_log_toggle)
+        toggles.addStretch(1)
+        tab_layout.addLayout(toggles)
+
+        self.proportion_output_group = QtWidgets.QGroupBox("Outputs")
+        outputs = QtWidgets.QFormLayout(self.proportion_output_group)
+        self.proportion_raw_label = QtWidgets.QLabel("")
+        self.proportion_workspace_label = QtWidgets.QLabel("")
+        self.proportion_final_label = QtWidgets.QLabel("")
+        self.proportion_pre_blend_label = QtWidgets.QLabel("")
+        self.proportion_processed_blend_label = QtWidgets.QLabel("")
+        self.proportion_report_label = QtWidgets.QLabel("")
+        self.proportion_files_json_label = QtWidgets.QLabel("")
+        self.proportion_log_label = QtWidgets.QLabel("")
+        for label in (
+            self.proportion_raw_label,
+            self.proportion_workspace_label,
+            self.proportion_final_label,
+            self.proportion_pre_blend_label,
+            self.proportion_processed_blend_label,
+            self.proportion_report_label,
+            self.proportion_files_json_label,
+            self.proportion_log_label,
+        ):
+            label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+            label.setWordWrap(True)
+        outputs.addRow("Raw export", self.proportion_raw_label)
+        outputs.addRow("Workspace", self.proportion_workspace_label)
+        outputs.addRow("Final export", self.proportion_final_label)
+        outputs.addRow("Pre-proportion .blend", self.proportion_pre_blend_label)
+        outputs.addRow("Processed .blend", self.proportion_processed_blend_label)
+        outputs.addRow("Report", self.proportion_report_label)
+        outputs.addRow("File list", self.proportion_files_json_label)
+        outputs.addRow("Log", self.proportion_log_label)
+        self.proportion_output_group.setVisible(False)
+        tab_layout.addWidget(self.proportion_output_group)
+
+        self.proportion_log_group = QtWidgets.QGroupBox("Log")
+        log_layout = QtWidgets.QVBoxLayout(self.proportion_log_group)
+        self.proportion_log = QtWidgets.QPlainTextEdit()
+        self.proportion_log.setReadOnly(True)
+        self.proportion_log.setMaximumHeight(220)
+        self.copy_proportion_log_button = QtWidgets.QPushButton("Copy Log")
+        self.copy_proportion_log_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogSaveButton))
+        self.copy_proportion_log_button.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(self.proportion_log.toPlainText()))
+        log_layout.addWidget(self.proportion_log, 1)
+        log_layout.addWidget(self.copy_proportion_log_button, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+        self.proportion_log_group.setVisible(False)
+        tab_layout.addWidget(self.proportion_log_group)
+
+        self.proportion_input_row.changed.connect(self.on_proportion_input_changed)
+        self.proportion_remove_zero_weight_check.toggled.connect(lambda _checked: self.save_settings())
+        self.detect_collision_blend_button.clicked.connect(self.detect_step8_output)
+        self.proportion_run_button.clicked.connect(self.start_proportion_run)
+        self.proportion_cancel_button.clicked.connect(self.cancel_proportion)
+        self.open_proportion_folder_button.clicked.connect(self.open_proportion_folder)
+        self.proportion_outputs_toggle.toggled.connect(self.set_proportion_outputs_visible)
+        self.proportion_log_toggle.toggled.connect(self.set_proportion_log_visible)
+
+        self.tabs.addTab(tab, "9 Export Proportion Trick")
+
+    def _build_carms_tab(self) -> None:
+        tab = QtWidgets.QWidget()
+        self.carms_tab = tab
+        tab_layout = QtWidgets.QVBoxLayout(tab)
+
+        self.carms_input_row = PathRow(
+            "Step 9 export folder",
+            "dir",
+            hint="Use the 2_proportion_export folder produced by Step 9.",
+        )
+        tab_layout.addWidget(self.carms_input_row)
+
+        settings = QtWidgets.QFormLayout()
+        self.carms_output_edit = QtWidgets.QLineEdit()
+        self.carms_output_edit.setReadOnly(True)
+        settings.addRow("Output folder", self.carms_output_edit)
+        self.carms_weight_spin = QtWidgets.QDoubleSpinBox()
+        self.carms_weight_spin.setRange(0.001, 1.0)
+        self.carms_weight_spin.setDecimals(3)
+        self.carms_weight_spin.setSingleStep(0.01)
+        self.carms_weight_spin.setValue(0.12)
+        settings.addRow("Weight threshold", self.carms_weight_spin)
+        self.detect_proportion_export_button = QtWidgets.QPushButton("Detect Step 9 Output")
+        self.detect_proportion_export_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogContentsView))
+        settings.addRow("", self.detect_proportion_export_button)
+        tab_layout.addLayout(settings)
+
+        buttons = QtWidgets.QHBoxLayout()
+        self.carms_run_button = QtWidgets.QPushButton("Run Step 10")
+        self.carms_run_button.setObjectName("importButton")
+        self.carms_run_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_MediaPlay))
+        self.carms_cancel_button = QtWidgets.QPushButton("Cancel")
+        self.carms_cancel_button.setEnabled(False)
+        self.carms_cancel_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogCancelButton))
+        self.open_carms_folder_button = QtWidgets.QPushButton("Open Folder")
+        self.open_carms_folder_button.setEnabled(False)
+        self.open_carms_folder_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DirOpenIcon))
+        for button in (self.carms_run_button, self.carms_cancel_button, self.open_carms_folder_button):
+            buttons.addWidget(button)
+        buttons.addStretch(1)
+        tab_layout.addLayout(buttons)
+
+        self.carms_summary_label = QtWidgets.QLabel("Detect a Step 9 export folder, then create c_arms SMD files from forearm and hand weights.")
+        self.carms_summary_label.setObjectName("fieldHint")
+        self.carms_summary_label.setWordWrap(True)
+        tab_layout.addWidget(self.carms_summary_label)
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        preview_group = QtWidgets.QGroupBox("c_arms Preview")
+        preview_layout = QtWidgets.QVBoxLayout(preview_group)
+        if MaterialPreviewWidget is not None:
+            self.carms_preview = MaterialPreviewWidget()
+            self.carms_preview_status_label = QtWidgets.QLabel("c_arms preview idle")
+            self.carms_preview_status_label.setObjectName("fieldHint")
+            self.carms_preview.statsChanged.connect(self.carms_preview_status_label.setText)
+            preview_layout.addWidget(self.carms_preview, 1)
+            preview_controls = QtWidgets.QHBoxLayout()
+            self.carms_wireframe_check = QtWidgets.QCheckBox("Wireframe")
+            self.carms_alpha_check = QtWidgets.QCheckBox("Respect Alpha")
+            preview_controls.addWidget(self.carms_wireframe_check)
+            preview_controls.addWidget(self.carms_alpha_check)
+            for direction in ("Front", "Back", "Left", "Right", "Top", "Bottom"):
+                button = QtWidgets.QPushButton(direction)
+                button.clicked.connect(lambda _checked=False, d=direction: self.carms_preview.reset_view(d))
+                preview_controls.addWidget(button)
+            preview_controls.addStretch(1)
+            preview_layout.addLayout(preview_controls)
+            preview_layout.addWidget(self.carms_preview_status_label)
+            self.carms_wireframe_check.toggled.connect(self.carms_preview.set_wireframe_visible)
+            self.carms_alpha_check.toggled.connect(self.carms_preview.set_respect_alpha)
+        else:
+            self.carms_preview = None
+            self.carms_preview_status_label = QtWidgets.QLabel("c_arms preview dependencies are unavailable.")
+            self.carms_preview_status_label.setObjectName("fieldHint")
+            preview_layout.addWidget(self.carms_preview_status_label)
+
+        files_group = QtWidgets.QGroupBox("Exported c_arms Files")
+        files_layout = QtWidgets.QVBoxLayout(files_group)
+        self.carms_files_table = QtWidgets.QTableWidget(0, 7)
+        self.carms_files_table.setHorizontalHeaderLabels(["File", "Type", "Size", "Vertices", "Faces", "Source", "Warnings"])
+        self.carms_files_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        for column in range(1, 6):
+            self.carms_files_table.horizontalHeader().setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.carms_files_table.horizontalHeader().setStretchLastSection(True)
+        self.carms_files_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.carms_files_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        files_layout.addWidget(self.carms_files_table)
+
+        splitter.addWidget(preview_group)
+        splitter.addWidget(files_group)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        tab_layout.addWidget(splitter, 1)
+
+        self.carms_progress_group = QtWidgets.QGroupBox("Progress")
+        progress_layout = QtWidgets.QVBoxLayout(self.carms_progress_group)
+        self.carms_progress_bar = QtWidgets.QProgressBar()
+        self.carms_progress_bar.setRange(0, 100)
+        self.carms_progress_label = QtWidgets.QLabel("Idle")
+        self.carms_progress_label.setObjectName("progressStatus")
+        self.carms_progress_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self.carms_progress_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        progress_layout.addWidget(self.carms_progress_bar)
+        progress_layout.addWidget(self.carms_progress_label)
+        tab_layout.addWidget(self.carms_progress_group)
+
+        toggles = QtWidgets.QHBoxLayout()
+        self.carms_outputs_toggle = QtWidgets.QToolButton()
+        self.carms_outputs_toggle.setText("Show Outputs")
+        self.carms_outputs_toggle.setCheckable(True)
+        self.carms_outputs_toggle.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogDetailedView))
+        self.carms_log_toggle = QtWidgets.QToolButton()
+        self.carms_log_toggle.setText("Show Log")
+        self.carms_log_toggle.setCheckable(True)
+        self.carms_log_toggle.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogInfoView))
+        toggles.addWidget(self.carms_outputs_toggle)
+        toggles.addWidget(self.carms_log_toggle)
+        toggles.addStretch(1)
+        tab_layout.addLayout(toggles)
+
+        self.carms_output_group = QtWidgets.QGroupBox("Outputs")
+        outputs = QtWidgets.QFormLayout(self.carms_output_group)
+        self.carms_workspace_blend_label = QtWidgets.QLabel("")
+        self.carms_report_label = QtWidgets.QLabel("")
+        self.carms_files_json_label = QtWidgets.QLabel("")
+        self.carms_log_label = QtWidgets.QLabel("")
+        for label in (self.carms_workspace_blend_label, self.carms_report_label, self.carms_files_json_label, self.carms_log_label):
+            label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+            label.setWordWrap(True)
+        outputs.addRow("Workspace .blend", self.carms_workspace_blend_label)
+        outputs.addRow("Report", self.carms_report_label)
+        outputs.addRow("File list", self.carms_files_json_label)
+        outputs.addRow("Log", self.carms_log_label)
+        self.carms_output_group.setVisible(False)
+        tab_layout.addWidget(self.carms_output_group)
+
+        self.carms_log_group = QtWidgets.QGroupBox("Log")
+        log_layout = QtWidgets.QVBoxLayout(self.carms_log_group)
+        self.carms_log = QtWidgets.QPlainTextEdit()
+        self.carms_log.setReadOnly(True)
+        self.carms_log.setMaximumHeight(220)
+        self.copy_carms_log_button = QtWidgets.QPushButton("Copy Log")
+        self.copy_carms_log_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogSaveButton))
+        self.copy_carms_log_button.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(self.carms_log.toPlainText()))
+        log_layout.addWidget(self.carms_log, 1)
+        log_layout.addWidget(self.copy_carms_log_button, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+        self.carms_log_group.setVisible(False)
+        tab_layout.addWidget(self.carms_log_group)
+
+        self.carms_input_row.changed.connect(self.on_carms_input_changed)
+        self.carms_weight_spin.valueChanged.connect(lambda _value: self.save_settings())
+        self.detect_proportion_export_button.clicked.connect(self.detect_step9_output)
+        self.carms_run_button.clicked.connect(self.start_carms_run)
+        self.carms_cancel_button.clicked.connect(self.cancel_carms)
+        self.open_carms_folder_button.clicked.connect(self.open_carms_folder)
+        self.carms_outputs_toggle.toggled.connect(self.set_carms_outputs_visible)
+        self.carms_log_toggle.toggled.connect(self.set_carms_log_visible)
+
+        self.tabs.addTab(tab, "10 Sort c_arms")
+
+    def _build_vrd_tab(self) -> None:
+        tab = QtWidgets.QWidget()
+        self.vrd_tab = tab
+        tab_layout = QtWidgets.QVBoxLayout(tab)
+
+        self.vrd_input_row = PathRow(
+            "Step 9 export folder",
+            "dir",
+            hint="Use the 2_proportion_export folder produced by Step 9.",
+        )
+        tab_layout.addWidget(self.vrd_input_row)
+
+        settings = QtWidgets.QFormLayout()
+        self.vrd_output_edit = QtWidgets.QLineEdit()
+        self.vrd_output_edit.setReadOnly(True)
+        settings.addRow("Output folder", self.vrd_output_edit)
+        self.detect_vrd_step9_button = QtWidgets.QPushButton("Detect Step 9 Output")
+        self.detect_vrd_step9_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogContentsView))
+        settings.addRow("", self.detect_vrd_step9_button)
+        tab_layout.addLayout(settings)
+
+        buttons = QtWidgets.QHBoxLayout()
+        self.vrd_analyze_button = QtWidgets.QPushButton("Analyze VRD")
+        self.vrd_analyze_button.setObjectName("importButton")
+        self.vrd_analyze_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogContentsView))
+        self.vrd_apply_button = QtWidgets.QPushButton("Apply / Export VRD")
+        self.vrd_apply_button.setObjectName("importButton")
+        self.vrd_apply_button.setEnabled(False)
+        self.vrd_apply_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_MediaPlay))
+        self.vrd_regenerate_button = QtWidgets.QPushButton("Regenerate Preview")
+        self.vrd_regenerate_button.setEnabled(False)
+        self.vrd_regenerate_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_BrowserReload))
+        self.vrd_cancel_button = QtWidgets.QPushButton("Cancel")
+        self.vrd_cancel_button.setEnabled(False)
+        self.vrd_cancel_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogCancelButton))
+        self.open_vrd_folder_button = QtWidgets.QPushButton("Open Folder")
+        self.open_vrd_folder_button.setEnabled(False)
+        self.open_vrd_folder_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DirOpenIcon))
+        for button in (self.vrd_analyze_button, self.vrd_apply_button, self.vrd_regenerate_button, self.vrd_cancel_button, self.open_vrd_folder_button):
+            buttons.addWidget(button)
+        buttons.addStretch(1)
+        tab_layout.addLayout(buttons)
+
+        intensity_group = QtWidgets.QGroupBox("VRD Intensity Multipliers")
+        intensity_layout = QtWidgets.QGridLayout(intensity_group)
+        self.vrd_intensity_sliders: dict[int, QtWidgets.QSlider] = {}
+        self.vrd_intensity_value_labels: dict[int, QtWidgets.QLabel] = {}
+        intensity_specs = [
+            (10, "Frame 10 forward"),
+            (20, "Frame 20 diagonal"),
+            (30, "Frame 30 side"),
+        ]
+        for row_index, (frame, label_text) in enumerate(intensity_specs):
+            label = QtWidgets.QLabel(label_text)
+            slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+            slider.setRange(0, 150)
+            slider.setTickPosition(QtWidgets.QSlider.TickPosition.TicksBelow)
+            slider.setTickInterval(25)
+            slider.setSingleStep(5)
+            slider.setPageStep(10)
+            slider.setValue(int(round(VRD_INTENSITY_DEFAULTS[frame] * 100)))
+            value_label = QtWidgets.QLabel(f"{VRD_INTENSITY_DEFAULTS[frame]:.2f}x")
+            value_label.setMinimumWidth(48)
+            intensity_layout.addWidget(label, row_index, 0)
+            intensity_layout.addWidget(slider, row_index, 1)
+            intensity_layout.addWidget(value_label, row_index, 2)
+            self.vrd_intensity_sliders[frame] = slider
+            self.vrd_intensity_value_labels[frame] = value_label
+            slider.valueChanged.connect(lambda value, frame=frame: self.on_vrd_intensity_changed(frame, value))
+        tab_layout.addWidget(intensity_group)
+
+        self.vrd_summary_label = QtWidgets.QLabel("Detect a Step 9 export folder, then infer skirt/dress VRD helper definitions.")
+        self.vrd_summary_label.setObjectName("fieldHint")
+        self.vrd_summary_label.setWordWrap(True)
+        tab_layout.addWidget(self.vrd_summary_label)
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        preview_group = QtWidgets.QGroupBox("VRD Preview")
+        preview_layout = QtWidgets.QVBoxLayout(preview_group)
+        if MaterialPreviewWidget is not None:
+            self.vrd_preview = MaterialPreviewWidget()
+            self.vrd_preview_status_label = QtWidgets.QLabel("VRD preview idle")
+            self.vrd_preview_status_label.setObjectName("fieldHint")
+            self.vrd_preview.statsChanged.connect(self.vrd_preview_status_label.setText)
+            preview_layout.addWidget(self.vrd_preview, 1)
+            frame_layout = QtWidgets.QHBoxLayout()
+            frame_layout.addWidget(QtWidgets.QLabel("Frame"))
+            self.vrd_frame_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+            self.vrd_frame_slider.setRange(0, 3)
+            self.vrd_frame_slider.setTickPosition(QtWidgets.QSlider.TickPosition.TicksBelow)
+            self.vrd_frame_slider.setTickInterval(1)
+            self.vrd_frame_label = QtWidgets.QLabel("0")
+            frame_layout.addWidget(self.vrd_frame_slider, 1)
+            frame_layout.addWidget(self.vrd_frame_label)
+            preview_layout.addLayout(frame_layout)
+            preview_controls = QtWidgets.QHBoxLayout()
+            self.vrd_wireframe_check = QtWidgets.QCheckBox("Wireframe")
+            self.vrd_alpha_check = QtWidgets.QCheckBox("Respect Alpha")
+            preview_controls.addWidget(self.vrd_wireframe_check)
+            preview_controls.addWidget(self.vrd_alpha_check)
+            for direction in ("Front", "Back", "Left", "Right", "Top", "Bottom"):
+                button = QtWidgets.QPushButton(direction)
+                button.clicked.connect(lambda _checked=False, d=direction: self.vrd_preview.reset_view(d))
+                preview_controls.addWidget(button)
+            preview_controls.addStretch(1)
+            preview_layout.addLayout(preview_controls)
+            preview_layout.addWidget(self.vrd_preview_status_label)
+            self.vrd_wireframe_check.toggled.connect(self.vrd_preview.set_wireframe_visible)
+            self.vrd_alpha_check.toggled.connect(self.vrd_preview.set_respect_alpha)
+            self.vrd_frame_slider.valueChanged.connect(self.on_vrd_frame_changed)
+        else:
+            self.vrd_preview = None
+            self.vrd_preview_status_label = QtWidgets.QLabel("VRD preview dependencies are unavailable.")
+            self.vrd_preview_status_label.setObjectName("fieldHint")
+            preview_layout.addWidget(self.vrd_preview_status_label)
+
+        rows_group = QtWidgets.QGroupBox("VRD Definitions")
+        rows_layout = QtWidgets.QVBoxLayout(rows_group)
+        row_buttons = QtWidgets.QHBoxLayout()
+        self.vrd_add_row_button = QtWidgets.QPushButton("Add Row")
+        self.vrd_remove_row_button = QtWidgets.QPushButton("Remove Selected")
+        row_buttons.addWidget(self.vrd_add_row_button)
+        row_buttons.addWidget(self.vrd_remove_row_button)
+        row_buttons.addStretch(1)
+        rows_layout.addLayout(row_buttons)
+        self.vrd_table = QtWidgets.QTableWidget(0, 12)
+        self.vrd_table.setHorizontalHeaderLabels(
+            ["Use", "Procedural Bone", "Driver Bone", "Angle", "Front 10", "Front-Side 20", "Side 30", "Side", "Confidence", "Vertices", "Source", "Warnings"]
+        )
+        self.vrd_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.vrd_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        for column in (0, 3, 4, 5, 6, 7, 8, 9):
+            self.vrd_table.horizontalHeader().setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.vrd_table.horizontalHeader().setStretchLastSection(True)
+        self.vrd_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.vrd_table.setMouseTracking(True)
+        self.vrd_table.viewport().setMouseTracking(True)
+        self.vrd_table.viewport().installEventFilter(self)
+        rows_layout.addWidget(self.vrd_table, 1)
+
+        splitter.addWidget(preview_group)
+        splitter.addWidget(rows_group)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 3)
+        tab_layout.addWidget(splitter, 1)
+
+        self.vrd_progress_group = QtWidgets.QGroupBox("Progress")
+        progress_layout = QtWidgets.QVBoxLayout(self.vrd_progress_group)
+        self.vrd_progress_bar = QtWidgets.QProgressBar()
+        self.vrd_progress_bar.setRange(0, 100)
+        self.vrd_progress_label = QtWidgets.QLabel("Idle")
+        self.vrd_progress_label.setObjectName("progressStatus")
+        self.vrd_progress_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self.vrd_progress_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        progress_layout.addWidget(self.vrd_progress_bar)
+        progress_layout.addWidget(self.vrd_progress_label)
+        tab_layout.addWidget(self.vrd_progress_group)
+
+        toggles = QtWidgets.QHBoxLayout()
+        self.vrd_outputs_toggle = QtWidgets.QToolButton()
+        self.vrd_outputs_toggle.setText("Show Outputs")
+        self.vrd_outputs_toggle.setCheckable(True)
+        self.vrd_outputs_toggle.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogDetailedView))
+        self.vrd_log_toggle = QtWidgets.QToolButton()
+        self.vrd_log_toggle.setText("Show Log")
+        self.vrd_log_toggle.setCheckable(True)
+        self.vrd_log_toggle.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogInfoView))
+        toggles.addWidget(self.vrd_outputs_toggle)
+        toggles.addWidget(self.vrd_log_toggle)
+        toggles.addStretch(1)
+        tab_layout.addLayout(toggles)
+
+        self.vrd_output_group = QtWidgets.QGroupBox("Outputs")
+        outputs = QtWidgets.QFormLayout(self.vrd_output_group)
+        self.vrd_workspace_blend_label = QtWidgets.QLabel("")
+        self.vrd_analysis_label = QtWidgets.QLabel("")
+        self.vrd_plan_label = QtWidgets.QLabel("")
+        self.vrd_preview_label = QtWidgets.QLabel("")
+        self.vrd_report_label = QtWidgets.QLabel("")
+        self.vrd_file_label = QtWidgets.QLabel("")
+        self.vrd_log_label = QtWidgets.QLabel("")
+        for label in (self.vrd_workspace_blend_label, self.vrd_analysis_label, self.vrd_plan_label, self.vrd_preview_label, self.vrd_report_label, self.vrd_file_label, self.vrd_log_label):
+            label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+            label.setWordWrap(True)
+        outputs.addRow("Workspace .blend", self.vrd_workspace_blend_label)
+        outputs.addRow("Analysis", self.vrd_analysis_label)
+        outputs.addRow("Plan", self.vrd_plan_label)
+        outputs.addRow("Preview", self.vrd_preview_label)
+        outputs.addRow("Report", self.vrd_report_label)
+        outputs.addRow("VRD", self.vrd_file_label)
+        outputs.addRow("Log", self.vrd_log_label)
+        self.vrd_output_group.setVisible(False)
+        tab_layout.addWidget(self.vrd_output_group)
+
+        self.vrd_log_group = QtWidgets.QGroupBox("Log")
+        log_layout = QtWidgets.QVBoxLayout(self.vrd_log_group)
+        self.vrd_log = QtWidgets.QPlainTextEdit()
+        self.vrd_log.setReadOnly(True)
+        self.vrd_log.setMaximumHeight(220)
+        self.copy_vrd_log_button = QtWidgets.QPushButton("Copy Log")
+        self.copy_vrd_log_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogSaveButton))
+        self.copy_vrd_log_button.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(self.vrd_log.toPlainText()))
+        log_layout.addWidget(self.vrd_log, 1)
+        log_layout.addWidget(self.copy_vrd_log_button, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+        self.vrd_log_group.setVisible(False)
+        tab_layout.addWidget(self.vrd_log_group)
+
+        self.vrd_input_row.changed.connect(self.on_vrd_input_changed)
+        self.detect_vrd_step9_button.clicked.connect(lambda: self.detect_step9_output(target="vrd"))
+        self.vrd_analyze_button.clicked.connect(self.start_vrd_analyze)
+        self.vrd_apply_button.clicked.connect(self.start_vrd_apply)
+        self.vrd_regenerate_button.clicked.connect(self.regenerate_vrd_preview)
+        self.vrd_cancel_button.clicked.connect(self.cancel_vrd)
+        self.open_vrd_folder_button.clicked.connect(self.open_vrd_folder)
+        self.vrd_outputs_toggle.toggled.connect(self.set_vrd_outputs_visible)
+        self.vrd_log_toggle.toggled.connect(self.set_vrd_log_visible)
+        self.vrd_table.itemChanged.connect(self.on_vrd_table_item_changed)
+        self.vrd_table.itemSelectionChanged.connect(self.on_vrd_table_selection_changed)
+        self.vrd_add_row_button.clicked.connect(self.add_vrd_row)
+        self.vrd_remove_row_button.clicked.connect(self.remove_selected_vrd_rows)
+
+        self.tabs.addTab(tab, "11 Sort VRD")
+
+    def _build_texture_tab(self) -> None:
+        tab = QtWidgets.QWidget()
+        self.texture_tab = tab
+        tab_layout = QtWidgets.QVBoxLayout(tab)
+
+        self.texture_input_row = PathRow(
+            "Step 5 material mapping or workspace",
+            "file",
+            "Material mapping (*.npy *.json);;All files (*.*)",
+            hint="Use materials.npy/materials.json or the workspace folder containing 5_sort_materials.",
+        )
+        tab_layout.addWidget(self.texture_input_row)
+
+        settings = QtWidgets.QFormLayout()
+        self.texture_output_edit = QtWidgets.QLineEdit()
+        self.texture_output_edit.setReadOnly(True)
+        settings.addRow("Output folder", self.texture_output_edit)
+        self.detect_texture_mapping_button = QtWidgets.QPushButton("Detect Material Mapping")
+        self.detect_texture_mapping_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogContentsView))
+        settings.addRow("", self.detect_texture_mapping_button)
+        tab_layout.addLayout(settings)
+
+        buttons = QtWidgets.QHBoxLayout()
+        self.texture_analyze_button = QtWidgets.QPushButton("Analyze Textures")
+        self.texture_analyze_button.setObjectName("importButton")
+        self.texture_analyze_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogContentsView))
+        self.texture_process_button = QtWidgets.QPushButton("Process Textures")
+        self.texture_process_button.setObjectName("importButton")
+        self.texture_process_button.setEnabled(False)
+        self.texture_process_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_MediaPlay))
+        self.texture_cancel_button = QtWidgets.QPushButton("Cancel")
+        self.texture_cancel_button.setEnabled(False)
+        self.texture_cancel_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogCancelButton))
+        self.open_texture_folder_button = QtWidgets.QPushButton("Open Folder")
+        self.open_texture_folder_button.setEnabled(False)
+        self.open_texture_folder_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DirOpenIcon))
+        for button in (self.texture_analyze_button, self.texture_process_button, self.texture_cancel_button, self.open_texture_folder_button):
+            buttons.addWidget(button)
+        buttons.addStretch(1)
+        tab_layout.addLayout(buttons)
+
+        self.texture_summary_label = QtWidgets.QLabel("Detect the Step 5 material mapping, then analyze base textures and normals.")
+        self.texture_summary_label.setObjectName("fieldHint")
+        self.texture_summary_label.setWordWrap(True)
+        tab_layout.addWidget(self.texture_summary_label)
+
+        preview_group = QtWidgets.QGroupBox("Texture Preview")
+        preview_layout = QtWidgets.QGridLayout(preview_group)
+        self.texture_base_preview_label = QtWidgets.QLabel("Base texture")
+        self.texture_normal_preview_label = QtWidgets.QLabel("Normal map")
+        for label in (self.texture_base_preview_label, self.texture_normal_preview_label):
+            label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            label.setFixedSize(260, 220)
+            label.setStyleSheet("border: 1px solid #444; background: #191b1f; color: #8f98a3;")
+        self.texture_info_label = FixedHintLabel("Hover or select a material row to preview base and normal textures.", width=620, height=220)
+        self.texture_info_label.setObjectName("fieldHint")
+        self.texture_info_label.setWordWrap(True)
+        self.texture_info_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        preview_layout.addWidget(self.texture_base_preview_label, 0, 0)
+        preview_layout.addWidget(self.texture_normal_preview_label, 0, 1)
+        preview_layout.addWidget(self.texture_info_label, 0, 2)
+        preview_layout.setColumnStretch(2, 1)
+        tab_layout.addWidget(preview_group, 0)
+
+        table_group = QtWidgets.QGroupBox("Texture Plan")
+        table_layout = QtWidgets.QVBoxLayout(table_group)
+        self.texture_table = QtWidgets.QTableWidget(0, 12)
+        self.texture_table.setHorizontalHeaderLabels(
+            [
+                "Material",
+                "Base Preview",
+                "Base Source",
+                "Base Output PNG",
+                "Normal Status",
+                "Use Normal",
+                "Generate New",
+                "Intensity",
+                "Normal Preview",
+                "Normal Source / Generated",
+                "Size",
+                "Warnings",
+            ]
+        )
+        self.texture_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.texture_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.texture_table.horizontalHeader().setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.texture_table.horizontalHeader().setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.texture_table.horizontalHeader().setSectionResizeMode(6, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.texture_table.horizontalHeader().setSectionResizeMode(7, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.texture_table.horizontalHeader().setSectionResizeMode(8, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.texture_table.horizontalHeader().setSectionResizeMode(10, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.texture_table.horizontalHeader().setStretchLastSection(True)
+        self.texture_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.texture_table.setMouseTracking(True)
+        self.texture_table.viewport().setMouseTracking(True)
+        table_layout.addWidget(self.texture_table, 1)
+        tab_layout.addWidget(table_group, 1)
+
+        self.texture_progress_group = QtWidgets.QGroupBox("Progress")
+        progress_layout = QtWidgets.QVBoxLayout(self.texture_progress_group)
+        self.texture_progress_bar = QtWidgets.QProgressBar()
+        self.texture_progress_bar.setRange(0, 100)
+        self.texture_progress_label = QtWidgets.QLabel("Idle")
+        self.texture_progress_label.setObjectName("progressStatus")
+        self.texture_progress_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self.texture_progress_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        progress_layout.addWidget(self.texture_progress_bar)
+        progress_layout.addWidget(self.texture_progress_label)
+        tab_layout.addWidget(self.texture_progress_group, 0)
+
+        toggles = QtWidgets.QHBoxLayout()
+        self.texture_outputs_toggle = QtWidgets.QToolButton()
+        self.texture_outputs_toggle.setText("Show Outputs")
+        self.texture_outputs_toggle.setCheckable(True)
+        self.texture_outputs_toggle.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogDetailedView))
+        self.texture_log_toggle = QtWidgets.QToolButton()
+        self.texture_log_toggle.setText("Show Log")
+        self.texture_log_toggle.setCheckable(True)
+        self.texture_log_toggle.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogInfoView))
+        toggles.addWidget(self.texture_outputs_toggle)
+        toggles.addWidget(self.texture_log_toggle)
+        toggles.addStretch(1)
+        tab_layout.addLayout(toggles)
+
+        self.texture_output_group = QtWidgets.QGroupBox("Outputs")
+        outputs = QtWidgets.QFormLayout(self.texture_output_group)
+        self.texture_analysis_label = QtWidgets.QLabel("")
+        self.texture_plan_label = QtWidgets.QLabel("")
+        self.texture_report_label = QtWidgets.QLabel("")
+        self.texture_manifest_label = QtWidgets.QLabel("")
+        self.texture_png_dir_label = QtWidgets.QLabel("")
+        self.texture_normals_dir_label = QtWidgets.QLabel("")
+        self.texture_log_label = QtWidgets.QLabel("")
+        for label in (
+            self.texture_analysis_label,
+            self.texture_plan_label,
+            self.texture_report_label,
+            self.texture_manifest_label,
+            self.texture_png_dir_label,
+            self.texture_normals_dir_label,
+            self.texture_log_label,
+        ):
+            label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+            label.setWordWrap(True)
+        outputs.addRow("Analysis", self.texture_analysis_label)
+        outputs.addRow("Plan", self.texture_plan_label)
+        outputs.addRow("Report", self.texture_report_label)
+        outputs.addRow("Manifest", self.texture_manifest_label)
+        outputs.addRow("PNG", self.texture_png_dir_label)
+        outputs.addRow("Normals", self.texture_normals_dir_label)
+        outputs.addRow("Log", self.texture_log_label)
+        self.texture_output_group.setVisible(False)
+        tab_layout.addWidget(self.texture_output_group)
+
+        self.texture_log_group = QtWidgets.QGroupBox("Log")
+        log_layout = QtWidgets.QVBoxLayout(self.texture_log_group)
+        self.texture_log = QtWidgets.QPlainTextEdit()
+        self.texture_log.setReadOnly(True)
+        self.texture_log.setMaximumHeight(220)
+        self.copy_texture_log_button = QtWidgets.QPushButton("Copy Log")
+        self.copy_texture_log_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogSaveButton))
+        self.copy_texture_log_button.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(self.texture_log.toPlainText()))
+        log_layout.addWidget(self.texture_log, 1)
+        log_layout.addWidget(self.copy_texture_log_button, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+        self.texture_log_group.setVisible(False)
+        tab_layout.addWidget(self.texture_log_group)
+
+        self.texture_input_row.changed.connect(self.on_texture_input_changed)
+        self.detect_texture_mapping_button.clicked.connect(self.detect_material_mapping)
+        self.texture_analyze_button.clicked.connect(self.start_texture_analyze)
+        self.texture_process_button.clicked.connect(self.start_texture_process)
+        self.texture_cancel_button.clicked.connect(self.cancel_texture)
+        self.open_texture_folder_button.clicked.connect(self.open_texture_folder)
+        self.texture_outputs_toggle.toggled.connect(self.texture_output_group.setVisible)
+        self.texture_log_toggle.toggled.connect(self.texture_log_group.setVisible)
+        self.texture_table.cellEntered.connect(lambda row, _column: self.update_texture_hover(row))
+        self.texture_table.itemChanged.connect(self.on_texture_table_item_changed)
+        self.texture_table.itemSelectionChanged.connect(self.on_texture_selection_changed)
+
+        self.tabs.addTab(tab, "12 Param Texture")
+
+    def _build_icons_tab(self) -> None:
+        tab = QtWidgets.QWidget()
+        self.icons_tab = tab
+        tab_layout = QtWidgets.QVBoxLayout(tab)
+
+        self.icon_input_row = PathRow(
+            "Step 1 workspace/import blend/PMX",
+            "file",
+            "PMX or Blend (*.pmx *.blend);;All files (*.*)",
+            hint="Use a Step 1 workspace, copied PMX, or Step 1 import blend.",
+        )
+        tab_layout.addWidget(self.icon_input_row)
+
+        self.icon_custom_image_row = PathRow(
+            "Custom release image",
+            "file",
+            "Images (*.png *.jpg *.jpeg);;All files (*.*)",
+            hint="Optional replacement image for release_icon.png.",
+        )
+        tab_layout.addWidget(self.icon_custom_image_row)
+
+        self.icon_body_vmd_row = PathRow(
+            "Body motion VMD",
+            "file",
+            "VMD motion (*.vmd);;All files (*.*)",
+            default=str(core.DEFAULT_ICON_VMD) if hasattr(core, "DEFAULT_ICON_VMD") else "",
+            hint="Default is reference/ref_motion/bad_bad_water.vmd.",
+        )
+        tab_layout.addWidget(self.icon_body_vmd_row)
+
+        self.icon_face_vmd_row = PathRow(
+            "Facial/flex VMD(s)",
+            "file",
+            "VMD motion (*.vmd);;All files (*.*)",
+            hint="Optional. Separate multiple paths with ; if needed.",
+        )
+        tab_layout.addWidget(self.icon_face_vmd_row)
+
+        settings = QtWidgets.QFormLayout()
+        self.icon_basename_edit = QtWidgets.QLineEdit()
+        self.icon_basename_edit.setPlaceholderText("Safe model name used in vgui/entities/<name>_F and _E")
+        self.icon_frame_spin = QtWidgets.QSpinBox()
+        self.icon_frame_spin.setRange(0, 999999)
+        self.icon_frame_spin.setValue(334)
+        self.icon_output_edit = QtWidgets.QLineEdit()
+        self.icon_output_edit.setReadOnly(True)
+        settings.addRow("Icon basename", self.icon_basename_edit)
+        settings.addRow("Render frame", self.icon_frame_spin)
+        settings.addRow("Output folder", self.icon_output_edit)
+        self.detect_icon_step1_button = QtWidgets.QPushButton("Detect Step 1 Output")
+        self.detect_icon_step1_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogContentsView))
+        settings.addRow("", self.detect_icon_step1_button)
+        tab_layout.addLayout(settings)
+
+        buttons = QtWidgets.QHBoxLayout()
+        self.icon_generate_button = QtWidgets.QPushButton("Generate Icons")
+        self.icon_generate_button.setObjectName("importButton")
+        self.icon_generate_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_MediaPlay))
+        self.icon_custom_button = QtWidgets.QPushButton("Use Custom Image")
+        self.icon_custom_button.setObjectName("importButton")
+        self.icon_custom_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogDetailedView))
+        self.icon_cancel_button = QtWidgets.QPushButton("Cancel")
+        self.icon_cancel_button.setEnabled(False)
+        self.icon_cancel_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogCancelButton))
+        self.open_icon_folder_button = QtWidgets.QPushButton("Open Folder")
+        self.open_icon_folder_button.setEnabled(False)
+        self.open_icon_folder_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DirOpenIcon))
+        for button in (self.icon_generate_button, self.icon_custom_button, self.icon_cancel_button, self.open_icon_folder_button):
+            buttons.addWidget(button)
+        buttons.addStretch(1)
+        tab_layout.addLayout(buttons)
+
+        self.icon_summary_label = QtWidgets.QLabel("Detect the Step 1 PMX workspace, then generate release and spawn icons.")
+        self.icon_summary_label.setObjectName("fieldHint")
+        self.icon_summary_label.setWordWrap(True)
+        tab_layout.addWidget(self.icon_summary_label)
+
+        animation_group = QtWidgets.QGroupBox("Animation Preview")
+        animation_layout = QtWidgets.QVBoxLayout(animation_group)
+        self.icon_preview_status_label = QtWidgets.QLabel("Load PMX and VMD to preview the selected icon frame.")
+        self.icon_preview_status_label.setObjectName("fieldHint")
+        self.icon_preview_status_label.setWordWrap(True)
+        self.icon_preview_load_button = QtWidgets.QPushButton("Load Animation Preview")
+        self.icon_preview_load_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_BrowserReload))
+        if IconVmdPreviewWidget is not None:
+            self.icon_animation_preview = IconVmdPreviewWidget()
+            self.icon_animation_preview.setMinimumHeight(300)
+            try:
+                self.icon_animation_preview.set_bone_overlay_enabled(False)
+                self.icon_animation_preview.set_bone_names_enabled(False)
+            except Exception:
+                pass
+        else:
+            self.icon_animation_preview = None
+            unavailable = QtWidgets.QLabel("Animation preview module is unavailable; Blender generation still works.")
+            unavailable.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            unavailable.setMinimumHeight(180)
+            unavailable.setStyleSheet("border: 1px solid #444; background: #191b1f; color: #8f98a3;")
+            self.icon_animation_preview_placeholder = unavailable
+        self.icon_preview_frame_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.icon_preview_frame_slider.setRange(0, 1000)
+        self.icon_preview_frame_slider.setValue(334)
+        preview_controls = QtWidgets.QHBoxLayout()
+        preview_controls.addWidget(self.icon_preview_load_button)
+        preview_controls.addWidget(QtWidgets.QLabel("Frame"))
+        preview_controls.addWidget(self.icon_preview_frame_slider, 1)
+        preview_controls.addWidget(self.icon_preview_status_label, 1)
+        if self.icon_animation_preview is not None:
+            animation_layout.addWidget(self.icon_animation_preview, 1)
+        else:
+            animation_layout.addWidget(self.icon_animation_preview_placeholder, 1)
+        animation_layout.addLayout(preview_controls)
+        tab_layout.addWidget(animation_group, 1)
+
+        preview_group = QtWidgets.QGroupBox("Icon Preview")
+        preview_layout = QtWidgets.QGridLayout(preview_group)
+        self.release_icon_preview_label = QtWidgets.QLabel("release_icon.png")
+        self.friendly_icon_preview_label = QtWidgets.QLabel("F.jpg")
+        self.enemy_icon_preview_label = QtWidgets.QLabel("E.jpg")
+        self.release_icon_preview_label.setFixedSize(340, 340)
+        for label in (self.release_icon_preview_label, self.friendly_icon_preview_label, self.enemy_icon_preview_label):
+            label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            label.setStyleSheet("border: 1px solid #444; background: #191b1f; color: #8f98a3;")
+        self.friendly_icon_preview_label.setFixedSize(170, 170)
+        self.enemy_icon_preview_label.setFixedSize(170, 170)
+        self.icon_info_label = FixedHintLabel("Generated icon information appears here.", width=620, height=170)
+        self.icon_info_label.setObjectName("fieldHint")
+        self.icon_info_label.setWordWrap(True)
+        self.icon_info_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        preview_layout.addWidget(self.release_icon_preview_label, 0, 0, 2, 1)
+        preview_layout.addWidget(self.friendly_icon_preview_label, 0, 1)
+        preview_layout.addWidget(self.enemy_icon_preview_label, 1, 1)
+        preview_layout.addWidget(self.icon_info_label, 0, 2, 2, 1)
+        preview_layout.setColumnStretch(2, 1)
+        tab_layout.addWidget(preview_group, 0)
+
+        table_group = QtWidgets.QGroupBox("Generated Files")
+        table_layout = QtWidgets.QVBoxLayout(table_group)
+        self.icon_files_table = QtWidgets.QTableWidget(0, 6)
+        self.icon_files_table.setHorizontalHeaderLabels(["File", "Type", "Size", "Stage", "Path", "Warnings"])
+        self.icon_files_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.icon_files_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.icon_files_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.icon_files_table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.icon_files_table.horizontalHeader().setStretchLastSection(True)
+        self.icon_files_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        table_layout.addWidget(self.icon_files_table, 1)
+        tab_layout.addWidget(table_group, 1)
+
+        self.icon_progress_group = QtWidgets.QGroupBox("Progress")
+        progress_layout = QtWidgets.QVBoxLayout(self.icon_progress_group)
+        self.icon_progress_bar = QtWidgets.QProgressBar()
+        self.icon_progress_bar.setRange(0, 100)
+        self.icon_progress_label = QtWidgets.QLabel("Idle")
+        self.icon_progress_label.setObjectName("progressStatus")
+        self.icon_progress_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self.icon_progress_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        progress_layout.addWidget(self.icon_progress_bar)
+        progress_layout.addWidget(self.icon_progress_label)
+        tab_layout.addWidget(self.icon_progress_group, 0)
+
+        toggles = QtWidgets.QHBoxLayout()
+        self.icon_outputs_toggle = QtWidgets.QToolButton()
+        self.icon_outputs_toggle.setText("Show Outputs")
+        self.icon_outputs_toggle.setCheckable(True)
+        self.icon_outputs_toggle.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogDetailedView))
+        self.icon_log_toggle = QtWidgets.QToolButton()
+        self.icon_log_toggle.setText("Show Log")
+        self.icon_log_toggle.setCheckable(True)
+        self.icon_log_toggle.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogInfoView))
+        toggles.addWidget(self.icon_outputs_toggle)
+        toggles.addWidget(self.icon_log_toggle)
+        toggles.addStretch(1)
+        tab_layout.addLayout(toggles)
+
+        self.icon_output_group = QtWidgets.QGroupBox("Outputs")
+        outputs = QtWidgets.QFormLayout(self.icon_output_group)
+        self.icon_analysis_label = QtWidgets.QLabel("")
+        self.icon_plan_label = QtWidgets.QLabel("")
+        self.icon_report_label = QtWidgets.QLabel("")
+        self.icon_files_label = QtWidgets.QLabel("")
+        self.icon_render_report_label = QtWidgets.QLabel("")
+        self.icon_log_label = QtWidgets.QLabel("")
+        for label in (
+            self.icon_analysis_label,
+            self.icon_plan_label,
+            self.icon_report_label,
+            self.icon_files_label,
+            self.icon_render_report_label,
+            self.icon_log_label,
+        ):
+            label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+            label.setWordWrap(True)
+        outputs.addRow("Analysis", self.icon_analysis_label)
+        outputs.addRow("Plan", self.icon_plan_label)
+        outputs.addRow("Report", self.icon_report_label)
+        outputs.addRow("Files", self.icon_files_label)
+        outputs.addRow("Render report", self.icon_render_report_label)
+        outputs.addRow("Log", self.icon_log_label)
+        self.icon_output_group.setVisible(False)
+        tab_layout.addWidget(self.icon_output_group)
+
+        self.icon_log_group = QtWidgets.QGroupBox("Log")
+        log_layout = QtWidgets.QVBoxLayout(self.icon_log_group)
+        self.icon_log = QtWidgets.QPlainTextEdit()
+        self.icon_log.setReadOnly(True)
+        self.icon_log.setMaximumHeight(220)
+        self.copy_icon_log_button = QtWidgets.QPushButton("Copy Log")
+        self.copy_icon_log_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogSaveButton))
+        self.copy_icon_log_button.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(self.icon_log.toPlainText()))
+        log_layout.addWidget(self.icon_log, 1)
+        log_layout.addWidget(self.copy_icon_log_button, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+        self.icon_log_group.setVisible(False)
+        tab_layout.addWidget(self.icon_log_group)
+
+        self.icon_input_row.changed.connect(self.on_icon_input_changed)
+        self.icon_custom_image_row.changed.connect(lambda _value: self.save_settings())
+        self.icon_body_vmd_row.changed.connect(lambda _value: self.save_settings())
+        self.icon_face_vmd_row.changed.connect(lambda _value: self.save_settings())
+        self.icon_basename_edit.textChanged.connect(lambda _value: self.save_settings())
+        self.icon_frame_spin.valueChanged.connect(self.on_icon_frame_spin_changed)
+        self.icon_preview_frame_slider.valueChanged.connect(self.on_icon_preview_slider_changed)
+        self.icon_preview_load_button.clicked.connect(self.load_icon_animation_preview)
+        self.detect_icon_step1_button.clicked.connect(self.detect_step1_output_for_icons)
+        self.icon_generate_button.clicked.connect(lambda: self.start_icon_generate(use_custom=False))
+        self.icon_custom_button.clicked.connect(lambda: self.start_icon_generate(use_custom=True))
+        self.icon_cancel_button.clicked.connect(self.cancel_icon_generation)
+        self.open_icon_folder_button.clicked.connect(self.open_icon_folder)
+        self.icon_outputs_toggle.toggled.connect(self.icon_output_group.setVisible)
+        self.icon_log_toggle.toggled.connect(self.icon_log_group.setVisible)
+
+        self.tabs.addTab(tab, "13 Sort Icons and Arts")
+
+    def _build_qc_tab(self) -> None:
+        tab = QtWidgets.QWidget()
+        self.qc_tab = tab
+        tab_layout = QtWidgets.QVBoxLayout(tab)
+
+        self.qc_input_row = PathRow(
+            "Workspace or Step 9 proportion export folder",
+            "dir",
+            hint="Use the workspace root or 9_export_proportion_trick/2_proportion_export folder.",
+        )
+        tab_layout.addWidget(self.qc_input_row)
+
+        self.qc_gmod_row = PathRow(
+            "GMod studiomdl.exe or install folder",
+            "file",
+            "StudioMDL (studiomdl.exe);;All files (*.*)",
+            hint="Optional; Detect GMod checks env vars, Steam libraries, and common paths.",
+        )
+        tab_layout.addWidget(self.qc_gmod_row)
+
+        settings = QtWidgets.QFormLayout()
+        self.qc_author_edit = QtWidgets.QLineEdit("sheepylord")
+        self.qc_author_edit.setVisible(False)
+        self.qc_author_label = QtWidgets.QLabel("sheepylord")
+        self.qc_category_edit = QtWidgets.QLineEdit("SheepyLord")
+        self.install_internal_identifier_filter(self.qc_category_edit)
+        self.qc_model_name_edit = QtWidgets.QLineEdit()
+        self.qc_model_name_edit.setPlaceholderText("auto-derived internal model name")
+        self.install_internal_identifier_filter(self.qc_model_name_edit)
+        self.qc_category_display_edit = QtWidgets.QLineEdit()
+        self.qc_category_display_edit.setPlaceholderText("Auto from internal category, e.g. Sheepy Lord")
+        self.install_category_display_name_filter(self.qc_category_display_edit)
+        self.install_category_completers(self.qc_category_edit, self.qc_category_display_edit)
+        self.qc_model_display_edit = QtWidgets.QLineEdit()
+        self.qc_model_display_edit.setPlaceholderText("Auto from internal model name")
+        self.install_display_name_filter(self.qc_model_display_edit)
+        for edit in (self.qc_category_edit, self.qc_model_name_edit):
+            edit.setToolTip("Internal identifier: English letters and underscores only.")
+        self.qc_category_display_edit.setToolTip("Category display name shown in Garry's Mod menus. Printable ASCII punctuation is allowed, for example Honkai: Star Rail.")
+        self.qc_model_display_edit.setToolTip("Character display name shown in Garry's Mod menus. English letters, spaces, and underscores only.")
+        self.qc_invert_jiggle_check = QtWidgets.QCheckBox("Invert jiggle yaw/pitch direction")
+        self.qc_invert_jiggle_check.setChecked(False)
+        self.qc_invert_jiggle_check.setToolTip(
+            "Default off. Reverses emitted jigglebone pitch/yaw constraints while keeping the existing classifier and jiggle lists."
+        )
+        self.qc_copy_to_gmod_addons_check = QtWidgets.QCheckBox("Copy composed folder to detected GMod addons")
+        self.qc_copy_to_gmod_addons_check.setChecked(True)
+        self.qc_copy_to_gmod_addons_check.setToolTip(
+            "Default on. After compile, mirror the composed addon folder into garrysmod/addons under the detected GMod install."
+        )
+        self.qc_include_mci_metadata_check = QtWidgets.QCheckBox("Include MMD Character Importer metadata JSON")
+        self.qc_include_mci_metadata_check.setChecked(True)
+        self.qc_include_mci_metadata_check.setToolTip(
+            "Default on. Writes the Step 14 data_static JSON files used by the dynamic model importer and VRD immunity helper. Turn off to omit those MMD Character Importer marker JSON files from the addon."
+        )
+        self.qc_output_edit = QtWidgets.QLineEdit()
+        self.qc_output_edit.setReadOnly(True)
+        settings.addRow("Author", self.qc_author_label)
+        settings.addRow("Character category internal", self.qc_category_edit)
+        settings.addRow("Character category display name", self.qc_category_display_edit)
+        settings.addRow("Model internal name", self.qc_model_name_edit)
+        settings.addRow("Model display name", self.qc_model_display_edit)
+        settings.addRow("Jiggle direction", self.qc_invert_jiggle_check)
+        settings.addRow("GMod addons install", self.qc_copy_to_gmod_addons_check)
+        settings.addRow("MCI metadata JSON", self.qc_include_mci_metadata_check)
+        settings.addRow("Output folder", self.qc_output_edit)
+        detect_row = QtWidgets.QHBoxLayout()
+        self.detect_qc_outputs_button = QtWidgets.QPushButton("Detect Step Outputs")
+        self.detect_qc_outputs_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogContentsView))
+        self.detect_qc_gmod_button = QtWidgets.QPushButton("Detect GMod")
+        self.detect_qc_gmod_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_ComputerIcon))
+        detect_row.addWidget(self.detect_qc_outputs_button)
+        detect_row.addWidget(self.detect_qc_gmod_button)
+        detect_row.addStretch(1)
+        settings.addRow("", detect_row)
+        tab_layout.addLayout(settings)
+
+        buttons = QtWidgets.QHBoxLayout()
+        self.qc_analyze_button = QtWidgets.QPushButton("Analyze QC")
+        self.qc_analyze_button.setObjectName("importButton")
+        self.qc_analyze_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogContentsView))
+        self.qc_compile_button = QtWidgets.QPushButton("Compile And Compose")
+        self.qc_compile_button.setObjectName("importButton")
+        self.qc_compile_button.setEnabled(False)
+        self.qc_compile_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_MediaPlay))
+        self.qc_cancel_button = QtWidgets.QPushButton("Cancel")
+        self.qc_cancel_button.setEnabled(False)
+        self.qc_cancel_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogCancelButton))
+        self.open_qc_folder_button = QtWidgets.QPushButton("Open Folder")
+        self.open_qc_folder_button.setEnabled(False)
+        self.open_qc_folder_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DirOpenIcon))
+        for button in (self.qc_analyze_button, self.qc_compile_button, self.qc_cancel_button, self.open_qc_folder_button):
+            buttons.addWidget(button)
+        buttons.addStretch(1)
+        tab_layout.addLayout(buttons)
+
+        self.qc_summary_label = QtWidgets.QLabel("Detect workflow outputs, then analyze QC inputs and jigglebone classification.")
+        self.qc_summary_label.setObjectName("fieldHint")
+        self.qc_summary_label.setWordWrap(True)
+        tab_layout.addWidget(self.qc_summary_label)
+
+        split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        preview_side = QtWidgets.QWidget()
+        preview_layout = QtWidgets.QVBoxLayout(preview_side)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_group = QtWidgets.QGroupBox("Model / Bone Preview")
+        preview_inner = QtWidgets.QVBoxLayout(preview_group)
+        if MaterialPreviewWidget is not None:
+            self.qc_preview = MaterialPreviewWidget()
+            self.qc_preview.setMinimumHeight(360)
+            preview_inner.addWidget(self.qc_preview, 1)
+            preview_controls = QtWidgets.QHBoxLayout()
+            self.qc_wireframe_check = QtWidgets.QCheckBox("Wireframe")
+            self.qc_alpha_check = QtWidgets.QCheckBox("Respect Alpha")
+            preview_controls.addWidget(self.qc_wireframe_check)
+            preview_controls.addWidget(self.qc_alpha_check)
+            for name in ("Front", "Back", "Left", "Right", "Top", "Bottom"):
+                button = QtWidgets.QPushButton(name)
+                button.clicked.connect(lambda _checked=False, view=name.lower(): self.qc_preview.set_view(view))
+                preview_controls.addWidget(button)
+            preview_controls.addStretch(1)
+            preview_inner.addLayout(preview_controls)
+            self.qc_wireframe_check.toggled.connect(self.qc_preview.set_wireframe_visible)
+            self.qc_alpha_check.toggled.connect(self.qc_preview.set_respect_alpha)
+        else:
+            self.qc_preview = None
+            preview_inner.addWidget(QtWidgets.QLabel("Install PyOpenGL to enable the QC preview."))
+        preview_layout.addWidget(preview_group, 1)
+        split.addWidget(preview_side)
+
+        table_side = QtWidgets.QWidget()
+        table_layout = QtWidgets.QVBoxLayout(table_side)
+        table_layout.setContentsMargins(0, 0, 0, 0)
+        bone_group = QtWidgets.QGroupBox("Jigglebone Classification")
+        bone_layout = QtWidgets.QVBoxLayout(bone_group)
+        self.qc_bone_table = QtWidgets.QTableWidget(0, 8)
+        self.qc_bone_table.setHorizontalHeaderLabels(
+            ["Type", "Bone", "Parent", "Weighted Vertices", "Region", "Confidence", "Reason", "Warnings"]
+        )
+        self.qc_bone_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.qc_bone_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.qc_bone_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.qc_bone_table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.qc_bone_table.horizontalHeader().setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.qc_bone_table.horizontalHeader().setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.qc_bone_table.horizontalHeader().setStretchLastSection(True)
+        self.qc_bone_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.qc_bone_table.setMouseTracking(True)
+        self.qc_bone_table.viewport().setMouseTracking(True)
+        self.qc_bone_table.viewport().installEventFilter(self)
+        bone_layout.addWidget(self.qc_bone_table, 1)
+        table_layout.addWidget(bone_group, 2)
+
+        files_group = QtWidgets.QGroupBox("Final Addon Files")
+        files_layout = QtWidgets.QVBoxLayout(files_group)
+        self.qc_files_table = QtWidgets.QTableWidget(0, 6)
+        self.qc_files_table.setHorizontalHeaderLabels(["File", "Type", "Size", "Stage", "Path", "Warnings"])
+        self.qc_files_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.qc_files_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.qc_files_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.qc_files_table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.qc_files_table.horizontalHeader().setStretchLastSection(True)
+        self.qc_files_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.qc_files_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        files_layout.addWidget(self.qc_files_table, 1)
+        table_layout.addWidget(files_group, 1)
+        split.addWidget(table_side)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 4)
+        tab_layout.addWidget(split, 1)
+
+        self.qc_progress_group = QtWidgets.QGroupBox("Progress")
+        progress_layout = QtWidgets.QVBoxLayout(self.qc_progress_group)
+        self.qc_progress_bar = QtWidgets.QProgressBar()
+        self.qc_progress_bar.setRange(0, 100)
+        self.qc_progress_label = QtWidgets.QLabel("Idle")
+        self.qc_progress_label.setObjectName("progressStatus")
+        self.qc_progress_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self.qc_progress_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        progress_layout.addWidget(self.qc_progress_bar)
+        progress_layout.addWidget(self.qc_progress_label)
+        tab_layout.addWidget(self.qc_progress_group, 0)
+
+        toggles = QtWidgets.QHBoxLayout()
+        self.qc_outputs_toggle = QtWidgets.QToolButton()
+        self.qc_outputs_toggle.setText("Show Outputs")
+        self.qc_outputs_toggle.setCheckable(True)
+        self.qc_outputs_toggle.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogDetailedView))
+        self.qc_log_toggle = QtWidgets.QToolButton()
+        self.qc_log_toggle.setText("Show Log")
+        self.qc_log_toggle.setCheckable(True)
+        self.qc_log_toggle.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogInfoView))
+        toggles.addWidget(self.qc_outputs_toggle)
+        toggles.addWidget(self.qc_log_toggle)
+        toggles.addStretch(1)
+        tab_layout.addLayout(toggles)
+
+        self.qc_output_group = QtWidgets.QGroupBox("Outputs")
+        outputs = QtWidgets.QFormLayout(self.qc_output_group)
+        self.qc_analysis_label = QtWidgets.QLabel("")
+        self.qc_plan_label = QtWidgets.QLabel("")
+        self.qc_report_label = QtWidgets.QLabel("")
+        self.qc_files_label = QtWidgets.QLabel("")
+        self.qc_log_label = QtWidgets.QLabel("")
+        for label in (self.qc_analysis_label, self.qc_plan_label, self.qc_report_label, self.qc_files_label, self.qc_log_label):
+            label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+            label.setWordWrap(True)
+        outputs.addRow("Analysis", self.qc_analysis_label)
+        outputs.addRow("Plan", self.qc_plan_label)
+        outputs.addRow("Report", self.qc_report_label)
+        outputs.addRow("Files", self.qc_files_label)
+        outputs.addRow("Log", self.qc_log_label)
+        self.qc_output_group.setVisible(False)
+        tab_layout.addWidget(self.qc_output_group)
+
+        self.qc_log_group = QtWidgets.QGroupBox("Log")
+        log_layout = QtWidgets.QVBoxLayout(self.qc_log_group)
+        self.qc_log = QtWidgets.QPlainTextEdit()
+        self.qc_log.setReadOnly(True)
+        self.qc_log.setMaximumHeight(220)
+        self.copy_qc_log_button = QtWidgets.QPushButton("Copy Log")
+        self.copy_qc_log_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogSaveButton))
+        self.copy_qc_log_button.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(self.qc_log.toPlainText()))
+        log_layout.addWidget(self.qc_log, 1)
+        log_layout.addWidget(self.copy_qc_log_button, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+        self.qc_log_group.setVisible(False)
+        tab_layout.addWidget(self.qc_log_group)
+
+        self.qc_input_row.changed.connect(self.on_qc_input_changed)
+        self.qc_gmod_row.changed.connect(lambda _value: self.save_settings())
+        self.qc_category_edit.textChanged.connect(lambda _value: self.save_settings())
+        self.qc_model_name_edit.textChanged.connect(lambda _value: self.save_settings())
+        self.qc_category_edit.textChanged.connect(lambda _value: self.update_qc_display_placeholders())
+        self.qc_model_name_edit.textChanged.connect(lambda _value: self.update_qc_display_placeholders())
+        self.qc_category_display_edit.textChanged.connect(lambda _value: self.save_settings())
+        self.qc_model_display_edit.textChanged.connect(lambda _value: self.save_settings())
+        self.qc_invert_jiggle_check.toggled.connect(self.on_qc_invert_jiggle_toggled)
+        self.qc_copy_to_gmod_addons_check.toggled.connect(lambda _value: self.save_settings())
+        self.qc_include_mci_metadata_check.toggled.connect(self.on_qc_include_mci_metadata_toggled)
+        self.detect_qc_outputs_button.clicked.connect(self.detect_qc_step_outputs)
+        self.detect_qc_gmod_button.clicked.connect(self.detect_gmod_for_qc)
+        self.qc_analyze_button.clicked.connect(self.start_qc_analyze)
+        self.qc_compile_button.clicked.connect(self.start_qc_compile)
+        self.qc_cancel_button.clicked.connect(self.cancel_qc)
+        self.open_qc_folder_button.clicked.connect(self.open_qc_folder)
+        self.qc_outputs_toggle.toggled.connect(self.set_qc_outputs_visible)
+        self.qc_log_toggle.toggled.connect(self.set_qc_log_visible)
+        self.qc_bone_table.itemSelectionChanged.connect(self.on_qc_bone_selection_changed)
+
+        self.tabs.addTab(tab, "14 Sort QC and Compile")
+
+    def _build_release_tab(self) -> None:
+        tab = QtWidgets.QWidget()
+        self.release_tab = tab
+        tab_layout = QtWidgets.QVBoxLayout(tab)
+
+        self.release_input_row = PathRow(
+            "Workspace or Step 14 QC folder",
+            "dir",
+            hint="Use the workspace root or 14_sort_qc_compile folder.",
+        )
+        tab_layout.addWidget(self.release_input_row)
+
+        form = QtWidgets.QFormLayout()
+        self.release_character_edit = QtWidgets.QLineEdit()
+        self.release_character_edit.setPlaceholderText("Character readable name")
+        self.release_work_edit = QtWidgets.QLineEdit()
+        self.release_work_edit.setPlaceholderText("Source work / franchise title")
+        self.release_author_edit = QtWidgets.QLineEdit("sheepylord")
+        self.release_creator_edit = QtWidgets.QLineEdit()
+        self.release_creator_edit.setPlaceholderText("Model creator / rights holder")
+        self.release_openai_model_edit = QtWidgets.QComboBox()
+        self.release_openai_model_edit.setEditable(True)
+        self.release_openai_model_edit.addItems(OPENAI_MODEL_OPTIONS)
+        self.release_openai_model_edit.setCurrentText(os.environ.get("OPENAI_MODEL", OPENAI_MODEL_OPTIONS[0]))
+        self.release_openai_key_edit = QtWidgets.QLineEdit()
+        self.release_openai_key_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+        self.release_openai_key_edit.setPlaceholderText("Session only; falls back to OPENAI_API_KEY")
+        self.release_deepl_key_edit = QtWidgets.QLineEdit()
+        self.release_deepl_key_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+        self.release_deepl_key_edit.setPlaceholderText("Session only; falls back to DEEPL_API_KEY")
+        self.release_image_url_edit = QtWidgets.QLineEdit("https://i.imgur.com/fVVaDCS.gif")
+        self.release_rtx_link_edit = QtWidgets.QLineEdit("https://github.com/SheepyLord/RTX-remix_GMod_Package")
+        self.release_quote_language_edit = QtWidgets.QLineEdit("english")
+        self.release_quote_author_edit = QtWidgets.QLineEdit()
+        self.release_output_edit = QtWidgets.QLineEdit()
+        self.release_output_edit.setReadOnly(True)
+        form.addRow("Character name", self.release_character_edit)
+        form.addRow("Source work", self.release_work_edit)
+        form.addRow("Author", self.release_author_edit)
+        form.addRow("Model creator", self.release_creator_edit)
+        form.addRow("OpenAI model", self.release_openai_model_edit)
+        form.addRow("OpenAI key", self.release_openai_key_edit)
+        form.addRow("DeepL key", self.release_deepl_key_edit)
+        form.addRow("Image URL", self.release_image_url_edit)
+        form.addRow("RTX link", self.release_rtx_link_edit)
+        form.addRow("Quote language", self.release_quote_language_edit)
+        form.addRow("Quote author", self.release_quote_author_edit)
+        form.addRow("Output folder", self.release_output_edit)
+        for hidden_field in (
+            self.release_image_url_edit,
+            self.release_rtx_link_edit,
+            self.release_quote_language_edit,
+            self.release_quote_author_edit,
+        ):
+            hidden_field.setVisible(False)
+            label = form.labelForField(hidden_field)
+            if label is not None:
+                label.setVisible(False)
+        tab_layout.addLayout(form)
+
+        self.release_quote_edit = QtWidgets.QPlainTextEdit()
+        self.release_quote_edit.setPlaceholderText("Generated/editable English quote translation.")
+        self.release_quote_edit.setMaximumHeight(70)
+        self.release_quote_label = QtWidgets.QLabel("Quote translation")
+        self.release_quote_label.setVisible(False)
+        self.release_quote_edit.setVisible(False)
+        tab_layout.addWidget(self.release_quote_label)
+        tab_layout.addWidget(self.release_quote_edit)
+        self.release_quote_original_edit = QtWidgets.QPlainTextEdit()
+        self.release_quote_original_edit.setPlaceholderText("Generated/editable native-language quote.")
+        self.release_quote_original_edit.setMaximumHeight(70)
+        tab_layout.addWidget(QtWidgets.QLabel("Native quote"))
+        tab_layout.addWidget(self.release_quote_original_edit)
+
+        buttons = QtWidgets.QHBoxLayout()
+        self.detect_release_step14_button = QtWidgets.QPushButton("Detect Step 14 Output")
+        self.detect_release_step14_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogContentsView))
+        self.release_chatgpt_button = QtWidgets.QPushButton("Generate English With ChatGPT")
+        self.release_chatgpt_button.setObjectName("importButton")
+        self.release_translate_button = QtWidgets.QPushButton("Translate With DeepL")
+        self.release_template_button = QtWidgets.QPushButton("Write Template")
+        self.release_template_button.setObjectName("importButton")
+        self.release_cancel_button = QtWidgets.QPushButton("Cancel")
+        self.release_cancel_button.setEnabled(False)
+        self.open_release_folder_button = QtWidgets.QPushButton("Open Folder")
+        self.open_release_folder_button.setEnabled(False)
+        self.open_release_folder_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DirOpenIcon))
+        for button in (
+            self.detect_release_step14_button,
+            self.release_chatgpt_button,
+            self.release_translate_button,
+            self.release_template_button,
+            self.release_cancel_button,
+            self.open_release_folder_button,
+        ):
+            buttons.addWidget(button)
+        buttons.addStretch(1)
+        tab_layout.addLayout(buttons)
+
+        self.release_summary_label = QtWidgets.QLabel("Detect Step 14, enter character/work metadata, then generate or write the release description template.")
+        self.release_summary_label.setObjectName("fieldHint")
+        self.release_summary_label.setWordWrap(True)
+        tab_layout.addWidget(self.release_summary_label)
+
+        split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        edit_side = QtWidgets.QWidget()
+        edit_layout = QtWidgets.QVBoxLayout(edit_side)
+        edit_layout.setContentsMargins(0, 0, 0, 0)
+        desc_group = QtWidgets.QGroupBox("English Description")
+        desc_layout = QtWidgets.QVBoxLayout(desc_group)
+        self.release_description_edit = QtWidgets.QPlainTextEdit()
+        self.release_description_edit.setPlaceholderText("Write or generate the English description first.")
+        desc_layout.addWidget(self.release_description_edit, 1)
+        edit_layout.addWidget(desc_group, 1)
+
+        translations_group = QtWidgets.QGroupBox("Translations")
+        translations_layout = QtWidgets.QVBoxLayout(translations_group)
+        self.release_translation_table = QtWidgets.QTableWidget(0, 3)
+        self.release_translation_table.setHorizontalHeaderLabels(["Language", "Description", "Status"])
+        self.release_translation_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.release_translation_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.release_translation_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.release_translation_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        translations_layout.addWidget(self.release_translation_table, 1)
+        edit_layout.addWidget(translations_group, 1)
+        split.addWidget(edit_side)
+
+        preview_side = QtWidgets.QWidget()
+        preview_layout = QtWidgets.QVBoxLayout(preview_side)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_group = QtWidgets.QGroupBox("Template Preview")
+        preview_inner = QtWidgets.QVBoxLayout(preview_group)
+        self.release_preview_edit = QtWidgets.QPlainTextEdit()
+        self.release_preview_edit.setReadOnly(True)
+        preview_inner.addWidget(self.release_preview_edit, 1)
+        preview_layout.addWidget(preview_group, 2)
+
+        files_group = QtWidgets.QGroupBox("Output Files")
+        files_layout = QtWidgets.QVBoxLayout(files_group)
+        self.release_files_table = QtWidgets.QTableWidget(0, 6)
+        self.release_files_table.setHorizontalHeaderLabels(["File", "Type", "Size", "Stage", "Path", "Warnings"])
+        self.release_files_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.release_files_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.release_files_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.release_files_table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.release_files_table.horizontalHeader().setStretchLastSection(True)
+        self.release_files_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        files_layout.addWidget(self.release_files_table, 1)
+        preview_layout.addWidget(files_group, 1)
+        split.addWidget(preview_side)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        tab_layout.addWidget(split, 1)
+
+        self.release_progress_group = QtWidgets.QGroupBox("Progress")
+        progress_layout = QtWidgets.QVBoxLayout(self.release_progress_group)
+        self.release_progress_bar = QtWidgets.QProgressBar()
+        self.release_progress_bar.setRange(0, 100)
+        self.release_progress_label = QtWidgets.QLabel("Idle")
+        self.release_progress_label.setObjectName("progressStatus")
+        self.release_progress_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        progress_layout.addWidget(self.release_progress_bar)
+        progress_layout.addWidget(self.release_progress_label)
+        tab_layout.addWidget(self.release_progress_group, 0)
+
+        toggles = QtWidgets.QHBoxLayout()
+        self.release_outputs_toggle = QtWidgets.QToolButton()
+        self.release_outputs_toggle.setText("Show Outputs")
+        self.release_outputs_toggle.setCheckable(True)
+        self.release_log_toggle = QtWidgets.QToolButton()
+        self.release_log_toggle.setText("Show Log")
+        self.release_log_toggle.setCheckable(True)
+        toggles.addWidget(self.release_outputs_toggle)
+        toggles.addWidget(self.release_log_toggle)
+        toggles.addStretch(1)
+        tab_layout.addLayout(toggles)
+
+        self.release_output_group = QtWidgets.QGroupBox("Outputs")
+        outputs = QtWidgets.QFormLayout(self.release_output_group)
+        self.release_analysis_label = QtWidgets.QLabel("")
+        self.release_plan_label = QtWidgets.QLabel("")
+        self.release_report_label = QtWidgets.QLabel("")
+        self.release_files_label = QtWidgets.QLabel("")
+        self.release_template_label = QtWidgets.QLabel("")
+        self.release_log_label = QtWidgets.QLabel("")
+        for label in (
+            self.release_analysis_label,
+            self.release_plan_label,
+            self.release_report_label,
+            self.release_files_label,
+            self.release_template_label,
+            self.release_log_label,
+        ):
+            label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+            label.setWordWrap(True)
+        outputs.addRow("Analysis", self.release_analysis_label)
+        outputs.addRow("Plan", self.release_plan_label)
+        outputs.addRow("Report", self.release_report_label)
+        outputs.addRow("Files", self.release_files_label)
+        outputs.addRow("Template", self.release_template_label)
+        outputs.addRow("Log", self.release_log_label)
+        self.release_output_group.setVisible(False)
+        tab_layout.addWidget(self.release_output_group)
+
+        self.release_log_group = QtWidgets.QGroupBox("Log")
+        log_layout = QtWidgets.QVBoxLayout(self.release_log_group)
+        self.release_log = QtWidgets.QPlainTextEdit()
+        self.release_log.setReadOnly(True)
+        self.release_log.setMaximumHeight(220)
+        self.copy_release_log_button = QtWidgets.QPushButton("Copy Log")
+        self.copy_release_log_button.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(self.release_log.toPlainText()))
+        log_layout.addWidget(self.release_log, 1)
+        log_layout.addWidget(self.copy_release_log_button, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+        self.release_log_group.setVisible(False)
+        tab_layout.addWidget(self.release_log_group)
+
+        self.release_input_row.changed.connect(self.on_release_input_changed)
+        for edit in (
+            self.release_character_edit,
+            self.release_work_edit,
+            self.release_author_edit,
+            self.release_creator_edit,
+            self.release_image_url_edit,
+            self.release_rtx_link_edit,
+            self.release_quote_language_edit,
+            self.release_quote_author_edit,
+        ):
+            edit.textChanged.connect(lambda _value: (self.commit_release_plan_from_ui(update_preview=True), self.save_settings()))
+        self.release_openai_model_edit.currentTextChanged.connect(lambda _value: (self.commit_release_plan_from_ui(update_preview=True), self.save_settings()))
+        self.release_description_edit.textChanged.connect(lambda: self.commit_release_plan_from_ui(update_preview=True))
+        self.release_quote_edit.textChanged.connect(lambda: self.commit_release_plan_from_ui(update_preview=True))
+        self.release_quote_original_edit.textChanged.connect(lambda: self.commit_release_plan_from_ui(update_preview=True))
+        self.release_translation_table.itemChanged.connect(self.on_release_translation_item_changed)
+        self.detect_release_step14_button.clicked.connect(self.detect_release_step14_output)
+        self.release_chatgpt_button.clicked.connect(lambda: self.start_release_generate("generate_english"))
+        self.release_translate_button.clicked.connect(lambda: self.start_release_generate("translate"))
+        self.release_template_button.clicked.connect(lambda: self.start_release_generate("write"))
+        self.release_cancel_button.clicked.connect(self.cancel_release)
+        self.open_release_folder_button.clicked.connect(self.open_release_folder)
+        self.release_outputs_toggle.toggled.connect(self.release_output_group.setVisible)
+        self.release_log_toggle.toggled.connect(self.release_log_group.setVisible)
+
+        self.tabs.addTab(tab, "15 Sort Release Description")
+
+    def _build_future_tabs(self) -> None:
+        steps_path = core.ROOT / "steps.txt"
+        try:
+            lines = steps_path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            lines = []
+        for line in lines:
+            match = line.strip()
+            if (
+                not match
+                or match.startswith("1.")
+                or match.startswith("2.")
+                or match.startswith("3.")
+                or match.startswith("4.")
+                or match.startswith("5.")
+                or match.startswith("6.")
+                or match.startswith("7.")
+                or match.startswith("8.")
+                or match.startswith("9.")
+                or match.startswith("10.")
+                or match.startswith("11.")
+                or match.startswith("12.")
+                or match.startswith("13.")
+                or match.startswith("14.")
+                or match.startswith("15.")
+            ):
+                continue
+            tab = QtWidgets.QWidget()
+            layout = QtWidgets.QVBoxLayout(tab)
+            label = QtWidgets.QLabel("This workflow step is reserved for a later implementation.")
+            label.setObjectName("fieldHint")
+            layout.addWidget(label)
+            layout.addStretch(1)
+            index = self.tabs.addTab(tab, match)
+            self.tabs.setTabEnabled(index, False)
+
+    def _load_settings(self) -> None:
+        saved_language = str(self.settings_store.value("ui_language", self.language_code, str) or self.language_code)
+        if saved_language != self.language_code:
+            self.language_code = saved_language
+            self.i18n_catalog = self.load_i18n_catalog(self.language_code)
+        if hasattr(self, "main_language_combo"):
+            language_index = self.main_language_combo.findData(self.language_code)
+            if language_index >= 0:
+                blocker = QtCore.QSignalBlocker(self.main_language_combo)
+                try:
+                    self.main_language_combo.setCurrentIndex(language_index)
+                finally:
+                    del blocker
+        source = str(self.settings_store.value("source_dir", "", str) or "")
+        if not source:
+            source = self.default_sample_dir()
+        main_source = str(self.settings_store.value("main_source_dir", source, str) or source)
+        if main_source and hasattr(self, "main_source_row"):
+            self.main_source_row.set_value(main_source)
+        main_gmod = str(self.settings_store.value("main_gmod_path", "", str) or "")
+        if not main_gmod:
+            main_gmod = str(self.settings_store.value("qc_gmod_path", "", str) or "")
+        if main_gmod and hasattr(self, "main_gmod_row"):
+            self.main_gmod_row.set_value(main_gmod)
+        main_model = str(self.settings_store.value("main_model_name", "", str) or "")
+        if main_model and hasattr(self, "main_model_name_edit"):
+            self.main_model_name_edit.setText(main_model)
+        if hasattr(self, "main_category_edit"):
+            self.main_category_edit.setText(str(self.settings_store.value("main_category", "SheepyLord", str) or "SheepyLord"))
+        if hasattr(self, "main_category_display_edit"):
+            self.main_category_display_edit.setText(str(self.settings_store.value("main_category_display_name", "", str) or ""))
+        if hasattr(self, "main_model_display_edit"):
+            self.main_model_display_edit.setText(str(self.settings_store.value("main_model_display_name", "", str) or ""))
+        if hasattr(self, "main_category_display_edit"):
+            self.update_main_display_placeholders()
+        if source:
+            self.source_row.set_value(source)
+        fix_input = str(self.settings_store.value("fix_input_blend", "", str) or "")
+        if fix_input:
+            self.fix_input_row.set_value(fix_input)
+        spine_input = str(self.settings_store.value("spine_input_blend", "", str) or "")
+        if spine_input and hasattr(self, "spine_input_row"):
+            self.spine_input_row.set_value(spine_input)
+        sort_input = str(self.settings_store.value("sort_input_blend", "", str) or "")
+        if sort_input and hasattr(self, "sort_input_row"):
+            self.sort_input_row.set_value(sort_input)
+        material_input = str(self.settings_store.value("material_input_blend", "", str) or "")
+        if material_input and hasattr(self, "material_input_row"):
+            self.material_input_row.set_value(material_input)
+        bodygroup_input = str(self.settings_store.value("bodygroup_input_blend", "", str) or "")
+        if bodygroup_input and hasattr(self, "bodygroup_input_row"):
+            self.bodygroup_input_row.set_value(bodygroup_input)
+        flex_input = str(self.settings_store.value("flex_input_blend", "", str) or "")
+        if flex_input and hasattr(self, "flex_input_row"):
+            self.flex_input_row.set_value(flex_input)
+        collision_input = str(self.settings_store.value("collision_input_blend", "", str) or "")
+        if collision_input and hasattr(self, "collision_input_row"):
+            self.collision_input_row.set_value(collision_input)
+        proportion_input = str(self.settings_store.value("proportion_input_blend", "", str) or "")
+        if proportion_input and hasattr(self, "proportion_input_row"):
+            self.proportion_input_row.set_value(proportion_input)
+        if hasattr(self, "proportion_remove_zero_weight_check"):
+            self.proportion_remove_zero_weight_check.setChecked(bool(self.settings_store.value("proportion_remove_zero_weight_bones", True, bool)))
+        carms_input = str(self.settings_store.value("carms_input_dir", "", str) or "")
+        if carms_input and hasattr(self, "carms_input_row"):
+            self.carms_input_row.set_value(carms_input)
+        vrd_input = str(self.settings_store.value("vrd_input_dir", "", str) or "")
+        if vrd_input and hasattr(self, "vrd_input_row"):
+            self.vrd_input_row.set_value(vrd_input)
+        texture_input = str(self.settings_store.value("texture_input_mapping", "", str) or "")
+        if texture_input and hasattr(self, "texture_input_row"):
+            self.texture_input_row.set_value(texture_input)
+        icon_input = str(self.settings_store.value("icon_step1_input", "", str) or "")
+        if icon_input and hasattr(self, "icon_input_row"):
+            self.icon_input_row.set_value(icon_input)
+        icon_custom = str(self.settings_store.value("icon_custom_image", "", str) or "")
+        if icon_custom and hasattr(self, "icon_custom_image_row"):
+            self.icon_custom_image_row.set_value(icon_custom)
+        icon_body_vmd = str(self.settings_store.value("icon_body_vmd", "", str) or "")
+        if icon_body_vmd and hasattr(self, "icon_body_vmd_row"):
+            self.icon_body_vmd_row.set_value(icon_body_vmd)
+        icon_face_vmds = str(self.settings_store.value("icon_face_vmds", "", str) or "")
+        if icon_face_vmds and hasattr(self, "icon_face_vmd_row"):
+            self.icon_face_vmd_row.set_value(icon_face_vmds)
+        icon_frame = int(self.settings_store.value("icon_frame", 334, int) or 334)
+        if hasattr(self, "icon_frame_spin"):
+            self.icon_frame_spin.setValue(icon_frame)
+        if hasattr(self, "icon_preview_frame_slider"):
+            self.icon_preview_frame_slider.setValue(icon_frame)
+        icon_basename = str(self.settings_store.value("icon_basename", "", str) or "")
+        if icon_basename and hasattr(self, "icon_basename_edit"):
+            self.icon_basename_edit.setText(icon_basename)
+        qc_input = str(self.settings_store.value("qc_input_dir", "", str) or "")
+        if qc_input and hasattr(self, "qc_input_row"):
+            self.qc_input_row.set_value(qc_input)
+        qc_gmod = str(self.settings_store.value("qc_gmod_path", "", str) or "")
+        if qc_gmod and hasattr(self, "qc_gmod_row"):
+            self.qc_gmod_row.set_value(qc_gmod)
+        if hasattr(self, "qc_author_edit"):
+            self.qc_author_edit.setText("sheepylord")
+        if hasattr(self, "qc_category_edit"):
+            saved_category = str(self.settings_store.value("qc_category", "SheepyLord", str) or "SheepyLord")
+            self.qc_category_edit.setText("SheepyLord" if saved_category == "sheepylord" else saved_category)
+        qc_model = str(self.settings_store.value("qc_model_name", "", str) or "")
+        if qc_model and hasattr(self, "qc_model_name_edit"):
+            self.qc_model_name_edit.setText(qc_model)
+        if hasattr(self, "qc_category_display_edit"):
+            self.qc_category_display_edit.setText(str(self.settings_store.value("qc_category_display_name", "", str) or ""))
+        if hasattr(self, "qc_model_display_edit"):
+            self.qc_model_display_edit.setText(str(self.settings_store.value("qc_model_display_name", "", str) or ""))
+        if hasattr(self, "qc_category_display_edit"):
+            self.update_qc_display_placeholders()
+        if hasattr(self, "qc_invert_jiggle_check"):
+            raw_invert = self.settings_store.value("qc_invert_jiggle_direction", False)
+            if isinstance(raw_invert, str):
+                invert = raw_invert.strip().lower() not in {"0", "false", "no", "off"}
+            else:
+                invert = bool(raw_invert)
+            self.qc_invert_jiggle_check.setChecked(invert)
+        if hasattr(self, "qc_copy_to_gmod_addons_check"):
+            raw_copy = self.settings_store.value("qc_copy_to_gmod_addons", True)
+            if isinstance(raw_copy, str):
+                copy_to_addons = raw_copy.strip().lower() not in {"0", "false", "no", "off"}
+            else:
+                copy_to_addons = bool(raw_copy)
+            self.qc_copy_to_gmod_addons_check.setChecked(copy_to_addons)
+        if hasattr(self, "qc_include_mci_metadata_check"):
+            raw_metadata = self.settings_store.value("qc_include_mci_metadata_json", True)
+            if isinstance(raw_metadata, str):
+                include_metadata = raw_metadata.strip().lower() not in {"0", "false", "no", "off"}
+            else:
+                include_metadata = bool(raw_metadata)
+            self.qc_include_mci_metadata_check.setChecked(include_metadata)
+        release_input = str(self.settings_store.value("release_input_dir", "", str) or "")
+        if release_input and hasattr(self, "release_input_row"):
+            self.release_input_row.set_value(release_input)
+        release_values = {
+            "release_character": "release_character_edit",
+            "release_work": "release_work_edit",
+            "release_author": "release_author_edit",
+            "release_creator": "release_creator_edit",
+            "release_openai_model": "release_openai_model_edit",
+            "release_image_url": "release_image_url_edit",
+            "release_rtx_link": "release_rtx_link_edit",
+            "release_quote_language": "release_quote_language_edit",
+            "release_quote_author": "release_quote_author_edit",
+        }
+        defaults = {
+            "release_author": "sheepylord",
+            "release_openai_model": os.environ.get("OPENAI_MODEL", OPENAI_MODEL_OPTIONS[0]),
+            "release_image_url": "https://i.imgur.com/fVVaDCS.gif",
+            "release_rtx_link": "https://github.com/SheepyLord/RTX-remix_GMod_Package",
+            "release_quote_language": "english",
+        }
+        for key, attr in release_values.items():
+            if hasattr(self, attr):
+                value = str(self.settings_store.value(key, defaults.get(key, ""), str) or defaults.get(key, ""))
+                if value:
+                    widget = getattr(self, attr)
+                    if isinstance(widget, QtWidgets.QComboBox):
+                        widget.setCurrentText(value)
+                    else:
+                        widget.setText(value)
+        sort_limit = self.settings_store.value("sort_bone_limit", 254, int)
+        if hasattr(self, "sort_limit_spin"):
+            try:
+                self.sort_limit_spin.setValue(max(1, min(254, int(sort_limit))))
+            except Exception:
+                self.sort_limit_spin.setValue(254)
+        material_limit = self.settings_store.value("material_limit", 32, int)
+        if hasattr(self, "material_limit_spin"):
+            try:
+                self.material_limit_spin.setValue(max(1, min(32, int(material_limit))))
+            except Exception:
+                self.material_limit_spin.setValue(32)
+        if hasattr(self, "material_always_merge_check"):
+            self.material_always_merge_check.setChecked(bool(self.settings_store.value("material_always_merge", False, bool)))
+        if hasattr(self, "bodygroup_scale_spin"):
+            try:
+                self.bodygroup_scale_spin.setValue(float(self.settings_store.value("bodygroup_scale_factor", core.DEFAULT_BODYGROUP_SCALE_FACTOR, float)))
+            except Exception:
+                self.bodygroup_scale_spin.setValue(float(core.DEFAULT_BODYGROUP_SCALE_FACTOR))
+        if hasattr(self, "bodygroup_scale_preset_buttons"):
+            self.set_bodygroup_scale_preset(str(self.settings_store.value("bodygroup_scale_preset", "factor", str) or "factor"))
+        if hasattr(self, "bodygroup_always_auto_split_check"):
+            self.bodygroup_always_auto_split_check.setChecked(bool(self.settings_store.value("bodygroup_always_auto_split", False, bool)))
+        raw_rtx_limit = self.settings_store.value("bodygroup_rtx_vertex_limit", False)
+        if isinstance(raw_rtx_limit, str):
+            rtx_limit = raw_rtx_limit.strip().lower() not in {"0", "false", "no", "off"}
+        else:
+            rtx_limit = bool(raw_rtx_limit)
+        for attr in ("main_rtx_bodygroup_limit_check", "bodygroup_rtx_limit_check"):
+            widget = getattr(self, attr, None)
+            if isinstance(widget, QtWidgets.QCheckBox):
+                widget.setChecked(rtx_limit)
+        self.update_bodygroup_limit_hint()
+        raw_clear_normals = self.settings_store.value("fix_clear_custom_normals", True)
+        if isinstance(raw_clear_normals, str):
+            clear_normals = raw_clear_normals.strip().lower() not in {"0", "false", "no", "off"}
+        else:
+            clear_normals = bool(raw_clear_normals)
+        for attr in ("main_clear_custom_normals_check", "fix_clear_custom_normals_check"):
+            widget = getattr(self, attr, None)
+            if isinstance(widget, QtWidgets.QCheckBox):
+                widget.setChecked(clear_normals)
+        if hasattr(self, "flex_isolate_bodygroup_check"):
+            self.flex_isolate_bodygroup_check.setChecked(bool(self.settings_store.value("flex_isolate_bodygroup", False, bool)))
+        if hasattr(self, "carms_weight_spin"):
+            try:
+                self.carms_weight_spin.setValue(float(self.settings_store.value("carms_weight_threshold", 0.12, float)))
+            except Exception:
+                self.carms_weight_spin.setValue(0.12)
+
+    def save_settings(self) -> None:
+        self.settings_store.setValue("ui_language", self.language_code)
+        if hasattr(self, "main_source_row"):
+            self.settings_store.setValue("main_source_dir", self.main_source_row.value())
+        if hasattr(self, "main_pmx_combo"):
+            pmx = self.current_main_pmx_path()
+            if pmx:
+                self.settings_store.setValue("main_pmx_path", str(pmx))
+        if hasattr(self, "main_gmod_row"):
+            self.settings_store.setValue("main_gmod_path", self.main_gmod_row.value())
+        if hasattr(self, "main_model_name_edit"):
+            self.settings_store.setValue("main_model_name", self.main_model_name_edit.text().strip())
+        if hasattr(self, "main_category_edit"):
+            self.settings_store.setValue("main_category", self.main_category_edit.text().strip())
+        if hasattr(self, "main_category_display_edit"):
+            self.settings_store.setValue("main_category_display_name", self.main_category_display_edit.text().strip())
+        if hasattr(self, "main_model_display_edit"):
+            self.settings_store.setValue("main_model_display_name", self.main_model_display_edit.text().strip())
+        self.settings_store.setValue("source_dir", self.source_row.value())
+        pmx = self.current_pmx_path()
+        if pmx:
+            self.settings_store.setValue("pmx_path", str(pmx))
+        if hasattr(self, "fix_input_row"):
+            self.settings_store.setValue("fix_input_blend", self.fix_input_row.value())
+        if hasattr(self, "spine_input_row"):
+            self.settings_store.setValue("spine_input_blend", self.spine_input_row.value())
+        if hasattr(self, "sort_input_row"):
+            self.settings_store.setValue("sort_input_blend", self.sort_input_row.value())
+        if hasattr(self, "sort_limit_spin"):
+            self.settings_store.setValue("sort_bone_limit", self.sort_limit_spin.value())
+        if hasattr(self, "material_input_row"):
+            self.settings_store.setValue("material_input_blend", self.material_input_row.value())
+        if hasattr(self, "material_limit_spin"):
+            self.settings_store.setValue("material_limit", self.material_limit_spin.value())
+        if hasattr(self, "material_always_merge_check"):
+            self.settings_store.setValue("material_always_merge", self.material_always_merge_check.isChecked())
+        if hasattr(self, "bodygroup_input_row"):
+            self.settings_store.setValue("bodygroup_input_blend", self.bodygroup_input_row.value())
+        if hasattr(self, "bodygroup_scale_spin"):
+            self.settings_store.setValue("bodygroup_scale_factor", self.bodygroup_scale_spin.value())
+        if hasattr(self, "bodygroup_scale_preset"):
+            self.settings_store.setValue("bodygroup_scale_preset", self.bodygroup_scale_preset)
+        if hasattr(self, "bodygroup_always_auto_split_check"):
+            self.settings_store.setValue("bodygroup_always_auto_split", self.bodygroup_always_auto_split_check.isChecked())
+        if hasattr(self, "bodygroup_rtx_limit_check") or hasattr(self, "main_rtx_bodygroup_limit_check"):
+            self.settings_store.setValue("bodygroup_rtx_vertex_limit", self.bodygroup_vertex_limit() == int(getattr(core, "RTX_BODYGROUP_VERTEX_LIMIT", 32767)))
+        if hasattr(self, "fix_clear_custom_normals_check") or hasattr(self, "main_clear_custom_normals_check"):
+            self.settings_store.setValue("fix_clear_custom_normals", self.clear_custom_normals_enabled())
+        if hasattr(self, "flex_input_row"):
+            self.settings_store.setValue("flex_input_blend", self.flex_input_row.value())
+        if hasattr(self, "flex_isolate_bodygroup_check"):
+            self.settings_store.setValue("flex_isolate_bodygroup", self.flex_isolate_bodygroup_check.isChecked())
+        if hasattr(self, "collision_input_row"):
+            self.settings_store.setValue("collision_input_blend", self.collision_input_row.value())
+        if hasattr(self, "proportion_input_row"):
+            self.settings_store.setValue("proportion_input_blend", self.proportion_input_row.value())
+        if hasattr(self, "proportion_remove_zero_weight_check"):
+            self.settings_store.setValue("proportion_remove_zero_weight_bones", self.proportion_remove_zero_weight_check.isChecked())
+        if hasattr(self, "carms_input_row"):
+            self.settings_store.setValue("carms_input_dir", self.carms_input_row.value())
+        if hasattr(self, "carms_weight_spin"):
+            self.settings_store.setValue("carms_weight_threshold", self.carms_weight_spin.value())
+        if hasattr(self, "vrd_input_row"):
+            self.settings_store.setValue("vrd_input_dir", self.vrd_input_row.value())
+        if hasattr(self, "texture_input_row"):
+            self.settings_store.setValue("texture_input_mapping", self.texture_input_row.value())
+        if hasattr(self, "icon_input_row"):
+            self.settings_store.setValue("icon_step1_input", self.icon_input_row.value())
+        if hasattr(self, "icon_custom_image_row"):
+            self.settings_store.setValue("icon_custom_image", self.icon_custom_image_row.value())
+        if hasattr(self, "icon_body_vmd_row"):
+            self.settings_store.setValue("icon_body_vmd", self.icon_body_vmd_row.value())
+        if hasattr(self, "icon_face_vmd_row"):
+            self.settings_store.setValue("icon_face_vmds", self.icon_face_vmd_row.value())
+        if hasattr(self, "icon_frame_spin"):
+            self.settings_store.setValue("icon_frame", int(self.icon_frame_spin.value()))
+        if hasattr(self, "icon_basename_edit"):
+            self.settings_store.setValue("icon_basename", self.icon_basename_edit.text().strip())
+        if hasattr(self, "qc_input_row"):
+            self.settings_store.setValue("qc_input_dir", self.qc_input_row.value())
+        if hasattr(self, "qc_gmod_row"):
+            self.settings_store.setValue("qc_gmod_path", self.qc_gmod_row.value())
+        if hasattr(self, "qc_author_edit"):
+            self.settings_store.setValue("qc_author", "sheepylord")
+        if hasattr(self, "qc_category_edit"):
+            self.settings_store.setValue("qc_category", self.qc_category_edit.text().strip())
+        if hasattr(self, "qc_model_name_edit"):
+            self.settings_store.setValue("qc_model_name", self.qc_model_name_edit.text().strip())
+        if hasattr(self, "qc_category_display_edit"):
+            self.settings_store.setValue("qc_category_display_name", self.qc_category_display_edit.text().strip())
+        if hasattr(self, "qc_model_display_edit"):
+            self.settings_store.setValue("qc_model_display_name", self.qc_model_display_edit.text().strip())
+        if hasattr(self, "qc_invert_jiggle_check"):
+            self.settings_store.setValue("qc_invert_jiggle_direction", self.qc_invert_jiggle_check.isChecked())
+        if hasattr(self, "qc_copy_to_gmod_addons_check"):
+            self.settings_store.setValue("qc_copy_to_gmod_addons", self.qc_copy_to_gmod_addons_check.isChecked())
+        if hasattr(self, "qc_include_mci_metadata_check"):
+            self.settings_store.setValue("qc_include_mci_metadata_json", self.qc_include_mci_metadata_check.isChecked())
+        if hasattr(self, "release_input_row"):
+            self.settings_store.setValue("release_input_dir", self.release_input_row.value())
+        if hasattr(self, "release_character_edit"):
+            self.settings_store.setValue("release_character", self.release_character_edit.text().strip())
+        if hasattr(self, "release_work_edit"):
+            self.settings_store.setValue("release_work", self.release_work_edit.text().strip())
+        if hasattr(self, "release_author_edit"):
+            self.settings_store.setValue("release_author", self.release_author_edit.text().strip())
+        if hasattr(self, "release_creator_edit"):
+            self.settings_store.setValue("release_creator", self.release_creator_edit.text().strip())
+        if hasattr(self, "release_openai_model_edit"):
+            self.settings_store.setValue("release_openai_model", self.release_openai_model_edit.currentText().strip())
+        if hasattr(self, "release_image_url_edit"):
+            self.settings_store.setValue("release_image_url", self.release_image_url_edit.text().strip())
+        if hasattr(self, "release_rtx_link_edit"):
+            self.settings_store.setValue("release_rtx_link", self.release_rtx_link_edit.text().strip())
+        if hasattr(self, "release_quote_language_edit"):
+            self.settings_store.setValue("release_quote_language", self.release_quote_language_edit.text().strip())
+        if hasattr(self, "release_quote_author_edit"):
+            self.settings_store.setValue("release_quote_author", self.release_quote_author_edit.text().strip())
+        self.settings_store.sync()
+
+    def append_translated_log(self, widget: QtWidgets.QPlainTextEdit, message: str, progress_callback: Callable[[str], None] | None = None) -> None:
+        display = self.translate_runtime_text(str(message))
+        widget.appendPlainText(display)
+        self.statusBar().showMessage(display[:160])
+        if progress_callback is not None:
+            progress_callback(str(message))
+
+    def append_log(self, message: str) -> None:
+        self.append_translated_log(self.log, message, self.update_progress_from_log)
+
+    def set_import_outputs_visible(self, visible: bool) -> None:
+        if hasattr(self, "output_group"):
+            self.output_group.setVisible(bool(visible))
+        if hasattr(self, "import_outputs_toggle"):
+            self.import_outputs_toggle.setText("Hide Outputs" if visible else "Show Outputs")
+
+    def set_import_log_visible(self, visible: bool) -> None:
+        if hasattr(self, "log_group"):
+            self.log_group.setVisible(bool(visible))
+        if hasattr(self, "import_log_toggle"):
+            self.import_log_toggle.setText("Hide Log" if visible else "Show Log")
+
+    def set_progress(self, value: int, title: str, detail: str, color: str = "#58a6ff") -> None:
+        value = max(0, min(100, int(value)))
+        self.progress_bar.setValue(value)
+        self.progress_label.setText(
+            f'<span style="color:{color};">{html.escape(title)}</span> - {value}%'
+            f'<br><span style="color:#8f98a3;">{html.escape(detail)}</span>'
+        )
+
+    def update_progress_from_log(self, message: str) -> None:
+        checks = [
+            ("Checking Blender 4.5 LTS downloads", 4, "Checking Blender", "#58a6ff"),
+            ("Downloading ", 8, "Downloading Blender", "#58a6ff"),
+            ("Extracting Blender", 15, "Extracting Blender", "#d29922"),
+            ("Verifying bundled Blender add-ons", 25, "Setting Up Add-ons", "#58a6ff"),
+            ("Blender add-on setup verified", 35, "Add-ons Ready", "#2ea043"),
+            ("Copied/updated", 42, "Copying Assets", "#58a6ff"),
+            ("Starting Blender import", 48, "Starting Blender", "#58a6ff"),
+            ("Starting MMD Character Importer Blender step 1", 54, "Preparing Scene", "#58a6ff"),
+            ("Importing PMX with CATS", 62, "Importing PMX", "#d29922"),
+            ("Imported PMX with CATS", 82, "PMX Imported", "#2ea043"),
+            ("Saving blend file", 90, "Saving Blend", "#d29922"),
+            ("Wrote import report", 96, "Writing Report", "#2ea043"),
+            ("Blender import finished", 100, "Import Complete", "#2ea043"),
+        ]
+        for needle, value, title, color in checks:
+            if needle in message:
+                self.set_progress(value, title, message, color)
+                return
+
+    def set_fix_progress(self, value: int, title: str, detail: str, color: str = "#58a6ff") -> None:
+        value = max(0, min(100, int(value)))
+        self.fix_progress_bar.setValue(value)
+        self.fix_progress_label.setText(
+            f'<span style="color:{color};">{html.escape(title)}</span> - {value}%'
+            f'<br><span style="color:#8f98a3;">{html.escape(detail)}</span>'
+        )
+
+    def append_fix_log(self, message: str) -> None:
+        self.append_translated_log(self.fix_log, message, self.update_fix_progress_from_log)
+
+    def set_fix_outputs_visible(self, visible: bool) -> None:
+        if hasattr(self, "fix_output_group"):
+            self.fix_output_group.setVisible(bool(visible))
+        if hasattr(self, "fix_outputs_toggle"):
+            self.fix_outputs_toggle.setText("Hide Outputs" if visible else "Show Outputs")
+
+    def set_fix_log_visible(self, visible: bool) -> None:
+        if hasattr(self, "fix_log_group"):
+            self.fix_log_group.setVisible(bool(visible))
+        if hasattr(self, "fix_log_toggle"):
+            self.fix_log_toggle.setText("Hide Log" if visible else "Show Log")
+
+    def update_fix_progress_from_log(self, message: str) -> None:
+        checks = [
+            ("Starting Blender fix step", 8, "Starting Blender", "#58a6ff"),
+            ("Starting MMD Character Importer Blender step 2", 12, "Preparing Fix", "#58a6ff"),
+            ("Opening imported blend", 18, "Opening Blend", "#58a6ff"),
+            ("CATS fix and conversion operators", 24, "CATS Ready", "#2ea043"),
+            ("Making all imported objects", 30, "Making Single User", "#58a6ff"),
+            ("Single-user conversion completed", 38, "Single User Complete", "#2ea043"),
+            ("Clearing custom split normals", 42, "Clearing Normals", "#58a6ff"),
+            ("Cleared custom normals", 48, "Normals Complete", "#2ea043"),
+            ("Running CATS Fix Model pass 1/2", 54, "Fix Model Pass 1", "#d29922"),
+            ("Running CATS Fix Model pass 2/2", 66, "Fix Model Pass 2", "#d29922"),
+            ("CATS Fix Model passes completed", 76, "Fix Model Complete", "#2ea043"),
+            ("Translating bones", 80, "Translating Names", "#58a6ff"),
+            ("Converting CATS standard bones", 86, "Converting Skeleton", "#d29922"),
+            ("ValveBiped bone conversion completed", 92, "Skeleton Converted", "#2ea043"),
+            ("Saving fixed blend file", 96, "Saving Fixed Blend", "#d29922"),
+            ("Wrote fix report", 98, "Writing Report", "#2ea043"),
+            ("Blender fix step finished", 100, "Fix Complete", "#2ea043"),
+        ]
+        for needle, value, title, color in checks:
+            if needle in message:
+                self.set_fix_progress(value, title, message, color)
+                return
+
+    def set_spine_progress(self, value: int, title: str, detail: str, color: str = "#58a6ff") -> None:
+        value = max(0, min(100, int(value)))
+        self.spine_progress_bar.setValue(value)
+        self.spine_progress_label.setText(
+            f'<span style="color:{color};">{html.escape(title)}</span> - {value}%'
+            f'<br><span style="color:#8f98a3;">{html.escape(detail)}</span>'
+        )
+
+    def append_spine_log(self, message: str) -> None:
+        self.append_translated_log(self.spine_log, message, self.update_spine_progress_from_log)
+
+    def set_spine_outputs_visible(self, visible: bool) -> None:
+        if hasattr(self, "spine_output_group"):
+            self.spine_output_group.setVisible(bool(visible))
+        if hasattr(self, "spine_outputs_toggle"):
+            self.spine_outputs_toggle.setText("Hide Outputs" if visible else "Show Outputs")
+
+    def set_spine_log_visible(self, visible: bool) -> None:
+        if hasattr(self, "spine_log_group"):
+            self.spine_log_group.setVisible(bool(visible))
+        if hasattr(self, "spine_log_toggle"):
+            self.spine_log_toggle.setText("Hide Log" if visible else "Show Log")
+
+    def update_spine_progress_from_log(self, message: str) -> None:
+        checks = [
+            ("Starting Blender spine analysis", 10, "Starting Analysis", "#58a6ff"),
+            ("Starting Blender spine fix step", 10, "Starting Fix", "#58a6ff"),
+            ("Starting MMD Character Importer Blender step 3", 18, "Opening Blender", "#58a6ff"),
+            ("Opening fixed blend", 24, "Opening Blend", "#58a6ff"),
+            ("Wrote spine analysis", 55, "Analysis Written", "#2ea043"),
+            ("Wrote proposed spine plan", 65, "Plan Written", "#2ea043"),
+            ("Renaming mapped spine bones", 42, "Renaming Bones", "#d29922"),
+            ("Added missing spine bone", 52, "Adding Bones", "#d29922"),
+            ("Applied canonical spine", 66, "Reparenting Spine", "#58a6ff"),
+            ("Rebuilt armature data", 78, "Reordering Bones", "#d29922"),
+            ("Saving spine-fixed blend file", 90, "Saving Blend", "#d29922"),
+            ("Wrote spine fix report", 96, "Writing Report", "#2ea043"),
+            ("Blender spine analysis finished", 100, "Analysis Complete", "#2ea043"),
+            ("Blender spine fix step finished", 100, "Fix Complete", "#2ea043"),
+        ]
+        for needle, value, title, color in checks:
+            if needle in message:
+                self.set_spine_progress(value, title, message, color)
+                return
+
+    def set_sort_progress(self, value: int, title: str, detail: str, color: str = "#58a6ff") -> None:
+        value = max(0, min(100, int(value)))
+        self.sort_progress_bar.setValue(value)
+        self.sort_progress_label.setText(
+            f'<span style="color:{color};">{html.escape(title)}</span> - {value}%'
+            f'<br><span style="color:#8f98a3;">{html.escape(detail)}</span>'
+        )
+
+    def append_sort_log(self, message: str) -> None:
+        self.append_translated_log(self.sort_log, message, self.update_sort_progress_from_log)
+
+    def set_sort_outputs_visible(self, visible: bool) -> None:
+        if hasattr(self, "sort_output_group"):
+            self.sort_output_group.setVisible(bool(visible))
+        if hasattr(self, "sort_outputs_toggle"):
+            self.sort_outputs_toggle.setText("Hide Outputs" if visible else "Show Outputs")
+
+    def set_sort_log_visible(self, visible: bool) -> None:
+        if hasattr(self, "sort_log_group"):
+            self.sort_log_group.setVisible(bool(visible))
+        if hasattr(self, "sort_log_toggle"):
+            self.sort_log_toggle.setText("Hide Log" if visible else "Show Log")
+
+    def update_sort_progress_from_log(self, message: str) -> None:
+        checks = [
+            ("Starting Blender sort bones analysis", 10, "Starting Analysis", "#58a6ff"),
+            ("Starting Blender sort bones step", 10, "Starting Merge", "#58a6ff"),
+            ("Opening Blender for manual bone merge", 35, "Waiting For Blender", "#d29922"),
+            ("Waiting for Blender to close before re-analyzing", 40, "Waiting For Blender", "#d29922"),
+            ("Blender closed; re-running Step 4 Analyze Bones", 55, "Re-Analyzing Bones", "#58a6ff"),
+            ("Starting MMD Character Importer Blender step 4", 18, "Opening Blender", "#58a6ff"),
+            ("Opening spine-fixed blend", 24, "Opening Blend", "#58a6ff"),
+            ("Wrote bone merge analysis", 55, "Analysis Written", "#2ea043"),
+            ("Wrote bone merge plan", 65, "Plan Written", "#2ea043"),
+            ("Applying ", 34, "Applying Merge Plan", "#d29922"),
+            ("Merge ", 52, "Merging Bones", "#d29922"),
+            ("Saving bone-sorted blend file", 90, "Saving Blend", "#d29922"),
+            ("Wrote bone sorting report", 96, "Writing Report", "#2ea043"),
+            ("Blender sort bones analysis finished", 100, "Analysis Complete", "#2ea043"),
+            ("Blender sort bones step finished", 100, "Sort Complete", "#2ea043"),
+        ]
+        for needle, value, title, color in checks:
+            if needle in message:
+                self.set_sort_progress(value, title, message, color)
+                return
+
+    def set_material_progress(self, value: int, title: str, detail: str, color: str = "#58a6ff") -> None:
+        value = max(0, min(100, int(value)))
+        self.material_progress_bar.setValue(value)
+        self.material_progress_label.setText(
+            f'<span style="color:{color};">{html.escape(title)}</span> - {value}%'
+            f'<br><span style="color:#8f98a3;">{html.escape(detail)}</span>'
+        )
+
+    def set_material_outputs_visible(self, visible: bool) -> None:
+        if not hasattr(self, "material_output_group"):
+            return
+        self.material_output_group.setVisible(bool(visible))
+        if hasattr(self, "material_outputs_toggle"):
+            self.material_outputs_toggle.setText("Hide Outputs" if visible else "Show Outputs")
+
+    def set_material_log_visible(self, visible: bool) -> None:
+        if not hasattr(self, "material_log_group"):
+            return
+        self.material_log_group.setVisible(bool(visible))
+        if hasattr(self, "material_log_toggle"):
+            self.material_log_toggle.setText("Hide Log" if visible else "Show Log")
+
+    def append_material_log(self, message: str) -> None:
+        self.append_translated_log(self.material_log, message, self.update_material_progress_from_log)
+
+    def update_material_progress_from_log(self, message: str) -> None:
+        checks = [
+            ("Starting Blender material scan", 10, "Starting Scan", "#58a6ff"),
+            ("Starting Blender material initial apply", 10, "Starting Cleanup", "#58a6ff"),
+            ("Starting Blender material merge", 10, "Starting Merge", "#58a6ff"),
+            ("Starting MMD Character Importer Blender step 5", 18, "Opening Blender", "#58a6ff"),
+            ("Opening material input blend", 24, "Opening Blend", "#58a6ff"),
+            ("Wrote material scan", 70, "Scan Written", "#2ea043"),
+            ("Wrote material plan", 78, "Plan Written", "#2ea043"),
+            ("Creating source material vertex groups", 32, "Tracking Materials", "#58a6ff"),
+            ("Removing geometry assigned", 44, "Removing Hidden Geometry", "#d29922"),
+            ("Combining materials", 58, "Combining Materials", "#d29922"),
+            ("Wrote material merge plan", 72, "Merge Plan Written", "#2ea043"),
+            ("Saving material-sorted blend file", 88, "Saving Intermediate", "#d29922"),
+            ("Wrote material initial report", 96, "Writing Report", "#2ea043"),
+            ("Consolidating material merge groups", 42, "Merging Groups", "#d29922"),
+            ("Creating final material vertex groups", 65, "Tracking Final Materials", "#58a6ff"),
+            ("Saving material-merged blend file", 88, "Saving Final", "#d29922"),
+            ("Wrote material merge report", 96, "Writing Report", "#2ea043"),
+            ("Blender material scan finished", 100, "Scan Complete", "#2ea043"),
+            ("Blender material initial apply finished", 100, "Cleanup Complete", "#2ea043"),
+            ("Blender material merge finished", 100, "Merge Complete", "#2ea043"),
+        ]
+        for needle, value, title, color in checks:
+            if needle in message:
+                self.set_material_progress(value, title, message, color)
+                return
+
+    def on_main_source_changed(self, _value: str) -> None:
+        self.current_main_analysis = None
+        self.current_main_workspace = None
+        self.main_workspace_edit.clear()
+        self.main_stats_label.setText("Refresh PMX files, then run preflight.")
+        self.main_warning_label.clear()
+        self.main_open_output_button.setEnabled(False)
+        if self.main_model_preview is not None:
+            self.main_model_preview.clear_model()
+        self.populate_main_pmx_files()
+        self.save_settings()
+
+    def populate_main_pmx_files(self) -> None:
+        source = Path(self.main_source_row.value()) if self.main_source_row.value() else None
+        previous = str(self.settings_store.value("main_pmx_path", "", str) or "")
+        self.main_pmx_paths = []
+        self.main_pmx_combo.blockSignals(True)
+        self.main_pmx_combo.clear()
+        if source and source.exists():
+            self.main_pmx_paths = core.find_pmx_files(source)
+            for path in self.main_pmx_paths:
+                try:
+                    label = str(path.relative_to(source))
+                except ValueError:
+                    label = path.name
+                self.main_pmx_combo.addItem(label, str(path))
+            if previous:
+                index = self.main_pmx_combo.findData(previous)
+                if index >= 0:
+                    self.main_pmx_combo.setCurrentIndex(index)
+        self.main_pmx_combo.blockSignals(False)
+        if self.main_pmx_paths:
+            self.analyze_main_pmx(silent=True)
+        else:
+            self.main_stats_label.setText("No .pmx files found in the selected folder.")
+            self.main_warning_label.clear()
+
+    def on_main_pmx_changed(self, _index: int) -> None:
+        self.current_main_analysis = None
+        self.current_main_workspace = None
+        self.main_workspace_edit.clear()
+        self.main_warning_label.clear()
+        if self.main_model_preview is not None:
+            self.main_model_preview.clear_model()
+        if self.current_main_pmx_path():
+            self.analyze_main_pmx(silent=True)
+        self.save_settings()
+
+    def current_main_pmx_path(self) -> Path | None:
+        raw = self.main_pmx_combo.currentData()
+        return Path(str(raw)) if raw else None
+
+    def analyze_main_pmx(self, silent: bool = False) -> core.PmxAnalysis | None:
+        pmx = self.current_main_pmx_path()
+        source_raw = self.main_source_row.value()
+        if not pmx or not source_raw:
+            if not silent:
+                self.show_error("Preflight failed", "Select a model folder and PMX file first.")
+            return None
+        try:
+            source = Path(source_raw)
+            analysis = core.analyze_pmx(pmx, source)
+            workspace = core.build_workspace(pmx, source, analysis)
+            self.current_main_analysis = analysis
+            self.current_main_workspace = workspace
+            self.main_workspace_edit.setText(str(workspace.root))
+            self.render_main_analysis(analysis)
+            self.load_main_preview(silent=True)
+            if not self.main_model_name_edit.text().strip():
+                candidate = core.slugify(analysis.model_name or pmx.stem)
+                candidate = re.sub(r"[^A-Za-z_]+", "_", candidate).strip("_")
+                if candidate:
+                    self.main_model_name_edit.setPlaceholderText(f"Optional, default: {candidate}")
+                    self.update_main_display_placeholders(default_model=candidate)
+            if not silent:
+                self.append_main_log(f"Analyzed PMX: {pmx}")
+            self.save_settings()
+            return analysis
+        except Exception as exc:
+            self.current_main_analysis = None
+            self.current_main_workspace = None
+            self.main_workspace_edit.clear()
+            self.main_stats_label.setText("Could not analyze the selected PMX.")
+            self.main_warning_label.setText(f'<span style="color:#f85149;">{html.escape(str(exc))}</span>')
+            if self.main_model_preview is not None:
+                self.main_model_preview.clear_model()
+            if not silent:
+                self.show_error("Preflight failed", str(exc))
+            return None
+
+    def render_main_analysis(self, analysis: core.PmxAnalysis) -> None:
+        self.main_stats_label.setText(
+            f"Model: {analysis.model_name or Path(analysis.pmx_path).stem}"
+            f" | Vertices: {analysis.vertex_count:,}"
+            f" | Morphs: {analysis.morph_count:,}"
+            f" | PMX textures: {analysis.texture_ref_count:,}"
+            f" | Resolved textures: {analysis.resolved_texture_count:,}/{analysis.texture_ref_count:,}"
+            f" | Bones: {analysis.bone_count:,}"
+            f" | Materials: {analysis.material_count:,}"
+        )
+        if analysis.warnings:
+            escaped = "<br>".join(html.escape(f"- {warning}") for warning in analysis.warnings)
+            self.main_warning_label.setText(f'<span style="color:#d29922;">Warnings:</span><br>{escaped}')
+        else:
+            self.main_warning_label.setText('<span style="color:#2ea043;">No preflight warnings.</span>')
+
+    def load_main_preview(self, silent: bool = False) -> None:
+        if self.main_model_preview is None:
+            return
+        pmx = self.current_main_pmx_path()
+        if not pmx:
+            self.main_model_preview.clear_model()
+            return
+        try:
+            model = self.main_model_preview.load_model(pmx)
+            self.main_preview_status_label.setText(
+                f"OpenGL preview loaded | {model.vertex_count:,} verts | {model.triangle_count:,} tris | "
+                f"{len(model.bones):,} bones | {model.morph_count:,} morphs | {len(model.materials):,} materials"
+            )
+            if not silent:
+                self.append_main_log(f"Loaded PMX preview: {pmx}")
+        except Exception as exc:
+            self.main_model_preview.clear_model()
+            self.main_preview_status_label.setText(f"Preview failed: {exc}")
+            if not silent:
+                self.show_error("Preview failed", str(exc))
+
+    def find_gmod_candidate(self) -> str:
+        candidates: list[Path] = []
+        for key in ("STUDIOMDL", "GMOD_PATH"):
+            raw = os.environ.get(key, "")
+            if raw:
+                path = Path(raw)
+                candidates.append(path)
+                if path.is_dir():
+                    candidates.append(path / "bin" / "studiomdl.exe")
+        for root in (
+            Path("H:/SteamLibrary/steamapps/common/GarrysMod_RTX_c"),
+            Path("H:/SteamLibrary/steamapps/common/GarrysMod"),
+            Path("C:/Program Files (x86)/Steam/steamapps/common/GarrysMod"),
+        ):
+            candidates.append(root / "bin" / "studiomdl.exe")
+        vdf = Path("C:/Program Files (x86)/Steam/steamapps/libraryfolders.vdf")
+        if vdf.exists():
+            try:
+                for match in re.finditer(r'"path"\s+"([^"]+)"', vdf.read_text(encoding="utf-8", errors="ignore")):
+                    lib = Path(match.group(1).replace("\\\\", "\\"))
+                    for name in ("GarrysMod_RTX_c", "GarrysMod"):
+                        candidates.append(lib / "steamapps" / "common" / name / "bin" / "studiomdl.exe")
+            except Exception:
+                pass
+        seen: set[Path] = set()
+        for candidate in candidates:
+            try:
+                candidate = candidate.resolve()
+            except Exception:
+                candidate = candidate.absolute()
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if candidate.name.lower() == "studiomdl.exe" and candidate.exists():
+                return str(candidate)
+            if candidate.is_dir() and (candidate / "bin" / "studiomdl.exe").exists():
+                return str(candidate)
+        return ""
+
+    def detect_gmod_for_main(self) -> None:
+        found = self.find_gmod_candidate()
+        if found:
+            self.main_gmod_row.set_value(found)
+            self.append_main_log(f"Detected GMod StudioMDL/install: {found}")
+            self.save_settings()
+            return
+        self.show_error("Detect GMod", "Could not find Garry's Mod StudioMDL. Browse to garrysmod/bin/studiomdl.exe or set STUDIOMDL.")
+
+    def update_main_display_placeholders(self, default_model: str = "") -> None:
+        if hasattr(self, "main_category_display_edit"):
+            category = self.main_category_edit.text().strip() if hasattr(self, "main_category_edit") else "SheepyLord"
+            known_display = self.known_category_display_for_internal(category)
+            self.main_category_display_edit.setPlaceholderText(
+                f"{self._t('main.auto_prefix', 'Auto')}: {known_display or self.qc_display_from_internal(category, 'Sheepy Lord')}"
+            )
+        if hasattr(self, "main_model_display_edit"):
+            model = self.main_model_name_edit.text().strip() if hasattr(self, "main_model_name_edit") else ""
+            if not model:
+                model = default_model or self.main_effective_model_name()
+            self.main_model_display_edit.setPlaceholderText(
+                f"{self._t('main.auto_prefix', 'Auto')}: {self.qc_display_from_internal(model, 'Mmd Model')}"
+            )
+
+    def bodygroup_vertex_limit(self) -> int:
+        enabled = False
+        if hasattr(self, "bodygroup_rtx_limit_check"):
+            enabled = enabled or bool(self.bodygroup_rtx_limit_check.isChecked())
+        if hasattr(self, "main_rtx_bodygroup_limit_check"):
+            enabled = enabled or bool(self.main_rtx_bodygroup_limit_check.isChecked())
+        return int(getattr(core, "RTX_BODYGROUP_VERTEX_LIMIT", 32767) if enabled else getattr(core, "DEFAULT_BODYGROUP_VERTEX_LIMIT", 65535))
+
+    def clear_custom_normals_enabled(self) -> bool:
+        widget = getattr(self, "fix_clear_custom_normals_check", None)
+        if isinstance(widget, QtWidgets.QCheckBox):
+            return bool(widget.isChecked())
+        widget = getattr(self, "main_clear_custom_normals_check", None)
+        if isinstance(widget, QtWidgets.QCheckBox):
+            return bool(widget.isChecked())
+        return True
+
+    def on_clear_custom_normals_changed(self, checked: bool) -> None:
+        for attr in ("main_clear_custom_normals_check", "fix_clear_custom_normals_check"):
+            widget = getattr(self, attr, None)
+            if isinstance(widget, QtWidgets.QCheckBox) and widget.isChecked() != bool(checked):
+                blocker = QtCore.QSignalBlocker(widget)
+                try:
+                    widget.setChecked(bool(checked))
+                finally:
+                    del blocker
+        self.save_settings()
+
+    def set_bodygroup_scale_preset(self, preset: str) -> None:
+        preset = str(preset or "factor").lower()
+        if preset not in {"factor", "tall", "normal", "short"}:
+            preset = "factor"
+        self.bodygroup_scale_preset = preset
+        buttons = getattr(self, "bodygroup_scale_preset_buttons", {})
+        button_items = buttons.items() if isinstance(buttons, dict) else []
+        for name, button in button_items:
+            if isinstance(button, QtWidgets.QPushButton):
+                blocker = QtCore.QSignalBlocker(button)
+                try:
+                    button.setChecked(name == preset)
+                finally:
+                    del blocker
+        if hasattr(self, "bodygroup_scale_preset_label"):
+            if preset == "factor":
+                text = "Default factor mode: scales by 40.457 only while model height is below 10 Blender units."
+            else:
+                reference = getattr(core, "BODYGROUP_SCALE_PRESETS", {}).get(preset) if hasattr(core, "BODYGROUP_SCALE_PRESETS") else None
+                target_top = getattr(core, "BODYGROUP_SCALE_PRESET_TOPS", {}).get(preset) if hasattr(core, "BODYGROUP_SCALE_PRESET_TOPS") else None
+                text = f"Preset mode: match current face/head top to {preset.title()} size"
+                if target_top:
+                    text += f" (target top {target_top:.3f})"
+                if reference and Path(reference).exists():
+                    text += f"; source Face.smd: {reference}"
+            self.bodygroup_scale_preset_label.setText(text)
+        self.save_settings()
+
+    def on_bodygroup_rtx_limit_changed(self, checked: bool) -> None:
+        for attr in ("main_rtx_bodygroup_limit_check", "bodygroup_rtx_limit_check"):
+            widget = getattr(self, attr, None)
+            if isinstance(widget, QtWidgets.QCheckBox) and widget.isChecked() != bool(checked):
+                blocker = QtCore.QSignalBlocker(widget)
+                try:
+                    widget.setChecked(bool(checked))
+                finally:
+                    del blocker
+        self.save_settings()
+        self.update_bodygroup_limit_hint()
+
+    def update_bodygroup_limit_hint(self) -> None:
+        limit = self.bodygroup_vertex_limit()
+        if hasattr(self, "bodygroup_always_auto_split_check"):
+            self.bodygroup_always_auto_split_check.setToolTip(
+                f"Off: show material-split bodygroups and only run advanced splitting when a separated mesh exceeds {limit:,} vertices."
+            )
+        if hasattr(self, "bodygroup_rtx_limit_check"):
+            self.bodygroup_rtx_limit_check.setToolTip(
+                f"When enabled, Step 6 validates and auto-splits bodygroups to {getattr(core, 'RTX_BODYGROUP_VERTEX_LIMIT', 32767):,} vertices for RTX Remix GMod builds."
+            )
+
+    def validate_main_import_inputs(self) -> list[str]:
+        errors: list[str] = []
+        if not self.current_main_pmx_path():
+            errors.append("Select a PMX model.")
+        if not self.main_source_row.value():
+            errors.append("Select the MMD model folder.")
+        gmod = self.main_gmod_row.value().strip()
+        if not gmod:
+            errors.append("Detect or browse to the GMod install/studiomdl.exe.")
+        else:
+            path = Path(gmod)
+            if path.name.lower() == "studiomdl.exe":
+                if not path.exists():
+                    errors.append(f"studiomdl.exe was not found: {path}")
+            elif not (path / "bin" / "studiomdl.exe").exists():
+                errors.append(f"GMod install does not contain bin/studiomdl.exe: {path}")
+        category = self.main_effective_category()
+        model = self.main_effective_model_name()
+        if category and not INTERNAL_IDENTIFIER_REQUIRED_RE.fullmatch(category):
+            errors.append("Category internal name must contain only English letters and underscores.")
+        if model and not INTERNAL_IDENTIFIER_REQUIRED_RE.fullmatch(model):
+            errors.append("Character internal name must contain only English letters and underscores.")
+        category_display = (
+            self.main_category_display_edit.text().strip()
+            if hasattr(self, "main_category_display_edit") and self.main_category_display_edit.text().strip()
+            else self.main_effective_category_display_name()
+        )
+        model_display = (
+            self.main_model_display_edit.text().strip()
+            if hasattr(self, "main_model_display_edit") and self.main_model_display_edit.text().strip()
+            else self.main_effective_model_display_name()
+        )
+        if not is_valid_category_display_name_text(category_display, allow_blank=False):
+            errors.append("Category display name must contain only printable ASCII characters.")
+        if not is_valid_display_name_text(model_display, allow_blank=False):
+            errors.append("Character display name must contain only English letters, spaces, and underscores.")
+        return errors
+
+    def main_effective_category(self) -> str:
+        return self.main_category_edit.text().strip() or "SheepyLord"
+
+    def main_effective_model_name(self) -> str:
+        explicit = self.main_model_name_edit.text().strip()
+        if explicit:
+            return explicit
+        analysis = self.current_main_analysis
+        pmx = self.current_main_pmx_path()
+        raw = analysis.model_name if analysis and analysis.model_name else (pmx.stem if pmx else "mmd_model")
+        safe = re.sub(r"[^A-Za-z_]+", "_", core.slugify(raw)).strip("_")
+        return safe or "mmd_model"
+
+    def main_effective_category_display_name(self) -> str:
+        explicit = self.main_category_display_edit.text().strip() if hasattr(self, "main_category_display_edit") else ""
+        category = self.main_effective_category()
+        return sanitize_category_display_name_text(
+            explicit or self.known_category_display_for_internal(category) or self.qc_display_from_internal(category, "Sheepy Lord")
+        )
+
+    def main_effective_model_display_name(self) -> str:
+        explicit = self.main_model_display_edit.text().strip() if hasattr(self, "main_model_display_edit") else ""
+        return sanitize_display_name_text(explicit or self.qc_display_from_internal(self.main_effective_model_name(), "Mmd Model"))
+
+    def start_full_import(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        analysis = self.analyze_main_pmx(silent=False)
+        if not analysis:
+            return
+        errors = self.validate_main_import_inputs()
+        if errors:
+            self.show_error("Import to GMod", "Blocking errors:\n" + "\n".join(f"- {error}" for error in errors))
+            return
+        if (analysis.warnings or self.analysis_has_content_warning(analysis)) and not self.confirm_main_warnings(analysis):
+            return
+        previous_output = str(self.settings_store.value("qc_gma_output_dir", "", str) or "")
+        start_dir = previous_output if previous_output and Path(previous_output).exists() else str(Path.home() / "Desktop")
+        selected_output = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Select folder for the .gma and composed addon folder",
+            start_dir,
+        )
+        if not selected_output:
+            return
+        self.settings_store.setValue("qc_gma_output_dir", selected_output)
+        self.save_settings()
+        self.main_log.clear()
+        self.main_files_table.setRowCount(0)
+        self.main_warnings_label.clear()
+        self.set_main_progress(0, "Queued", "Preparing full import", "#58a6ff")
+        self.main_import_button.setEnabled(False)
+        self.main_preflight_button.setEnabled(False)
+        self.main_detect_gmod_button.setEnabled(False)
+        self.main_cancel_button.setEnabled(True)
+        self.main_open_output_button.setEnabled(False)
+        self.worker = FullImportWorker(
+            str(self.current_main_pmx_path()),
+            self.main_source_row.value(),
+            self.main_gmod_row.value(),
+            self.main_effective_category(),
+            self.main_effective_category_display_name(),
+            self.main_effective_model_name(),
+            self.main_effective_model_display_name(),
+            selected_output,
+            self.bodygroup_vertex_limit(),
+            self.clear_custom_normals_enabled(),
+        )
+        self.worker.log.connect(self.append_main_log)
+        self.worker.progress.connect(self.set_main_progress)
+        self.worker.done.connect(self.full_import_done)
+        self.worker.failed.connect(self.full_import_failed)
+        self.worker.start()
+
+    def confirm_main_warnings(self, analysis: core.PmxAnalysis) -> bool:
+        return self.confirm_preflight_warnings(
+            analysis,
+            "Preflight warnings",
+            "The PMX has warnings. Proceed with the full import?",
+            full_import=True,
+        )
+
+    def analysis_has_content_warning(self, analysis: core.PmxAnalysis | None) -> bool:
+        if analysis is None:
+            return False
+        scan = getattr(analysis, "content_warning_scan", None)
+        return bool(isinstance(scan, dict) and scan.get("triggered"))
+
+    def confirm_preflight_warnings(
+        self,
+        analysis: core.PmxAnalysis,
+        title: str,
+        generic_text: str,
+        full_import: bool = False,
+    ) -> bool:
+        dialog = QtWidgets.QMessageBox(self)
+        dialog.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+        scan = getattr(analysis, "content_warning_scan", {}) if analysis else {}
+        content_triggered = isinstance(scan, dict) and bool(scan.get("triggered"))
+        dialog.setWindowTitle("Potential NSFW model content" if content_triggered else title)
+        if content_triggered:
+            dialog.setText(
+                "The program detected NSFW elements in the model you provided. "
+                "It is not encouraged to do so, and the automatic porting function is not optimized for that "
+                "and might return unexpected results."
+            )
+            match_count = int(scan.get("match_count") or 0)
+            morph_count = int(scan.get("matched_morph_count") or 0)
+            keywords = scan.get("matched_keywords") if isinstance(scan.get("matched_keywords"), list) else []
+            keyword_preview = ", ".join(str(keyword) for keyword in keywords[:12])
+            lines = [
+                f"Detected {match_count:,} keyword match(es) across {morph_count:,} shapekey/morph name(s).",
+                "If you intend to continue, the manual step-by-step workflow is recommended over one-click auto porting."
+                if full_import
+                else "If you intend to continue, review each later step carefully and prefer manual corrections when needed.",
+            ]
+            if keyword_preview:
+                suffix = "" if len(keywords) <= 12 else f" and {len(keywords) - 12} more"
+                lines.append(f"Matched keyword hints: {keyword_preview}{suffix}")
+            other_warnings = [
+                warning
+                for warning in analysis.warnings
+                if "Potential NSFW shapekey names detected" not in warning
+            ]
+            if other_warnings:
+                lines.append("")
+                lines.append("Other preflight warnings:")
+                lines.extend(f"- {warning}" for warning in other_warnings)
+            dialog.setInformativeText("\n".join(lines))
+        else:
+            dialog.setText(generic_text)
+            dialog.setInformativeText("\n".join(analysis.warnings))
+        proceed = dialog.addButton("Proceed Anyway" if content_triggered else "Proceed", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        dialog.addButton("Cancel", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+        dialog.setDefaultButton(proceed)
+        dialog.exec()
+        return dialog.clickedButton() == proceed
+
+    def cancel_full_import(self) -> None:
+        if self.worker and self.worker.isRunning() and hasattr(self.worker, "cancel"):
+            self.worker.cancel()  # type: ignore[attr-defined]
+            self.append_main_log("Cancel requested.")
+
+    def full_import_done(self, result: dict) -> None:
+        self.main_import_button.setEnabled(True)
+        self.main_preflight_button.setEnabled(True)
+        self.main_detect_gmod_button.setEnabled(True)
+        self.main_cancel_button.setEnabled(False)
+        self.main_open_output_button.setEnabled(bool(result.get("distribution_output_dir")))
+        self.main_output_files = result.get("qc_files") if isinstance(result.get("qc_files"), dict) else {}
+        self.populate_main_files_table(self.main_output_files.get("files", []) if self.main_output_files else [])
+        warnings = result.get("optional_warnings") if isinstance(result.get("optional_warnings"), list) else []
+        if warnings:
+            escaped = "<br>".join(html.escape(f"- {warning}") for warning in warnings)
+            self.main_warnings_label.setText(f'<span style="color:#d29922;">Optional warnings:</span><br>{escaped}')
+        else:
+            self.main_warnings_label.setText('<span style="color:#2ea043;">All attempted steps completed without optional warnings.</span>')
+        self.sync_main_results_to_step_tabs(result)
+        self.refresh_workflow_statuses()
+        self.refresh_workspace_cache_size()
+        distribution = str(result.get("distribution_output_dir") or "")
+        if distribution and Path(distribution).exists():
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(distribution))
+        QtWidgets.QMessageBox.information(self, "Import complete", "The model was imported, compiled, packaged, and copied to GMod addons.")
+
+    def full_import_failed(self, message: str) -> None:
+        self.main_import_button.setEnabled(True)
+        self.main_preflight_button.setEnabled(True)
+        self.main_detect_gmod_button.setEnabled(True)
+        self.main_cancel_button.setEnabled(False)
+        self.set_main_progress(self.main_progress_bar.value(), "Import Failed", "See the log for details.", "#f85149")
+        failed_step, partial_steps = self.full_import_failure_context(message)
+        if partial_steps:
+            self.sync_main_results_to_step_tabs({"steps": partial_steps})
+        if failed_step:
+            self.prefill_failed_auto_step(failed_step, partial_steps)
+            self.set_step_failed(failed_step, f"Auto import failed at Step {failed_step}")
+        self.set_advanced_steps_visible(True)
+        if failed_step:
+            self.switch_to_step(failed_step)
+        self.refresh_workspace_cache_size()
+        self.show_error("Import to GMod failed", message)
+
+    def full_import_failure_context(self, message: str) -> tuple[int, dict[object, object]]:
+        failed_step = 0
+        partial_steps: dict[object, object] = {}
+        worker = self.worker
+        raw_step = getattr(worker, "current_step", 0) if worker is not None else 0
+        try:
+            failed_step = int(raw_step or 0)
+        except Exception:
+            failed_step = 0
+        raw_steps = getattr(worker, "step_results", {}) if worker is not None else {}
+        if isinstance(raw_steps, dict):
+            partial_steps = dict(raw_steps)
+        if not failed_step:
+            match = re.search(r"Step\s+(\d+)", message)
+            if match:
+                try:
+                    failed_step = int(match.group(1))
+                except Exception:
+                    failed_step = 0
+        return failed_step, partial_steps
+
+    def full_import_step_input_from_results(self, step: int, steps: dict[object, object]) -> str:
+        def step_data(number: int) -> dict[str, object]:
+            value = steps.get(number) or steps.get(str(number))
+            return value if isinstance(value, dict) else {}
+
+        if step == 1:
+            return self.main_source_row.value() if hasattr(self, "main_source_row") else ""
+        previous_key_by_step = {
+            2: (1, "blend"),
+            3: (2, "blend"),
+            4: (3, "blend"),
+            5: (4, "blend"),
+            6: (5, "blend"),
+            7: (6, "blend"),
+            8: (7, "blend"),
+            9: (8, "blend"),
+            10: (9, "final_dir"),
+            11: (9, "final_dir"),
+            12: (5, "materials_json"),
+            13: (1, "workspace"),
+            14: (9, "final_dir"),
+            15: (14, "dir"),
+        }
+        lookup = previous_key_by_step.get(int(step))
+        if not lookup:
+            return ""
+        source_step, key = lookup
+        return str(step_data(source_step).get(key) or "")
+
+    def refresh_step_preview_from_input(self, step: int) -> None:
+        row_attr_by_step = {
+            2: "fix_input_row",
+            3: "spine_input_row",
+            4: "sort_input_row",
+            5: "material_input_row",
+            6: "bodygroup_input_row",
+            7: "flex_input_row",
+            8: "collision_input_row",
+            9: "proportion_input_row",
+            10: "carms_input_row",
+            11: "vrd_input_row",
+            12: "texture_input_row",
+            13: "icon_input_row",
+            14: "qc_input_row",
+            15: "release_input_row",
+        }
+        updater_by_step = {
+            2: self.update_fix_output_preview,
+            3: self.update_spine_output_preview,
+            4: self.update_sort_output_preview,
+            5: self.update_material_output_preview,
+            6: self.update_bodygroup_output_preview,
+            7: self.update_flex_output_preview,
+            8: self.update_collision_output_preview,
+            9: self.update_proportion_output_preview,
+            10: self.update_carms_output_preview,
+            11: self.update_vrd_output_preview,
+            12: self.update_texture_output_preview,
+            13: self.update_icon_output_preview,
+            14: self.update_qc_output_preview,
+            15: self.update_release_output_preview,
+        }
+        row = getattr(self, row_attr_by_step.get(int(step), ""), None)
+        value = row.value().strip() if hasattr(row, "value") else ""
+        updater = updater_by_step.get(int(step))
+        if value and updater:
+            updater(Path(value))
+            self.fill_expected_step_paths(step, Path(value))
+
+    def fill_expected_step_paths(self, step: int, input_path: Path) -> None:
+        def set_text(attr: str, value: object) -> None:
+            widget = getattr(self, attr, None)
+            if isinstance(widget, (QtWidgets.QLabel, QtWidgets.QLineEdit)):
+                widget.setText(str(value or ""))
+
+        try:
+            if step == 2:
+                fix_dir, output_blend, report_json = core.fix_paths_for_import_blend(input_path)
+                set_text("fix_output_edit", fix_dir)
+                set_text("fixed_blend_label", output_blend)
+                set_text("fix_report_label", report_json)
+            elif step == 3:
+                spine_dir, output_blend, analysis_json, plan_json, report_json = core.spine_paths_for_fixed_blend(input_path)
+                set_text("spine_output_edit", spine_dir)
+                set_text("spine_fixed_blend_label", output_blend)
+                set_text("spine_analysis_label", analysis_json)
+                set_text("spine_plan_label", plan_json)
+                set_text("spine_report_label", report_json)
+            elif step == 4:
+                sort_dir, output_blend, analysis_json, plan_json, report_json = core.sort_bones_paths_for_spine_blend(input_path)
+                set_text("sort_output_edit", sort_dir)
+                set_text("sort_blend_label", output_blend)
+                set_text("sort_analysis_label", analysis_json)
+                set_text("sort_plan_label", plan_json)
+                set_text("sort_report_label", report_json)
+                set_text("sort_manual_blend_label", core.sort_bones_manual_merge_path_for_spine_blend(input_path))
+            elif step == 5:
+                material_dir, output_blend, final_blend, scan_json, plan_json, merge_plan_json, report_json, _merge_report = core.material_paths_for_sort_bones_blend(input_path)
+                set_text("material_output_edit", material_dir)
+                set_text("material_sorted_blend_label", output_blend)
+                set_text("material_final_blend_label", final_blend)
+                set_text("material_scan_label", scan_json)
+                set_text("material_plan_label", plan_json)
+                set_text("material_merge_plan_label", merge_plan_json)
+                set_text("material_report_label", report_json)
+            elif step == 6:
+                bodygroup_dir, output_blend, analysis_json, plan_json, report_json = core.bodygroup_paths_for_material_blend(input_path)
+                set_text("bodygroup_output_edit", bodygroup_dir)
+                set_text("bodygroup_blend_label", output_blend)
+                set_text("bodygroup_manual_blend_label", core.bodygroup_manual_edit_path_for_material_blend(input_path))
+                set_text("bodygroup_analysis_label", analysis_json)
+                set_text("bodygroup_plan_label", plan_json)
+                set_text("bodygroup_report_label", report_json)
+            elif step == 7:
+                flex_dir, output_blend, analysis_json, plan_json, report_json, flexes_json = core.flex_paths_for_bodygroup_blend(input_path)
+                set_text("flex_output_edit", flex_dir)
+                set_text("flex_blend_label", output_blend)
+                set_text("flex_analysis_label", analysis_json)
+                set_text("flex_plan_label", plan_json)
+                set_text("flex_report_label", report_json)
+                set_text("flex_json_label", flexes_json)
+            elif step == 8:
+                collision_dir, output_blend, analysis_json, plan_json, report_json, settings_json, physics_smd = core.collision_paths_for_flex_blend(input_path)
+                set_text("collision_output_edit", collision_dir)
+                set_text("collision_blend_label", output_blend)
+                set_text("collision_analysis_label", analysis_json)
+                set_text("collision_plan_label", plan_json)
+                set_text("collision_report_label", report_json)
+                set_text("collision_settings_label", settings_json)
+                set_text("collision_smd_label", physics_smd)
+            elif step == 9:
+                proportion_dir, _raw_dir, _workspace_dir, final_dir, pre_blend, processed_blend, report_json, files_json, _log_path = core.proportion_paths_for_collision_blend(input_path)
+                set_text("proportion_output_edit", proportion_dir)
+                set_text("proportion_final_label", final_dir)
+                set_text("proportion_pre_blend_label", pre_blend)
+                set_text("proportion_processed_blend_label", processed_blend)
+                set_text("proportion_report_label", report_json)
+            elif step == 10:
+                _final_dir, carms_dir, workspace_blend, report_json, files_json = core.carms_paths_for_proportion_export(input_path)
+                set_text("carms_output_edit", carms_dir)
+                set_text("carms_workspace_blend_label", workspace_blend)
+                set_text("carms_report_label", report_json)
+                set_text("carms_files_json_label", files_json)
+            elif step == 11:
+                _final_dir, vrd_dir, workspace_blend, analysis_json, plan_json, preview_json, report_json, vrd_path = core.vrd_paths_for_proportion_export(input_path)
+                set_text("vrd_output_edit", vrd_dir)
+                set_text("vrd_workspace_blend_label", workspace_blend)
+                set_text("vrd_analysis_label", analysis_json)
+                set_text("vrd_plan_label", plan_json)
+                set_text("vrd_preview_label", preview_json)
+                set_text("vrd_report_label", report_json)
+                set_text("vrd_file_label", vrd_path)
+            elif step == 12:
+                texture_dir, analysis_json, plan_json, report_json, manifest_json, _log_path = core.texture_paths_for_material_input(input_path)
+                set_text("texture_output_edit", texture_dir)
+                set_text("texture_analysis_label", analysis_json)
+                set_text("texture_plan_label", plan_json)
+                set_text("texture_report_label", report_json)
+                set_text("texture_manifest_label", manifest_json)
+            elif step == 13:
+                icon_dir, analysis_json, plan_json, report_json, files_json, render_report_json, _log_path = core.icon_paths_for_step1_input(input_path)
+                set_text("icon_output_edit", icon_dir)
+                set_text("icon_analysis_label", analysis_json)
+                set_text("icon_plan_label", plan_json)
+                set_text("icon_report_label", report_json)
+                set_text("icon_files_label", files_json)
+                set_text("icon_render_report_label", render_report_json)
+            elif step == 14:
+                _final_dir, qc_dir, analysis_json, plan_json, report_json, files_json, _log_path = core.qc_paths_for_step9_input(input_path)
+                set_text("qc_output_edit", qc_dir)
+                set_text("qc_analysis_label", analysis_json)
+                set_text("qc_plan_label", plan_json)
+                set_text("qc_report_label", report_json)
+                set_text("qc_files_label", files_json)
+            elif step == 15:
+                release_dir, analysis_json, plan_json, report_json, files_json, _translations_json, template_path, _log_path = core.release_paths_for_step14_input(input_path)
+                set_text("release_output_edit", release_dir)
+                set_text("release_analysis_label", analysis_json)
+                set_text("release_plan_label", plan_json)
+                set_text("release_report_label", report_json)
+                set_text("release_files_label", files_json)
+                set_text("release_template_label", template_path)
+        except Exception:
+            pass
+
+    def prefill_failed_auto_step(self, step: int, steps: dict[object, object]) -> None:
+        if step == 1:
+            if hasattr(self, "source_row") and hasattr(self, "main_source_row"):
+                self.source_row.set_value(self.main_source_row.value())
+            return
+        row_attr_by_step = {
+            2: "fix_input_row",
+            3: "spine_input_row",
+            4: "sort_input_row",
+            5: "material_input_row",
+            6: "bodygroup_input_row",
+            7: "flex_input_row",
+            8: "collision_input_row",
+            9: "proportion_input_row",
+            10: "carms_input_row",
+            11: "vrd_input_row",
+            12: "texture_input_row",
+            13: "icon_input_row",
+            14: "qc_input_row",
+            15: "release_input_row",
+        }
+        value = self.full_import_step_input_from_results(step, steps)
+        row = getattr(self, row_attr_by_step.get(int(step), ""), None)
+        if value and hasattr(row, "set_value"):
+            row.set_value(value)
+        if step == 14:
+            if hasattr(self, "qc_gmod_row") and hasattr(self, "main_gmod_row") and self.main_gmod_row.value():
+                self.qc_gmod_row.set_value(self.main_gmod_row.value())
+            if hasattr(self, "qc_category_edit"):
+                self.qc_category_edit.setText(self.main_effective_category())
+            if hasattr(self, "qc_category_display_edit"):
+                self.qc_category_display_edit.setText(self.main_effective_category_display_name())
+            if hasattr(self, "qc_model_name_edit"):
+                self.qc_model_name_edit.setText(self.main_effective_model_name())
+            if hasattr(self, "qc_model_display_edit"):
+                self.qc_model_display_edit.setText(self.main_effective_model_display_name())
+        self.refresh_step_preview_from_input(step)
+        self.save_settings()
+
+    def sync_main_results_to_step_tabs(self, result: dict) -> None:
+        steps = result.get("steps") if isinstance(result.get("steps"), dict) else {}
+        step1 = steps.get(1) or steps.get("1")
+        if isinstance(step1, dict):
+            self.workspace_edit.setText(str(step1.get("workspace") or result.get("workspace") or ""))
+            self.output_blend_label.setText(str(step1.get("blend") or ""))
+            self.output_report_label.setText(str(step1.get("report") or ""))
+            self.output_log_label.setText(str(step1.get("log") or ""))
+        for step, row_attr, key in (
+            (2, "fix_input_row", "blend"),
+            (3, "spine_input_row", "blend"),
+            (4, "sort_input_row", "blend"),
+            (5, "material_input_row", "blend"),
+            (6, "bodygroup_input_row", "blend"),
+            (7, "flex_input_row", "blend"),
+            (8, "collision_input_row", "blend"),
+            (9, "proportion_input_row", "blend"),
+        ):
+            previous = steps.get(step - 1) or steps.get(str(step - 1))
+            if isinstance(previous, dict) and previous.get(key):
+                row = getattr(self, row_attr, None)
+                if hasattr(row, "set_value"):
+                    row.set_value(str(previous[key]))
+        step9 = steps.get(9) or steps.get("9")
+        if isinstance(step9, dict) and step9.get("final_dir"):
+            final_dir = str(step9["final_dir"])
+            self.proportion_export_dir = final_dir
+            if hasattr(self, "carms_input_row"):
+                self.carms_input_row.set_value(final_dir)
+            if hasattr(self, "vrd_input_row"):
+                self.vrd_input_row.set_value(final_dir)
+            if hasattr(self, "qc_input_row"):
+                self.qc_input_row.set_value(final_dir)
+        step5 = steps.get(5) or steps.get("5")
+        if isinstance(step5, dict):
+            if step5.get("materials_json") and hasattr(self, "texture_input_row"):
+                self.texture_input_row.set_value(str(step5["materials_json"]))
+            if step5.get("blend") and hasattr(self, "bodygroup_input_row"):
+                self.bodygroup_input_row.set_value(str(step5["blend"]))
+        step14 = steps.get(14) or steps.get("14")
+        if isinstance(step14, dict):
+            self.qc_output_dir = str(step14.get("dir") or "")
+            if hasattr(self, "qc_output_edit"):
+                self.qc_output_edit.setText(self.qc_output_dir)
+            if hasattr(self, "qc_report_label"):
+                self.qc_report_label.setText(str(step14.get("report") or ""))
+            if hasattr(self, "qc_files_label"):
+                self.qc_files_label.setText(str(step14.get("files") or ""))
+        self.save_settings()
+
+    def populate_main_files_table(self, files: object) -> None:
+        rows = [entry for entry in files if isinstance(entry, dict)] if isinstance(files, list) else []
+        self.main_files_table.setRowCount(len(rows))
+        for row_index, entry in enumerate(rows):
+            values = [
+                str(entry.get("name") or ""),
+                str(entry.get("type") or ""),
+                f"{int(entry.get('size', 0) or 0):,}",
+                str(entry.get("stage") or ""),
+                str(entry.get("path") or ""),
+            ]
+            for column, value in enumerate(values):
+                item = QtWidgets.QTableWidgetItem(value)
+                item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                if value:
+                    item.setToolTip(value)
+                self.main_files_table.setItem(row_index, column, item)
+        self.main_files_table.resizeRowsToContents()
+
+    def open_main_output_folder(self) -> None:
+        output = str(self.settings_store.value("qc_gma_output_dir", "", str) or "")
+        if output and Path(output).exists():
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(output))
+
+    def append_main_log(self, message: str) -> None:
+        self.append_translated_log(self.main_log, message)
+
+    def set_main_progress(self, value: int, title: str, detail: str, color: str = "#58a6ff") -> None:
+        value = max(0, min(100, int(value)))
+        self.main_progress_bar.setValue(value)
+        self.main_progress_label.setText(
+            f'<span style="color:{color};">{html.escape(title)}</span> - {value}%'
+            f'<br><span style="color:#8f98a3;">{html.escape(detail)}</span>'
+        )
+
+    def set_main_outputs_visible(self, visible: bool) -> None:
+        self.main_output_group.setVisible(bool(visible))
+        self.main_outputs_toggle.setText(self._t("common.hide_outputs", "Hide Outputs") if visible else self._t("common.show_outputs", "Show Outputs"))
+
+    def set_main_log_visible(self, visible: bool) -> None:
+        self.main_log_group.setVisible(bool(visible))
+        self.main_log_toggle.setText(self._t("common.hide_log", "Hide Log") if visible else self._t("common.show_log", "Show Log"))
+
+    def on_source_changed(self, _value: str) -> None:
+        self.current_analysis = None
+        self.current_workspace = None
+        self.open_workspace_button.setEnabled(False)
+        self.workspace_edit.clear()
+        self.stats_label.setText("Refresh PMX files, then run Analyze.")
+        self.warning_label.clear()
+        if self.model_preview is not None:
+            self.model_preview.clear_model()
+        self.populate_pmx_files()
+        self.save_settings()
+
+    def populate_pmx_files(self) -> None:
+        source = Path(self.source_row.value()) if self.source_row.value() else None
+        previous = str(self.settings_store.value("pmx_path", "", str) or "")
+        self.pmx_paths = []
+        self.pmx_combo.blockSignals(True)
+        self.pmx_combo.clear()
+        if source and source.exists():
+            self.pmx_paths = core.find_pmx_files(source)
+            for path in self.pmx_paths:
+                try:
+                    label = str(path.relative_to(source))
+                except ValueError:
+                    label = path.name
+                self.pmx_combo.addItem(label, str(path))
+            if previous:
+                index = self.pmx_combo.findData(previous)
+                if index >= 0:
+                    self.pmx_combo.setCurrentIndex(index)
+        self.pmx_combo.blockSignals(False)
+        if self.pmx_paths:
+            self.analyze_current_pmx(silent=True)
+        else:
+            self.stats_label.setText("No .pmx files found in the selected folder.")
+            self.warning_label.clear()
+
+    def on_pmx_changed(self, _index: int) -> None:
+        self.current_analysis = None
+        self.current_workspace = None
+        self.workspace_edit.clear()
+        self.open_workspace_button.setEnabled(False)
+        self.warning_label.clear()
+        if self.model_preview is not None:
+            self.model_preview.clear_model()
+        if self.current_pmx_path():
+            self.analyze_current_pmx(silent=True)
+        self.save_settings()
+
+    def current_pmx_path(self) -> Path | None:
+        raw = self.pmx_combo.currentData()
+        if raw:
+            return Path(str(raw))
+        return None
+
+    def analyze_current_pmx(self, silent: bool = False) -> core.PmxAnalysis | None:
+        pmx = self.current_pmx_path()
+        source_raw = self.source_row.value()
+        if not pmx or not source_raw:
+            if not silent:
+                self.show_error("Analyze failed", "Select a model folder and PMX file first.")
+            return None
+        try:
+            source = Path(source_raw)
+            analysis = core.analyze_pmx(pmx, source)
+            workspace = core.build_workspace(pmx, source, analysis)
+            self.current_analysis = analysis
+            self.current_workspace = workspace
+            self.workspace_edit.setText(str(workspace.root))
+            self.open_workspace_button.setEnabled(workspace.root.exists())
+            self.render_analysis(analysis)
+            self.load_current_preview(silent=True)
+            if not silent:
+                self.append_log(f"Analyzed PMX: {pmx}")
+            self.save_settings()
+            return analysis
+        except Exception as exc:
+            self.current_analysis = None
+            self.current_workspace = None
+            self.workspace_edit.clear()
+            self.render_error_analysis(exc)
+            if not silent:
+                self.show_error("Analyze failed", str(exc))
+            return None
+
+    def render_analysis(self, analysis: core.PmxAnalysis) -> None:
+        stats = (
+            f"Model: {analysis.model_name or Path(analysis.pmx_path).stem}"
+            f" | Vertices: {analysis.vertex_count:,}"
+            f" | Morphs: {analysis.morph_count:,}"
+            f" | PMX textures: {analysis.texture_ref_count:,}"
+            f" | Resolved textures: {analysis.resolved_texture_count:,}/{analysis.texture_ref_count:,}"
+            f" | Native texture files: {analysis.texture_file_count:,}"
+            f" | Bones: {analysis.bone_count:,}"
+            f" | Materials: {analysis.material_count:,}"
+        )
+        self.stats_label.setText(stats)
+        if analysis.warnings:
+            escaped = "<br>".join(html.escape(f"- {warning}") for warning in analysis.warnings)
+            self.warning_label.setText(f'<span style="color:#d29922;">Warnings:</span><br>{escaped}')
+        else:
+            self.warning_label.setText('<span style="color:#2ea043;">No preflight warnings.</span>')
+
+    def render_error_analysis(self, exc: Exception) -> None:
+        self.stats_label.setText("Could not analyze the selected PMX.")
+        self.warning_label.setText(f'<span style="color:#f85149;">{html.escape(str(exc))}</span>')
+        if self.model_preview is not None:
+            self.model_preview.clear_model()
+
+    def load_current_preview(self, silent: bool = False) -> None:
+        if self.model_preview is None:
+            return
+        pmx = self.current_pmx_path()
+        if not pmx:
+            self.model_preview.clear_model()
+            return
+        try:
+            model = self.model_preview.load_model(pmx)
+            self.preview_status_label.setText(
+                f"OpenGL preview loaded | {model.vertex_count:,} verts | {model.triangle_count:,} tris | "
+                f"{len(model.bones):,} bones | {model.morph_count:,} morphs | {len(model.materials):,} materials"
+            )
+            if not silent:
+                self.append_log(f"Loaded PMX preview: {pmx}")
+        except Exception as exc:
+            self.model_preview.clear_model()
+            self.preview_status_label.setText(f"Preview failed: {exc}")
+            if not silent:
+                self.show_error("Preview failed", str(exc))
+
+    def confirm_warnings(self, analysis: core.PmxAnalysis) -> bool:
+        if not analysis.warnings and not self.analysis_has_content_warning(analysis):
+            return True
+        return self.confirm_preflight_warnings(
+            analysis,
+            "Preflight warnings",
+            "The PMX has warnings. Proceed with import?",
+            full_import=False,
+        )
+
+    def start_import(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        self.set_step_working(1, "Preparing Step 1 import")
+        analysis = self.analyze_current_pmx(silent=False)
+        pmx = self.current_pmx_path()
+        source = self.source_row.value()
+        if not analysis or not pmx or not source:
+            self.clear_step_state(1)
+            return
+        if not self.confirm_warnings(analysis):
+            self.statusBar().showMessage("Import cancelled before Blender launch.")
+            self.clear_step_state(1)
+            return
+
+        self.log.clear()
+        self.set_progress(0, "Queued", "Preparing import", "#58a6ff")
+        self.import_button.setEnabled(False)
+        self.analyze_button.setEnabled(False)
+        self.cancel_button.setEnabled(True)
+        self.output_blend_label.clear()
+        self.output_log_label.clear()
+        self.output_report_label.clear()
+        self.worker = ImportWorker(str(pmx), source)
+        self.worker.log.connect(self.append_log)
+        self.worker.done.connect(self.import_done)
+        self.worker.failed.connect(self.import_failed)
+        self.worker.start()
+
+    def cancel_import(self) -> None:
+        if self.worker and self.worker.isRunning() and hasattr(self.worker, "cancel"):
+            self.worker.cancel()  # type: ignore[attr-defined]
+            self.append_log("Cancel requested.")
+
+    def import_done(self, result: dict) -> None:
+        self.import_button.setEnabled(True)
+        self.analyze_button.setEnabled(True)
+        self.cancel_button.setEnabled(False)
+        self.output_blend_label.setText(str(result.get("blend", "")))
+        self.output_log_label.setText(str(result.get("log", "")))
+        self.output_report_label.setText(str(result.get("report", "")))
+        self.workspace_edit.setText(str(result.get("workspace", "")))
+        self.open_workspace_button.setEnabled(True)
+        if result.get("blend"):
+            self.fix_input_row.set_value(str(result["blend"]))
+            self.update_fix_output_preview(Path(str(result["blend"])))
+            self.switch_to_step(2)
+        self.set_progress(100, "Import Complete", str(result.get("blend", "")), "#2ea043")
+        import_dir = Path(str(result["blend"])).parent if result.get("blend") else Path(str(result.get("workspace", ""))) / "1_import_mmd_model"
+        self.write_step_complete(
+            1,
+            import_dir,
+            outputs={key: str(result.get(key, "")) for key in ("blend", "preflight") if result.get(key)},
+            report_path=str(result.get("report", "")),
+            validation={"ok": True},
+        )
+        self.refresh_workspace_cache_size()
+        QtWidgets.QMessageBox.information(self, "Import complete", "The PMX was imported and saved as a Blender file.")
+
+    def import_failed(self, message: str) -> None:
+        self.import_button.setEnabled(True)
+        self.analyze_button.setEnabled(True)
+        self.cancel_button.setEnabled(False)
+        self.set_progress(self.progress_bar.value(), "Import Failed", "See the log for details.", "#f85149")
+        self.set_step_failed(1, "Step 1 import failed")
+        self.refresh_workspace_cache_size()
+        self.show_error("Import failed", message)
+
+    def on_fix_input_changed(self, value: str) -> None:
+        if value.strip():
+            self.update_fix_output_preview(Path(value.strip()))
+        else:
+            self.fix_output_edit.clear()
+            self.open_fix_folder_button.setEnabled(False)
+        self.save_settings()
+
+    def update_fix_output_preview(self, input_blend: Path) -> None:
+        try:
+            fix_dir, output_blend, _report = core.fix_paths_for_import_blend(input_blend)
+            self.fix_output_edit.setText(str(fix_dir))
+            self.open_fix_folder_button.setEnabled(fix_dir.exists())
+            if output_blend.exists():
+                self.fixed_blend_label.setText(str(output_blend))
+        except Exception:
+            self.fix_output_edit.clear()
+            self.open_fix_folder_button.setEnabled(False)
+
+    def detect_step1_output(self) -> None:
+        candidates: list[Path] = []
+        if self.current_workspace:
+            candidates.append(self.current_workspace.blend_path)
+        workspace_text = self.workspace_edit.text().strip()
+        if workspace_text:
+            candidates.extend(sorted(Path(workspace_text).glob("1_import_mmd_model/*.blend")))
+        stored = self.settings_store.value("fix_input_blend", "", str)
+        if stored:
+            candidates.append(Path(str(stored)))
+        for candidate in candidates:
+            if candidate.exists():
+                self.fix_input_row.set_value(str(candidate))
+                self.switch_to_step(2)
+                return
+        self.show_error("Detect Step 1 Output", "No existing step-1 .blend output was found. Run step 1 or browse to the imported .blend.")
+
+    def start_fix(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        if not self.ensure_step_can_run(2):
+            return
+        self.set_step_working(2, "Preparing Step 2 fix")
+        input_raw = self.fix_input_row.value()
+        if not input_raw:
+            self.show_error("Fix failed", "Select the step-1 imported .blend first.")
+            return
+        input_blend = Path(input_raw)
+        if not input_blend.exists():
+            self.show_error("Fix failed", f"Imported .blend not found:\n{input_blend}")
+            return
+
+        self.fix_log.clear()
+        self.set_fix_progress(0, "Queued", "Preparing fix step", "#58a6ff")
+        self.fix_button.setEnabled(False)
+        self.detect_import_blend_button.setEnabled(False)
+        self.fix_cancel_button.setEnabled(True)
+        self.fixed_blend_label.clear()
+        self.fix_log_label.clear()
+        self.fix_report_label.clear()
+        self.worker = FixWorker(str(input_blend), self.clear_custom_normals_enabled())
+        self.worker.log.connect(self.append_fix_log)
+        self.worker.done.connect(self.fix_done)
+        self.worker.failed.connect(self.fix_failed)
+        self.worker.start()
+
+    def cancel_fix(self) -> None:
+        if self.worker and self.worker.isRunning() and hasattr(self.worker, "cancel"):
+            self.worker.cancel()  # type: ignore[attr-defined]
+            self.append_fix_log("Cancel requested.")
+
+    def fix_done(self, result: dict) -> None:
+        self.fix_button.setEnabled(True)
+        self.detect_import_blend_button.setEnabled(True)
+        self.fix_cancel_button.setEnabled(False)
+        self.fixed_blend_label.setText(str(result.get("output_blend", "")))
+        self.fix_log_label.setText(str(result.get("log", "")))
+        self.fix_report_label.setText(str(result.get("report", "")))
+        self.fix_output_edit.setText(str(result.get("fix_dir", "")))
+        self.open_fix_folder_button.setEnabled(True)
+        if result.get("output_blend"):
+            self.spine_input_row.set_value(str(result["output_blend"]))
+            self.update_spine_output_preview(Path(str(result["output_blend"])))
+            self.switch_to_step(3)
+        self.set_fix_progress(100, "Fix Complete", str(result.get("output_blend", "")), "#2ea043")
+        self.complete_step_from_result(
+            2,
+            result,
+            "fix_dir",
+            ["output_blend"],
+            report_key="report",
+            validation={"ok": True},
+        )
+        QtWidgets.QMessageBox.information(self, "Fix complete", "The model was fixed and converted to a Source/ValveBiped skeleton checkpoint.")
+
+    def fix_failed(self, message: str) -> None:
+        self.fix_button.setEnabled(True)
+        self.detect_import_blend_button.setEnabled(True)
+        self.fix_cancel_button.setEnabled(False)
+        self.set_fix_progress(self.fix_progress_bar.value(), "Fix Failed", "See the log for details.", "#f85149")
+        self.set_step_failed(2, "Step 2 fix failed")
+        self.show_error("Fix failed", message)
+
+    def on_spine_input_changed(self, value: str) -> None:
+        self.current_spine_analysis = None
+        self.current_spine_plan = None
+        self.spine_table.setRowCount(0)
+        self.spine_apply_button.setEnabled(False)
+        if self.spine_preview is not None:
+            self.spine_preview.clear()
+        if value.strip():
+            self.update_spine_output_preview(Path(value.strip()))
+        else:
+            self.spine_output_edit.clear()
+            self.open_spine_folder_button.setEnabled(False)
+        self.save_settings()
+
+    def update_spine_output_preview(self, input_blend: Path) -> None:
+        try:
+            spine_dir, output_blend, analysis_json, plan_json, report_json = core.spine_paths_for_fixed_blend(input_blend)
+            self.spine_output_edit.setText(str(spine_dir))
+            self.open_spine_folder_button.setEnabled(spine_dir.exists())
+            self.spine_analysis_label.setText(str(analysis_json) if analysis_json.exists() else "")
+            self.spine_plan_label.setText(str(plan_json) if plan_json.exists() else "")
+            self.spine_report_label.setText(str(report_json) if report_json.exists() else "")
+            if output_blend.exists():
+                self.spine_fixed_blend_label.setText(str(output_blend))
+        except Exception:
+            self.spine_output_edit.clear()
+            self.open_spine_folder_button.setEnabled(False)
+
+    def detect_step2_output(self) -> None:
+        candidates: list[Path] = []
+        fixed_text = self.fixed_blend_label.text().strip()
+        if fixed_text:
+            candidates.append(Path(fixed_text))
+        fix_dir_text = self.fix_output_edit.text().strip()
+        if fix_dir_text:
+            candidates.extend(sorted(Path(fix_dir_text).glob("*.blend")))
+        workspace_text = self.workspace_edit.text().strip()
+        if workspace_text:
+            candidates.extend(sorted(Path(workspace_text).glob("2_fix_model_source_skeleton/*.blend")))
+        stored = self.settings_store.value("spine_input_blend", "", str)
+        if stored:
+            candidates.append(Path(str(stored)))
+        for candidate in candidates:
+            if candidate.exists():
+                self.spine_input_row.set_value(str(candidate))
+                self.switch_to_step(3)
+                return
+        self.show_error("Detect Step 2 Output", "No existing step-2 .blend output was found. Run step 2 or browse to the fixed .blend.")
+
+    def start_spine_analyze(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        if not self.ensure_step_can_run(3):
+            return
+        self.set_step_working(3, "Preparing Step 3 spine analysis")
+        input_raw = self.spine_input_row.value()
+        if not input_raw:
+            self.show_error("Analyze spine failed", "Select the step-2 fixed .blend first.")
+            return
+        input_blend = Path(input_raw)
+        if not input_blend.exists():
+            self.show_error("Analyze spine failed", f"Fixed .blend not found:\n{input_blend}")
+            return
+        self.current_spine_analysis = None
+        self.current_spine_plan = None
+        self.spine_log.clear()
+        self.spine_table.setRowCount(0)
+        if self.spine_preview is not None:
+            self.spine_preview.clear()
+        self.set_spine_progress(0, "Queued", "Preparing spine analysis", "#58a6ff")
+        self.spine_analyze_button.setEnabled(False)
+        self.spine_apply_button.setEnabled(False)
+        self.detect_fixed_blend_button.setEnabled(False)
+        self.spine_cancel_button.setEnabled(True)
+        self.worker = SpineAnalyzeWorker(str(input_blend))
+        self.worker.log.connect(self.append_spine_log)
+        self.worker.done.connect(self.spine_analyze_done)
+        self.worker.failed.connect(self.spine_failed)
+        self.worker.start()
+
+    def cancel_spine(self) -> None:
+        if self.worker and self.worker.isRunning() and hasattr(self.worker, "cancel"):
+            self.worker.cancel()  # type: ignore[attr-defined]
+            self.append_spine_log("Cancel requested.")
+
+    def spine_analyze_done(self, result: dict) -> None:
+        self.spine_analyze_button.setEnabled(True)
+        self.spine_apply_button.setEnabled(True)
+        self.detect_fixed_blend_button.setEnabled(True)
+        self.spine_cancel_button.setEnabled(False)
+        self.current_spine_analysis = result.get("analysis_data") if isinstance(result.get("analysis_data"), dict) else None
+        self.current_spine_plan = result.get("plan_data") if isinstance(result.get("plan_data"), dict) else None
+        self.spine_output_edit.setText(str(result.get("spine_dir", "")))
+        self.spine_analysis_label.setText(str(result.get("analysis", "")))
+        self.spine_plan_label.setText(str(result.get("plan", "")))
+        self.spine_log_label.setText(str(result.get("log", "")))
+        self.open_spine_folder_button.setEnabled(True)
+        self.populate_spine_table()
+        self.refresh_spine_preview()
+        self.set_spine_progress(100, "Analysis Complete", str(result.get("analysis", "")), "#2ea043")
+        self.clear_step_state(3, "Step 3 analysis complete")
+
+    def spine_failed(self, message: str) -> None:
+        self.spine_analyze_button.setEnabled(True)
+        self.spine_apply_button.setEnabled(self.current_spine_plan is not None)
+        self.detect_fixed_blend_button.setEnabled(True)
+        self.spine_cancel_button.setEnabled(False)
+        self.set_spine_progress(self.spine_progress_bar.value(), "Spine Step Failed", "See the log for details.", "#f85149")
+        self.set_step_failed(3, "Step 3 spine step failed")
+        self.show_error("Spine step failed", message)
+
+    def bone_names_for_spine_table(self) -> list[str]:
+        if not self.current_spine_analysis:
+            return []
+        bones = self.current_spine_analysis.get("bones", [])
+        names = [str(bone.get("name")) for bone in bones if isinstance(bone, dict) and bone.get("name")]
+        return sorted(names, key=str.lower)
+
+    def populate_spine_table(self) -> None:
+        if not self.current_spine_plan:
+            self.spine_table.setRowCount(0)
+            return
+        names = self.bone_names_for_spine_table()
+        targets = self.current_spine_plan.get("targets", {})
+        self._updating_spine_table = True
+        self.spine_table.setRowCount(len(SPINE_TARGETS))
+        for row, target in enumerate(SPINE_TARGETS):
+            entry = targets.get(target, {}) if isinstance(targets, dict) else {}
+            self.spine_table.setItem(row, 0, QtWidgets.QTableWidgetItem(target))
+            combo = QtWidgets.QComboBox()
+            combo.setEditable(False)
+            if target in SPINE_ADDABLE_TARGETS:
+                combo.addItem("Add new", ADD_NEW_MARKER)
+            for name in names:
+                combo.addItem(name, name)
+            selected = ADD_NEW_MARKER if entry.get("action") == "add" else str(entry.get("source") or "")
+            index = combo.findData(selected)
+            if index < 0 and selected:
+                combo.insertItem(0, selected, selected)
+                index = 0
+            if index >= 0:
+                combo.setCurrentIndex(index)
+            combo.currentIndexChanged.connect(lambda _index, t=target: self.on_spine_override_changed(t))
+            self.spine_table.setCellWidget(row, 1, combo)
+            self.refresh_spine_table_row(row, target)
+        self._updating_spine_table = False
+        self.spine_table.resizeRowsToContents()
+
+    def refresh_spine_table_row(self, row: int, target: str) -> None:
+        if not self.current_spine_plan:
+            return
+        targets = self.current_spine_plan.get("targets", {})
+        entry = targets.get(target, {}) if isinstance(targets, dict) else {}
+        action = str(entry.get("action") or "")
+        parent = entry.get("parent")
+        confidence = entry.get("confidence")
+        warnings = entry.get("warnings") if isinstance(entry.get("warnings"), list) else []
+        self.spine_table.setItem(row, 2, QtWidgets.QTableWidgetItem(action))
+        self.spine_table.setItem(row, 3, QtWidgets.QTableWidgetItem(str(parent or "")))
+        self.spine_table.setItem(row, 4, QtWidgets.QTableWidgetItem("" if confidence is None else f"{float(confidence):.3f}"))
+        self.spine_table.setItem(row, 5, QtWidgets.QTableWidgetItem("; ".join(str(warning) for warning in warnings)))
+
+    def spine_target_row(self, target: str) -> int:
+        try:
+            return SPINE_TARGETS.index(target)
+        except ValueError:
+            return -1
+
+    def estimate_added_spine_position(self, target: str) -> dict[str, list[float]]:
+        if not self.current_spine_analysis or not self.current_spine_plan:
+            return {"head": [0.0, 0.0, 0.0], "tail": [0.0, 0.0, 0.035]}
+        bones = {
+            str(bone["name"]): bone
+            for bone in self.current_spine_analysis.get("bones", [])
+            if isinstance(bone, dict) and bone.get("name")
+        }
+        targets = self.current_spine_plan.get("targets", {})
+
+        def target_vec(target_name: str, key: str) -> list[float] | None:
+            entry = targets.get(target_name, {}) if isinstance(targets, dict) else {}
+            source = entry.get("source")
+            if source and str(source) in bones:
+                value = bones[str(source)].get(key)
+                if isinstance(value, list) and len(value) >= 3:
+                    return [float(value[0]), float(value[1]), float(value[2])]
+            return None
+
+        lower_tail = target_vec("ValveBiped.Bip01_Spine1" if target.endswith("Spine2") else "ValveBiped.Bip01_Pelvis", "tail")
+        upper_head = target_vec("ValveBiped.Bip01_Spine4" if target.endswith("Spine2") else "ValveBiped.Bip01_Spine1", "head")
+        if lower_tail and upper_head:
+            head = lower_tail
+            tail = upper_head
+            distance = sum((tail[i] - head[i]) ** 2 for i in range(3)) ** 0.5
+            if distance < 0.004 or head[2] > tail[2]:
+                head = [head[i] * 0.35 + tail[i] * 0.65 for i in range(3)]
+                tail = [head[i] * 0.75 + upper_head[i] * 0.25 for i in range(3)]
+            return {"head": head, "tail": tail}
+        return {"head": [0.0, 0.0, 0.0], "tail": [0.0, 0.0, 0.035]}
+
+    def on_spine_override_changed(self, target: str) -> None:
+        if self._updating_spine_table or not self.current_spine_plan:
+            return
+        row = self.spine_target_row(target)
+        if row < 0:
+            return
+        combo = self.spine_table.cellWidget(row, 1)
+        if not isinstance(combo, QtWidgets.QComboBox):
+            return
+        selected = combo.currentData()
+        targets = self.current_spine_plan.setdefault("targets", {})
+        if not isinstance(targets, dict):
+            return
+        entry = targets.setdefault(target, {})
+        if not isinstance(entry, dict):
+            entry = {}
+            targets[target] = entry
+        entry["target"] = target
+        entry["parent"] = SPINE_TARGET_PARENTS.get(target)
+        if selected == ADD_NEW_MARKER:
+            entry["source"] = None
+            entry["action"] = "add"
+            entry["confidence"] = 1.0
+            entry["warnings"] = ["User selected Add new."]
+            entry["position"] = self.estimate_added_spine_position(target)
+        else:
+            source = str(selected or "")
+            entry["source"] = source
+            entry["action"] = "keep" if source == target else "rename"
+            entry["confidence"] = 1.0
+            entry["warnings"] = []
+            entry.pop("position", None)
+        self.refresh_spine_table_row(row, target)
+        self.refresh_spine_preview()
+
+    def refresh_spine_preview(self) -> None:
+        if self.spine_preview is not None:
+            self.spine_preview.set_analysis(self.current_spine_analysis, self.current_spine_plan)
+
+    def validate_spine_plan(self) -> None:
+        if not self.current_spine_plan:
+            self.show_error("Validate spine", "Run Analyze Spine before validating the plan.")
+            return
+        errors: list[str] = []
+        warnings: list[str] = []
+        names = set(self.bone_names_for_spine_table())
+        targets = self.current_spine_plan.get("targets", {})
+        used_sources: dict[str, list[str]] = {}
+        if not isinstance(targets, dict):
+            errors.append("Plan targets are missing.")
+        else:
+            for target in SPINE_TARGETS:
+                entry = targets.get(target)
+                if not isinstance(entry, dict):
+                    errors.append(f"Missing plan target: {target}")
+                    continue
+                action = str(entry.get("action") or "")
+                source = entry.get("source")
+                if action == "add":
+                    if target not in SPINE_ADDABLE_TARGETS:
+                        errors.append(f"{target} cannot be added; select an existing source bone.")
+                elif not source:
+                    errors.append(f"{target} needs an existing source bone.")
+                elif str(source) not in names:
+                    errors.append(f"{target} source bone does not exist: {source}")
+                if source:
+                    used_sources.setdefault(str(source), []).append(target)
+                for warning in entry.get("warnings", []) if isinstance(entry.get("warnings"), list) else []:
+                    warnings.append(f"{target}: {warning}")
+        for source, mapped_targets in used_sources.items():
+            if len(mapped_targets) > 1:
+                errors.append(f"{source} is mapped to multiple targets: {', '.join(mapped_targets)}")
+        if errors:
+            self.show_error("Spine plan validation", "Blocking errors:\n" + "\n".join(f"- {error}" for error in errors))
+            return
+        detail = "The current plan is internally consistent. The apply step will run Blender-side hierarchy and position validation."
+        if warnings:
+            detail += "\n\nWarnings:\n" + "\n".join(f"- {warning}" for warning in warnings)
+        QtWidgets.QMessageBox.information(self, "Spine plan validation", detail)
+
+    def start_spine_fix(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        if not self.ensure_step_can_run(3):
+            return
+        self.set_step_working(3, "Preparing Step 3 spine fix")
+        input_raw = self.spine_input_row.value()
+        if not input_raw:
+            self.show_error("Fix spine failed", "Select the step-2 fixed .blend first.")
+            return
+        if not self.current_spine_plan:
+            self.show_error("Fix spine failed", "Run Analyze Spine and confirm the detected bone plan first.")
+            return
+        input_blend = Path(input_raw)
+        if not input_blend.exists():
+            self.show_error("Fix spine failed", f"Fixed .blend not found:\n{input_blend}")
+            return
+        self.spine_log.clear()
+        self.set_spine_progress(0, "Queued", "Preparing spine fix", "#58a6ff")
+        self.spine_analyze_button.setEnabled(False)
+        self.spine_apply_button.setEnabled(False)
+        self.detect_fixed_blend_button.setEnabled(False)
+        self.spine_cancel_button.setEnabled(True)
+        self.spine_fixed_blend_label.clear()
+        self.spine_report_label.clear()
+        self.worker = SpineFixWorker(str(input_blend), self.current_spine_plan)
+        self.worker.log.connect(self.append_spine_log)
+        self.worker.done.connect(self.spine_fix_done)
+        self.worker.failed.connect(self.spine_failed)
+        self.worker.start()
+
+    def spine_fix_done(self, result: dict) -> None:
+        self.spine_analyze_button.setEnabled(True)
+        self.spine_apply_button.setEnabled(True)
+        self.detect_fixed_blend_button.setEnabled(True)
+        self.spine_cancel_button.setEnabled(False)
+        self.spine_fixed_blend_label.setText(str(result.get("output_blend", "")))
+        self.spine_output_edit.setText(str(result.get("spine_dir", "")))
+        self.spine_plan_label.setText(str(result.get("plan", "")))
+        self.spine_log_label.setText(str(result.get("log", "")))
+        self.spine_report_label.setText(str(result.get("report", "")))
+        self.open_spine_folder_button.setEnabled(True)
+        report = result.get("report_data") if isinstance(result.get("report_data"), dict) else {}
+        validation = report.get("applied", {}).get("validation", {}) if isinstance(report.get("applied"), dict) else {}
+        if isinstance(validation, dict) and validation.get("ok"):
+            self.set_spine_progress(100, "Fix Complete", str(result.get("output_blend", "")), "#2ea043")
+            self.complete_step_from_result(
+                3,
+                result,
+                "spine_dir",
+                ["output_blend", "plan"],
+                report_key="report",
+                validation=validation,
+            )
+            QtWidgets.QMessageBox.information(self, "Spine fix complete", "The spine hierarchy was repaired and validated.")
+        else:
+            self.set_spine_progress(100, "Fix Complete With Warnings", str(result.get("output_blend", "")), "#d29922")
+        if result.get("output_blend") and hasattr(self, "sort_input_row"):
+            self.sort_input_row.set_value(str(result["output_blend"]))
+            self.update_sort_output_preview(Path(str(result["output_blend"])))
+            self.switch_to_step(4)
+
+    def on_sort_input_changed(self, value: str) -> None:
+        self.current_sort_analysis = None
+        self.current_sort_plan = None
+        self.sort_manual_merge_blend_path = ""
+        self.sort_apply_input_blend_path = ""
+        self.sort_table.setRowCount(0)
+        self.sort_apply_button.setEnabled(False)
+        self.sort_manual_merge_button.setEnabled(False)
+        self.sort_manual_blend_label.clear()
+        self.refresh_sort_bone_combos()
+        if self.sort_preview is not None:
+            self.sort_preview.clear()
+        if value.strip():
+            self.update_sort_output_preview(Path(value.strip()))
+        else:
+            self.sort_output_edit.clear()
+            self.open_sort_folder_button.setEnabled(False)
+        self.save_settings()
+
+    def update_sort_output_preview(self, input_blend: Path) -> None:
+        try:
+            sort_dir, output_blend, analysis_json, plan_json, report_json = core.sort_bones_paths_for_spine_blend(input_blend)
+            self.sort_output_edit.setText(str(sort_dir))
+            self.open_sort_folder_button.setEnabled(sort_dir.exists())
+            self.sort_analysis_label.setText(str(analysis_json) if analysis_json.exists() else "")
+            self.sort_plan_label.setText(str(plan_json) if plan_json.exists() else "")
+            self.sort_report_label.setText(str(report_json) if report_json.exists() else "")
+            manual_blend = core.sort_bones_manual_merge_path_for_spine_blend(input_blend)
+            self.sort_manual_blend_label.setText(str(manual_blend) if manual_blend.exists() else "")
+            self.sort_manual_merge_blend_path = str(manual_blend) if manual_blend.exists() else ""
+            if output_blend.exists():
+                self.sort_blend_label.setText(str(output_blend))
+        except Exception:
+            self.sort_output_edit.clear()
+            self.open_sort_folder_button.setEnabled(False)
+
+    def detect_step3_output(self) -> None:
+        candidates: list[Path] = []
+        spine_text = self.spine_fixed_blend_label.text().strip()
+        if spine_text:
+            candidates.append(Path(spine_text))
+        spine_dir_text = self.spine_output_edit.text().strip()
+        if spine_dir_text:
+            candidates.extend(sorted(Path(spine_dir_text).glob("*.blend")))
+        workspace_text = self.workspace_edit.text().strip()
+        if workspace_text:
+            candidates.extend(sorted(Path(workspace_text).glob("3_fix_spine_bones/*.blend")))
+        stored = self.settings_store.value("sort_input_blend", "", str)
+        if stored:
+            candidates.append(Path(str(stored)))
+        for candidate in candidates:
+            if candidate.exists():
+                self.sort_input_row.set_value(str(candidate))
+                self.switch_to_step(4)
+                return
+        self.show_error("Detect Step 3 Output", "No existing step-3 .blend output was found. Run step 3 or browse to the spine-fixed .blend.")
+
+    def start_sort_analyze(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        if not self.ensure_step_can_run(4):
+            return
+        self.set_step_working(4, "Preparing Step 4 bone analysis")
+        input_raw = self.sort_input_row.value()
+        if not input_raw:
+            self.show_error("Analyze bones failed", "Select the step-3 spine-fixed .blend first.")
+            return
+        input_blend = Path(input_raw)
+        if not input_blend.exists():
+            self.show_error("Analyze bones failed", f"Spine-fixed .blend not found:\n{input_blend}")
+            return
+        self.current_sort_analysis = None
+        self.current_sort_plan = None
+        self.sort_manual_merge_blend_path = ""
+        self.sort_log.clear()
+        self.sort_table.setRowCount(0)
+        self.sort_manual_blend_label.clear()
+        self.refresh_sort_bone_combos()
+        if self.sort_preview is not None:
+            self.sort_preview.clear()
+        self.set_sort_progress(0, "Queued", "Preparing bone analysis", "#58a6ff")
+        self.sort_analyze_button.setEnabled(False)
+        self.sort_apply_button.setEnabled(False)
+        self.sort_manual_merge_button.setEnabled(False)
+        self.detect_spine_blend_button.setEnabled(False)
+        self.sort_cancel_button.setEnabled(True)
+        self.worker = SortBonesAnalyzeWorker(str(input_blend), self.sort_limit_spin.value())
+        self.worker.log.connect(self.append_sort_log)
+        self.worker.done.connect(self.sort_analyze_done)
+        self.worker.failed.connect(self.sort_failed)
+        self.worker.start()
+
+    def cancel_sort(self) -> None:
+        if self.worker and self.worker.isRunning() and hasattr(self.worker, "cancel"):
+            self.worker.cancel()  # type: ignore[attr-defined]
+            self.append_sort_log("Cancel requested.")
+
+    def sort_analyze_done(self, result: dict) -> None:
+        self.sort_analyze_button.setEnabled(True)
+        self.sort_apply_button.setEnabled(True)
+        self.sort_manual_merge_button.setEnabled(False)
+        self.detect_spine_blend_button.setEnabled(True)
+        self.sort_cancel_button.setEnabled(False)
+        self.current_sort_analysis = result.get("analysis_data") if isinstance(result.get("analysis_data"), dict) else None
+        self.current_sort_plan = result.get("plan_data") if isinstance(result.get("plan_data"), dict) else None
+        self.sort_output_edit.setText(str(result.get("sort_dir", "")))
+        self.sort_analysis_label.setText(str(result.get("analysis", "")))
+        self.sort_plan_label.setText(str(result.get("plan", "")))
+        self.sort_log_label.setText(str(result.get("log", "")))
+        self.open_sort_folder_button.setEnabled(True)
+        self.sort_apply_input_blend_path = str(result.get("input_blend", "") or "")
+        self.prepare_sort_manual_merge_blend(Path(str(result.get("input_blend", ""))))
+        self.populate_sort_table()
+        self.refresh_sort_bone_combos()
+        self.commit_sort_plan_edit(populate_table=False)
+        self.set_sort_progress(100, "Analysis Complete", str(result.get("analysis", "")), "#2ea043")
+        self.clear_step_state(4, "Step 4 analysis complete")
+
+    def prepare_sort_manual_merge_blend(self, input_blend: Path) -> None:
+        if not input_blend.exists() or not str(input_blend):
+            self.sort_manual_merge_blend_path = ""
+            self.sort_manual_blend_label.clear()
+            self.sort_manual_merge_button.setEnabled(False)
+            return
+        try:
+            manual_blend = core.sort_bones_manual_merge_path_for_spine_blend(input_blend)
+            manual_blend.parent.mkdir(parents=True, exist_ok=True)
+            if manual_blend.resolve() != input_blend.resolve() and not manual_blend.exists():
+                shutil.copy2(input_blend, manual_blend)
+                self.append_sort_log(f"Created manual bone merge blend: {manual_blend}")
+            elif manual_blend.exists():
+                self.append_sort_log(f"Manual bone merge blend is available: {manual_blend}")
+            self.sort_manual_merge_blend_path = str(manual_blend)
+            self.sort_manual_blend_label.setText(str(manual_blend))
+            self.sort_manual_merge_button.setEnabled(manual_blend.exists())
+        except Exception as exc:
+            self.sort_manual_merge_blend_path = ""
+            self.sort_manual_blend_label.clear()
+            self.sort_manual_merge_button.setEnabled(False)
+            self.append_sort_log(f"Could not prepare manual bone merge blend: {exc}")
+
+    def start_sort_manual_merge(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        if not self.ensure_step_can_run(4):
+            return
+        manual_raw = self.sort_manual_merge_blend_path or self.sort_manual_blend_label.text().strip()
+        if not manual_raw:
+            self.show_error("Manual bone merge", "Run Analyze Bones first to create the manual merge .blend.")
+            return
+        manual_blend = Path(manual_raw)
+        if not manual_blend.exists():
+            self.show_error("Manual bone merge", f"Manual merge .blend not found:\n{manual_blend}")
+            return
+        message = QtWidgets.QMessageBox(self)
+        message.setIcon(QtWidgets.QMessageBox.Icon.Information)
+        message.setWindowTitle("Manual Bone Merge")
+        message.setText("Blender will open the Step 4 manual merge blend.")
+        message.setInformativeText(
+            "Use this only for merges that are easier to inspect in Blender.\n\n"
+            "Instructions:\n"
+            "- Select the armature and use the Bones Merger add-on from Blender.\n"
+            "- Select the bones to merge, making the target/remaining bone the active bone.\n"
+            "- Right-click and run the merge operation; selected bones merge into the active bone.\n"
+            "- Do not merge essential bones: ValveBiped bones, ZArmTwist_L/R, ZHandTwist_L/R, Eye_L, or Eye_R.\n"
+            "- Save the blend before closing Blender.\n\n"
+            "After Blender closes, this tool will run Analyze Bones again and refresh the auto-merge candidates."
+        )
+        message.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Ok | QtWidgets.QMessageBox.StandardButton.Cancel)
+        if message.exec() != QtWidgets.QMessageBox.StandardButton.Ok:
+            return
+        self.set_step_working(4, "Waiting for manual Step 4 bone merge")
+        self.sort_log.clear()
+        self.set_sort_progress(30, "Waiting For Blender", str(manual_blend), "#d29922")
+        self.sort_analyze_button.setEnabled(False)
+        self.sort_manual_merge_button.setEnabled(False)
+        self.sort_apply_button.setEnabled(False)
+        self.detect_spine_blend_button.setEnabled(False)
+        self.sort_cancel_button.setEnabled(True)
+        source_blend = self.sort_input_row.value().strip()
+        if source_blend:
+            source_path = Path(source_blend)
+            if source_path.parent.name == "4_sort_bones" and source_path.stem.endswith("_bones_manual_merge"):
+                for label in (self.spine_fixed_blend_label,):
+                    candidate_text = label.text().strip() if isinstance(label, QtWidgets.QLabel) else ""
+                    if candidate_text and Path(candidate_text).exists():
+                        source_blend = candidate_text
+                        break
+        self.worker = SortBonesManualMergeWorker(str(manual_blend), self.sort_limit_spin.value(), source_blend)
+        self.worker.log.connect(self.append_sort_log)
+        self.worker.done.connect(self.sort_manual_merge_done)
+        self.worker.failed.connect(self.sort_failed)
+        self.worker.start()
+
+    def sort_manual_merge_done(self, result: dict) -> None:
+        manual_blend = str(result.get("manual_blend") or result.get("input_blend") or "")
+        source_blend = str(result.get("source_blend") or "").strip()
+        if manual_blend:
+            self.sort_manual_merge_blend_path = manual_blend
+            self.sort_apply_input_blend_path = manual_blend
+            self.sort_manual_blend_label.setText(manual_blend)
+        if source_blend and Path(source_blend).exists():
+            self.sort_input_row.edit.blockSignals(True)
+            self.sort_input_row.set_value(source_blend)
+            self.sort_input_row.edit.blockSignals(False)
+            self.settings_store.setValue("sort_input_blend", source_blend)
+        self.sort_analyze_done(result)
+        if manual_blend:
+            self.sort_apply_input_blend_path = manual_blend
+            self.sort_manual_merge_blend_path = manual_blend
+            self.sort_manual_blend_label.setText(manual_blend)
+        if source_blend and Path(source_blend).exists():
+            self.sort_input_row.edit.blockSignals(True)
+            self.sort_input_row.set_value(source_blend)
+            self.sort_input_row.edit.blockSignals(False)
+            self.settings_store.setValue("sort_input_blend", source_blend)
+        self.sort_apply_button.setEnabled(self.current_sort_plan is not None and self.first_missing_dependency(4) is None)
+        self.set_sort_progress(100, "Manual Merge Re-Analyzed", str(result.get("analysis", "")), "#2ea043")
+
+    def sort_failed(self, message: str) -> None:
+        self.sort_analyze_button.setEnabled(True)
+        self.sort_apply_button.setEnabled(self.current_sort_plan is not None and self.first_missing_dependency(4) is None)
+        self.sort_manual_merge_button.setEnabled(bool(self.sort_manual_merge_blend_path and Path(self.sort_manual_merge_blend_path).exists()))
+        self.detect_spine_blend_button.setEnabled(True)
+        self.sort_cancel_button.setEnabled(False)
+        self.set_sort_progress(self.sort_progress_bar.value(), "Sort Bones Failed", "See the log for details.", "#f85149")
+        self.set_step_failed(4, "Step 4 sort bones failed")
+        self.show_error("Sort bones failed", message)
+
+    def sort_bone_names(self) -> list[str]:
+        if not self.current_sort_analysis:
+            return []
+        bones = self.current_sort_analysis.get("bones", [])
+        names = [str(bone.get("name")) for bone in bones if isinstance(bone, dict) and bone.get("name")]
+        return sorted(names, key=str.lower)
+
+    def refresh_sort_bone_combos(self) -> None:
+        names = self.sort_bone_names()
+        for combo in (self.sort_protect_combo, self.sort_source_combo, self.sort_target_combo):
+            if not hasattr(self, "sort_protect_combo"):
+                return
+            current = combo.currentText()
+            combo.blockSignals(True)
+            combo.clear()
+            for name in names:
+                combo.addItem(name, name)
+            index = combo.findText(current)
+            if index >= 0:
+                combo.setCurrentIndex(index)
+            combo.blockSignals(False)
+
+    def populate_sort_table(self) -> None:
+        if not self.current_sort_plan:
+            self.sort_table.setRowCount(0)
+            return
+        operations = self.current_sort_plan.get("operations", [])
+        if not isinstance(operations, list):
+            self.sort_table.setRowCount(0)
+            return
+        self._updating_sort_table = True
+        self.sort_table.setRowCount(len(operations))
+        for row, raw in enumerate(operations):
+            entry = raw if isinstance(raw, dict) else {}
+            enabled_item = QtWidgets.QTableWidgetItem("")
+            enabled_item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsUserCheckable | QtCore.Qt.ItemFlag.ItemIsSelectable)
+            enabled_item.setCheckState(QtCore.Qt.CheckState.Checked if entry.get("enabled", True) else QtCore.Qt.CheckState.Unchecked)
+            self.sort_table.setItem(row, 0, enabled_item)
+            for column, key in enumerate(("round", "source", "target", "branch", "reason"), start=1):
+                self.sort_table.setItem(row, column, QtWidgets.QTableWidgetItem(str(entry.get(key, ""))))
+            warnings = entry.get("warnings") if isinstance(entry.get("warnings"), list) else []
+            self.sort_table.setItem(row, 6, QtWidgets.QTableWidgetItem("; ".join(str(warning) for warning in warnings)))
+        self._updating_sort_table = False
+        self.sort_table.resizeRowsToContents()
+
+    def on_sort_table_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
+        if self._updating_sort_table or not self.current_sort_plan or item.column() != 0:
+            return
+        operations = self.current_sort_plan.get("operations", [])
+        if not isinstance(operations, list) or item.row() >= len(operations):
+            return
+        entry = operations[item.row()]
+        if isinstance(entry, dict):
+            entry["enabled"] = item.checkState() == QtCore.Qt.CheckState.Checked
+            self.commit_sort_plan_edit(populate_table=False)
+
+    def add_sort_protected_bone(self) -> None:
+        if not self.current_sort_plan:
+            self.show_error("Protect bone", "Run Analyze Bones before adding protected bones.")
+            return
+        name = str(self.sort_protect_combo.currentData() or self.sort_protect_combo.currentText()).strip()
+        if not name:
+            return
+        protected = self.current_sort_plan.setdefault("protected_bones", [])
+        if not isinstance(protected, list):
+            protected = []
+            self.current_sort_plan["protected_bones"] = protected
+        if name not in protected:
+            protected.append(name)
+        operations = self.current_sort_plan.get("operations", [])
+        if isinstance(operations, list):
+            for entry in operations:
+                if isinstance(entry, dict) and entry.get("source") == name:
+                    entry["enabled"] = False
+                    warnings = entry.setdefault("warnings", [])
+                    if isinstance(warnings, list):
+                        warnings.append("Disabled because the source bone was protected in the UI.")
+        self.commit_sort_plan_edit()
+
+    def add_manual_sort_operation(self) -> None:
+        if not self.current_sort_plan:
+            self.show_error("Add manual merge", "Run Analyze Bones before adding manual merge operations.")
+            return
+        source = str(self.sort_source_combo.currentData() or self.sort_source_combo.currentText()).strip()
+        target = str(self.sort_target_combo.currentData() or self.sort_target_combo.currentText()).strip()
+        if not source or not target or source == target:
+            self.show_error("Add manual merge", "Select a source and a different target bone.")
+            return
+        protected = set(str(name) for name in self.current_sort_plan.get("protected_bones", []) if name) if isinstance(self.current_sort_plan.get("protected_bones"), list) else set()
+        if source.startswith("ValveBiped") or source in {"ZArmTwist_L", "ZArmTwist_R", "ZHandTwist_L", "ZHandTwist_R", "Eye_L", "Eye_R"} or source in protected:
+            self.show_error("Add manual merge", f"Protected bone cannot be merged away:\n{source}")
+            return
+        operations = self.current_sort_plan.setdefault("operations", [])
+        if not isinstance(operations, list):
+            operations = []
+            self.current_sort_plan["operations"] = operations
+        operations.append(
+            {
+                "round": 0,
+                "order": len(operations),
+                "source": source,
+                "target": target,
+                "branch": "manual",
+                "reason": "manual UI merge",
+                "depth": 0,
+                "enabled": True,
+                "warnings": ["User-added manual operation."],
+            }
+        )
+        self.commit_sort_plan_edit()
+
+    def sort_parent_for_bone(self, bone_name: str) -> str | None:
+        if not self.current_sort_analysis:
+            return None
+        for raw in self.current_sort_analysis.get("bones", []):
+            if isinstance(raw, dict) and raw.get("name") == bone_name:
+                parent = raw.get("parent")
+                return str(parent) if parent else None
+        return None
+
+    def is_sort_core_protected(self, bone_name: str) -> bool:
+        if bone_name.startswith("ValveBiped"):
+            return True
+        if bone_name in {"ZArmTwist_L", "ZArmTwist_R", "ZHandTwist_L", "ZHandTwist_R", "Eye_L", "Eye_R"}:
+            return True
+        return False
+
+    def sort_protected_set(self) -> set[str]:
+        if not self.current_sort_plan:
+            return set()
+        protected = self.current_sort_plan.get("protected_bones", [])
+        return set(str(name) for name in protected if name) if isinstance(protected, list) else set()
+
+    def reestimate_sort_plan(self) -> None:
+        if not self.current_sort_plan:
+            return
+        operations = self.current_sort_plan.get("operations", [])
+        enabled = sum(1 for entry in operations if isinstance(entry, dict) and entry.get("enabled", True)) if isinstance(operations, list) else 0
+        initial = int(self.current_sort_plan.get("initial_bone_count", 0) or 0)
+        if not initial and self.current_sort_analysis:
+            initial = int(self.current_sort_analysis.get("bone_count", 0) or 0)
+        if initial:
+            self.current_sort_plan["estimated_final_bone_count"] = max(0, initial - enabled)
+
+    def disable_sort_operations_for_bone(self, bone_name: str, include_targets: bool) -> int:
+        if not self.current_sort_plan:
+            return 0
+        operations = self.current_sort_plan.get("operations", [])
+        if not isinstance(operations, list):
+            return 0
+        changed = 0
+        for entry in operations:
+            if not isinstance(entry, dict) or not entry.get("enabled", True):
+                continue
+            source_match = str(entry.get("source") or "") == bone_name
+            target_match = include_targets and str(entry.get("target") or "") == bone_name
+            if source_match or target_match:
+                entry["enabled"] = False
+                warnings = entry.setdefault("warnings", [])
+                if isinstance(warnings, list):
+                    warnings.append("Disabled from the preview context menu.")
+                changed += 1
+        return changed
+
+    def append_manual_sort_operation(self, source: str, target: str, reason: str, warning: str) -> None:
+        if not self.current_sort_plan:
+            return
+        operations = self.current_sort_plan.setdefault("operations", [])
+        if not isinstance(operations, list):
+            operations = []
+            self.current_sort_plan["operations"] = operations
+        self.disable_sort_operations_for_bone(source, include_targets=False)
+        operations.append(
+            {
+                "round": 0,
+                "order": len(operations),
+                "source": source,
+                "target": target,
+                "branch": "manual",
+                "reason": reason,
+                "depth": 0,
+                "enabled": True,
+                "warnings": [warning],
+            }
+        )
+
+    def handle_sort_preview_bone_action(self, action: str, bone_name: str) -> None:
+        if not self.current_sort_plan:
+            return
+        bone_name = str(bone_name)
+        if action == "merge_to_parent":
+            parent = self.sort_parent_for_bone(bone_name)
+            if not parent:
+                self.show_error("Merge to parent", f"No parent bone was found for:\n{bone_name}")
+                return
+            if self.is_sort_core_protected(bone_name) or bone_name in self.sort_protected_set():
+                self.show_error("Merge to parent", f"Protected bone cannot be merged away:\n{bone_name}")
+                return
+            self.append_manual_sort_operation(bone_name, parent, "manual preview merge to parent", "User-added from preview context menu.")
+            self.statusBar().showMessage(f"Added manual merge: {bone_name} -> {parent}")
+        elif action == "protect":
+            protected = self.current_sort_plan.setdefault("protected_bones", [])
+            if not isinstance(protected, list):
+                protected = []
+                self.current_sort_plan["protected_bones"] = protected
+            if bone_name not in protected:
+                protected.append(bone_name)
+            disabled = self.disable_sort_operations_for_bone(bone_name, include_targets=False)
+            self.statusBar().showMessage(f"Protected {bone_name}; disabled {disabled} merge operation(s).")
+        elif action == "unprotect":
+            if self.is_sort_core_protected(bone_name):
+                self.show_error("Disable protect bone", f"Core protected bone cannot be unprotected:\n{bone_name}")
+                return
+            protected = self.current_sort_plan.get("protected_bones", [])
+            if isinstance(protected, list) and bone_name in protected:
+                protected[:] = [name for name in protected if name != bone_name]
+            self.statusBar().showMessage(f"Removed user protection from {bone_name}.")
+        elif action == "cancel_merge":
+            disabled = self.disable_sort_operations_for_bone(bone_name, include_targets=True)
+            self.statusBar().showMessage(f"Cancelled {disabled} merge operation(s) touching {bone_name}.")
+        self.commit_sort_plan_edit()
+
+    def refresh_sort_preview(self) -> None:
+        if self.sort_preview is not None:
+            self.sort_preview.set_analysis(self.current_sort_analysis, self.current_sort_plan)
+
+    def commit_sort_plan_edit(self, populate_table: bool = True) -> None:
+        if self.current_sort_plan:
+            self.reestimate_sort_plan()
+        if populate_table:
+            self.populate_sort_table()
+        self.refresh_sort_preview()
+        self.update_sort_summary()
+
+    def update_sort_summary(self) -> None:
+        if not self.current_sort_plan:
+            self.sort_summary_label.setText(
+                "Analyze the step-3 armature, review or edit the proposed merges, then apply until the model is under the Source bone limit."
+            )
+            return
+        self.reestimate_sort_plan()
+        initial = int(self.current_sort_plan.get("initial_bone_count", 0) or 0)
+        estimated = int(self.current_sort_plan.get("estimated_final_bone_count", initial) or initial)
+        operations = self.current_sort_plan.get("operations", [])
+        enabled = sum(1 for entry in operations if isinstance(entry, dict) and entry.get("enabled", True)) if isinstance(operations, list) else 0
+        warnings = self.current_sort_plan.get("warnings", [])
+        warning_text = f" | Warnings: {len(warnings)}" if isinstance(warnings, list) and warnings else ""
+        self.sort_summary_label.setText(
+            f"Initial bones: {initial:,} | Estimated after auto plan: {estimated:,} | Enabled merges: {enabled:,} | Limit: {self.sort_limit_spin.value():,}{warning_text}"
+        )
+
+    def validate_sort_plan(self) -> None:
+        if not self.current_sort_plan:
+            self.show_error("Validate sort bones", "Run Analyze Bones before validating the plan.")
+            return
+        names = set(self.sort_bone_names())
+        protected = set(str(name) for name in self.current_sort_plan.get("protected_bones", []) if name) if isinstance(self.current_sort_plan.get("protected_bones"), list) else set()
+        errors: list[str] = []
+        warnings: list[str] = []
+        operations = self.current_sort_plan.get("operations", [])
+        if not isinstance(operations, list):
+            errors.append("Plan operations are missing.")
+        else:
+            for index, entry in enumerate(operations):
+                if not isinstance(entry, dict) or not entry.get("enabled", True):
+                    continue
+                source = str(entry.get("source") or "")
+                target = str(entry.get("target") or "")
+                if source not in names:
+                    errors.append(f"Operation {index + 1} source bone does not exist: {source}")
+                if target not in names:
+                    errors.append(f"Operation {index + 1} target bone does not exist: {target}")
+                if source == target:
+                    errors.append(f"Operation {index + 1} source and target are the same: {source}")
+                if source.startswith("ValveBiped") or source in {"ZArmTwist_L", "ZArmTwist_R", "ZHandTwist_L", "ZHandTwist_R", "Eye_L", "Eye_R"} or source in protected:
+                    errors.append(f"Operation {index + 1} tries to merge protected bone: {source}")
+        estimated = int(self.current_sort_plan.get("estimated_final_bone_count", 0) or 0)
+        if estimated and estimated > self.sort_limit_spin.value():
+            warnings.append(f"Estimated automatic result remains above limit: {estimated} > {self.sort_limit_spin.value()}")
+        if errors:
+            self.show_error("Sort bones validation", "Blocking errors:\n" + "\n".join(f"- {error}" for error in errors))
+            return
+        detail = "The current merge plan is internally consistent. The apply step will run Blender-side weight and skeleton validation."
+        if warnings:
+            detail += "\n\nWarnings:\n" + "\n".join(f"- {warning}" for warning in warnings)
+        QtWidgets.QMessageBox.information(self, "Sort bones validation", detail)
+
+    def start_sort_bones(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        if not self.ensure_step_can_run(4):
+            return
+        self.set_step_working(4, "Preparing Step 4 bone merge")
+        input_raw = self.sort_apply_input_blend_path.strip() or self.sort_input_row.value()
+        if not input_raw:
+            self.show_error("Sort bones failed", "Select the step-3 spine-fixed .blend first.")
+            return
+        if not self.current_sort_plan:
+            self.show_error("Sort bones failed", "Run Analyze Bones and confirm the merge plan first.")
+            return
+        input_blend = Path(input_raw)
+        if not input_blend.exists():
+            self.show_error("Sort bones failed", f"Spine-fixed .blend not found:\n{input_blend}")
+            return
+        self.sort_log.clear()
+        self.set_sort_progress(0, "Queued", "Preparing bone merge", "#58a6ff")
+        self.sort_analyze_button.setEnabled(False)
+        self.sort_apply_button.setEnabled(False)
+        self.sort_manual_merge_button.setEnabled(False)
+        self.detect_spine_blend_button.setEnabled(False)
+        self.sort_cancel_button.setEnabled(True)
+        self.sort_blend_label.clear()
+        self.sort_report_label.clear()
+        self.worker = SortBonesWorker(str(input_blend), self.current_sort_plan, self.sort_limit_spin.value())
+        self.worker.log.connect(self.append_sort_log)
+        self.worker.done.connect(self.sort_bones_done)
+        self.worker.failed.connect(self.sort_failed)
+        self.worker.start()
+
+    def sort_bones_done(self, result: dict) -> None:
+        self.sort_analyze_button.setEnabled(True)
+        self.sort_apply_button.setEnabled(True)
+        self.sort_manual_merge_button.setEnabled(bool(self.sort_manual_merge_blend_path and Path(self.sort_manual_merge_blend_path).exists()))
+        self.detect_spine_blend_button.setEnabled(True)
+        self.sort_cancel_button.setEnabled(False)
+        self.sort_blend_label.setText(str(result.get("output_blend", "")))
+        self.sort_output_edit.setText(str(result.get("sort_dir", "")))
+        self.sort_plan_label.setText(str(result.get("plan", "")))
+        self.sort_log_label.setText(str(result.get("log", "")))
+        self.sort_report_label.setText(str(result.get("report", "")))
+        self.open_sort_folder_button.setEnabled(True)
+        report = result.get("report_data") if isinstance(result.get("report_data"), dict) else {}
+        after = report.get("after", {}) if isinstance(report.get("after"), dict) else {}
+        if isinstance(after, dict):
+            self.current_sort_analysis = after
+        validation = report.get("applied", {}).get("validation", {}) if isinstance(report.get("applied"), dict) else {}
+        if isinstance(validation, dict) and validation.get("ok"):
+            self.set_sort_progress(100, "Sort Complete", str(result.get("output_blend", "")), "#2ea043")
+            self.complete_step_from_result(
+                4,
+                result,
+                "sort_dir",
+                ["output_blend", "plan"],
+                report_key="report",
+                validation=validation,
+            )
+            QtWidgets.QMessageBox.information(self, "Sort bones complete", "The bone count was reduced and validated for the Source limit.")
+        else:
+            self.set_sort_progress(100, "Sort Complete With Warnings", str(result.get("output_blend", "")), "#d29922")
+        self.refresh_sort_preview()
+        self.update_sort_summary()
+        if result.get("output_blend") and hasattr(self, "material_input_row"):
+            self.material_input_row.set_value(str(result["output_blend"]))
+            self.update_material_output_preview(Path(str(result["output_blend"])))
+
+    def on_material_input_changed(self, value: str) -> None:
+        self.current_material_scan = None
+        self.current_material_plan = None
+        self.current_material_merge_plan = None
+        self.material_sorted_blend_path = ""
+        self.material_apply_button.setEnabled(False)
+        self.material_merge_button.setEnabled(False)
+        self.material_table.setRowCount(0)
+        self.material_merge_table.setRowCount(0)
+        if self.material_preview is not None:
+            self.material_preview.clear()
+        if value.strip():
+            self.update_material_output_preview(Path(value.strip()))
+        else:
+            self.material_output_edit.clear()
+            self.open_material_folder_button.setEnabled(False)
+        self.update_material_summary()
+        self.save_settings()
+
+    def update_material_output_preview(self, input_blend: Path) -> None:
+        try:
+            material_dir, output_blend, final_blend, scan_json, plan_json, merge_plan_json, report_json, _merge_report = core.material_paths_for_sort_bones_blend(input_blend)
+            self.material_output_edit.setText(str(material_dir))
+            self.open_material_folder_button.setEnabled(material_dir.exists())
+            self.material_scan_label.setText(str(scan_json) if scan_json.exists() else "")
+            self.material_plan_label.setText(str(plan_json) if plan_json.exists() else "")
+            self.material_merge_plan_label.setText(str(merge_plan_json) if merge_plan_json.exists() else "")
+            self.material_report_label.setText(str(report_json) if report_json.exists() else "")
+            if output_blend.exists():
+                self.material_sorted_blend_label.setText(str(output_blend))
+                self.material_sorted_blend_path = str(output_blend)
+            if final_blend.exists():
+                self.material_final_blend_label.setText(str(final_blend))
+        except Exception:
+            self.material_output_edit.clear()
+            self.open_material_folder_button.setEnabled(False)
+
+    def detect_step4_output(self) -> None:
+        candidates: list[Path] = []
+        sort_text = self.sort_blend_label.text().strip() if hasattr(self, "sort_blend_label") else ""
+        if sort_text:
+            candidates.append(Path(sort_text))
+        sort_dir_text = self.sort_output_edit.text().strip() if hasattr(self, "sort_output_edit") else ""
+        if sort_dir_text:
+            candidates.extend(sorted(Path(sort_dir_text).glob("*.blend")))
+        workspace_text = self.workspace_edit.text().strip() if hasattr(self, "workspace_edit") else ""
+        if workspace_text:
+            candidates.extend(sorted(Path(workspace_text).glob("4_sort_bones/*.blend")))
+        stored = self.settings_store.value("material_input_blend", "", str)
+        if stored:
+            candidates.append(Path(str(stored)))
+        for candidate in candidates:
+            if candidate.exists():
+                self.material_input_row.set_value(str(candidate))
+                self.switch_to_step(5)
+                return
+        self.show_error("Detect Step 4 Output", "No existing step-4 .blend output was found. Run step 4 or browse to the bone-sorted .blend.")
+
+    def start_material_scan(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        if not self.ensure_step_can_run(5):
+            return
+        self.set_step_working(5, "Preparing Step 5 material scan")
+        input_raw = self.material_input_row.value()
+        if not input_raw:
+            self.show_error("Scan materials failed", "Select the step-4 bone-sorted .blend first.")
+            return
+        input_blend = Path(input_raw)
+        if not input_blend.exists():
+            self.show_error("Scan materials failed", f"Bone-sorted .blend not found:\n{input_blend}")
+            return
+        self.current_material_scan = None
+        self.current_material_plan = None
+        self.current_material_merge_plan = None
+        self.material_log.clear()
+        self.material_table.setRowCount(0)
+        self.material_merge_table.setRowCount(0)
+        if self.material_preview is not None:
+            self.material_preview.clear()
+        if hasattr(self, "material_merge_preview") and self.material_merge_preview is not None:
+            self.material_merge_preview.clear()
+        self.clear_material_texture_preview()
+        self.clear_material_merge_texture_preview()
+        self.set_material_progress(0, "Queued", "Preparing material scan", "#58a6ff")
+        self.material_scan_button.setEnabled(False)
+        self.material_apply_button.setEnabled(False)
+        self.detect_sort_blend_button.setEnabled(False)
+        self.material_cancel_button.setEnabled(True)
+        self.worker = MaterialScanWorker(str(input_blend), self.material_limit_spin.value())
+        self.worker.log.connect(self.append_material_log)
+        self.worker.done.connect(self.material_scan_done)
+        self.worker.failed.connect(self.material_failed)
+        self.worker.start()
+
+    def material_scan_done(self, result: dict) -> None:
+        self.material_scan_button.setEnabled(True)
+        self.material_apply_button.setEnabled(True)
+        self.detect_sort_blend_button.setEnabled(True)
+        self.material_cancel_button.setEnabled(False)
+        self.current_material_scan = result.get("scan_data") if isinstance(result.get("scan_data"), dict) else None
+        self.current_material_plan = result.get("plan_data") if isinstance(result.get("plan_data"), dict) else None
+        self.material_output_edit.setText(str(result.get("material_dir", "")))
+        self.material_scan_label.setText(str(result.get("scan", "")))
+        self.material_plan_label.setText(str(result.get("plan", "")))
+        self.material_log_label.setText(str(result.get("log", "")))
+        self.open_material_folder_button.setEnabled(True)
+        self.populate_material_table()
+        self.refresh_material_preview()
+        self.update_material_summary()
+        self.set_material_progress(100, "Scan Complete", str(result.get("scan", "")), "#2ea043")
+        self.clear_step_state(5, "Step 5 scan complete")
+
+    def material_failed(self, message: str) -> None:
+        self.material_scan_button.setEnabled(True)
+        self.material_apply_button.setEnabled(self.current_material_plan is not None)
+        self.material_merge_button.setEnabled(self.current_material_merge_plan is not None and bool(self.material_sorted_blend_path))
+        self.detect_sort_blend_button.setEnabled(True)
+        self.material_cancel_button.setEnabled(False)
+        self.set_material_progress(self.material_progress_bar.value(), "Material Step Failed", "See the log for details.", "#f85149")
+        self.set_step_failed(5, "Step 5 material step failed")
+        self.show_error("Material step failed", message)
+
+    def cancel_material(self) -> None:
+        if self.worker and self.worker.isRunning() and hasattr(self.worker, "cancel"):
+            self.worker.cancel()  # type: ignore[attr-defined]
+            self.append_material_log("Cancel requested.")
+
+    def material_entries(self) -> list[dict[str, object]]:
+        if not self.current_material_plan:
+            return []
+        entries = self.current_material_plan.get("materials", [])
+        return [entry for entry in entries if isinstance(entry, dict)] if isinstance(entries, list) else []
+
+    @staticmethod
+    def material_color_icon(raw_color: object) -> QtGui.QIcon:
+        values = raw_color if isinstance(raw_color, list) else [0.75, 0.75, 0.75, 1.0]
+        vals = [float(values[index]) if index < len(values) else 1.0 for index in range(4)]
+        pixmap = QtGui.QPixmap(22, 22)
+        pixmap.fill(QtCore.Qt.GlobalColor.transparent)
+        painter = QtGui.QPainter(pixmap)
+        try:
+            painter.setBrush(QtGui.QColor.fromRgbF(max(0.0, min(1.0, vals[0])), max(0.0, min(1.0, vals[1])), max(0.0, min(1.0, vals[2])), max(0.05, min(1.0, vals[3]))))
+            painter.setPen(QtGui.QPen(QtGui.QColor(20, 20, 20), 1))
+            painter.drawRect(2, 2, 18, 18)
+        finally:
+            painter.end()
+        return QtGui.QIcon(pixmap)
+
+    @staticmethod
+    def material_texture_key(path: Path) -> str:
+        return path.resolve().as_posix().lower()
+
+    @staticmethod
+    def filter_manual_material_texture_warnings(raw_warnings: object) -> list[str]:
+        if not isinstance(raw_warnings, list):
+            return []
+        filtered: list[str] = []
+        for warning in raw_warnings:
+            text = str(warning)
+            lowered = text.lower()
+            if "no base-color image was found" in lowered:
+                continue
+            if "base-color fallback" in lowered:
+                continue
+            if "no base texture but kept" in lowered:
+                continue
+            if "shadow-like material with no base texture" in lowered:
+                continue
+            if "defaulting to removed" in lowered:
+                continue
+            filtered.append(text)
+        return filtered
+
+    def populate_material_table(self) -> None:
+        entries = self.material_entries()
+        self._updating_material_table = True
+        self.material_table.setRowCount(len(entries))
+        for row, entry in enumerate(entries):
+            uid = str(entry.get("uid") or "")
+            keep_item = QtWidgets.QTableWidgetItem("")
+            keep_item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsUserCheckable | QtCore.Qt.ItemFlag.ItemIsSelectable)
+            keep_item.setCheckState(QtCore.Qt.CheckState.Checked if entry.get("keep", True) else QtCore.Qt.CheckState.Unchecked)
+            keep_item.setData(QtCore.Qt.ItemDataRole.UserRole, uid)
+            self.material_table.setItem(row, 0, keep_item)
+            for column, value in (
+                (1, str(entry.get("material_name", ""))),
+                (2, str(entry.get("proposed_name", ""))),
+                (3, f"{int(entry.get('vertex_count', 0) or 0):,}"),
+                (4, f"{int(entry.get('face_count', 0) or 0):,}"),
+                (5, str(entry.get("base_color_file") or entry.get("base_color_path") or "")),
+                (7, "; ".join(str(w) for w in entry.get("warnings", []) if w) if isinstance(entry.get("warnings"), list) else ""),
+            ):
+                item = QtWidgets.QTableWidgetItem(value)
+                if value:
+                    item.setToolTip(value)
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, uid)
+                if column == 2:
+                    item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsEditable)
+                else:
+                    item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                self.material_table.setItem(row, column, item)
+            browse_button = QtWidgets.QPushButton("Browse")
+            browse_button.setToolTip("Select a base color texture for this material.")
+            browse_button.setProperty("material_uid", uid)
+            browse_button.clicked.connect(lambda _checked=False, material_uid=uid: self.browse_material_base_texture(material_uid))
+            self.material_table.setCellWidget(row, 6, browse_button)
+        self._updating_material_table = False
+        for row in range(self.material_table.rowCount()):
+            self.material_table.setRowHeight(row, 38)
+
+    def material_plan_entries_for_uid(self, uid: str) -> list[dict[str, object]]:
+        matches: list[dict[str, object]] = []
+        seen: set[int] = set()
+        for container in (self.current_material_plan, self.current_material_scan):
+            if not isinstance(container, dict):
+                continue
+            entries = container.get("materials", [])
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict) or str(entry.get("uid") or "") != uid:
+                    continue
+                marker = id(entry)
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                matches.append(entry)
+        return matches
+
+    def reset_material_combine_for_manual_texture(self, uid: str) -> None:
+        if not self.current_material_plan:
+            return
+        for entry in self.material_entries():
+            entry_uid = str(entry.get("uid") or "")
+            if not entry_uid:
+                continue
+            if entry_uid == uid or str(entry.get("combine_target_uid") or "") == uid:
+                entry["combine_target_uid"] = entry_uid
+        operations = self.current_material_plan.get("combine_operations", [])
+        if isinstance(operations, list):
+            self.current_material_plan["combine_operations"] = [
+                operation
+                for operation in operations
+                if not (
+                    isinstance(operation, dict)
+                    and (
+                        str(operation.get("source_uid") or "") == uid
+                        or str(operation.get("target_uid") or "") == uid
+                    )
+                )
+            ]
+
+    def persist_current_material_plan(self) -> None:
+        if not self.current_material_plan:
+            return
+        raw_path = self.material_plan_label.text().strip() if hasattr(self, "material_plan_label") else ""
+        if not raw_path:
+            return
+        try:
+            plan_path = Path(raw_path)
+            plan_path.parent.mkdir(parents=True, exist_ok=True)
+            plan_path.write_text(json.dumps(self.current_material_plan, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            self.append_material_log(f"Warning: could not update material plan JSON after manual texture selection: {exc}")
+
+    def browse_material_base_texture(self, uid: str) -> None:
+        self.sync_material_table_to_plan()
+        entry = self.entry_for_material_uid(uid)
+        if entry is None:
+            return
+        start_dir = ""
+        current_path = str(entry.get("base_color_path") or "").strip()
+        if current_path and Path(current_path).exists():
+            start_dir = str(Path(current_path).parent)
+        else:
+            input_raw = self.material_input_row.value().strip() if hasattr(self, "material_input_row") else ""
+            if input_raw:
+                start_dir = str(Path(input_raw).parent)
+        file_name, _selected_filter = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select Base Color Texture",
+            start_dir,
+            "Image files (*.png *.jpg *.jpeg *.tga *.bmp *.tif *.tiff *.webp);;All files (*.*)",
+        )
+        if not file_name:
+            return
+        texture_path = Path(file_name)
+        if not texture_path.exists():
+            self.show_error("Select Base Color Texture", f"Texture file not found:\n{texture_path}")
+            return
+        resolved_path = texture_path.resolve()
+        updates = {
+            "has_base_texture": True,
+            "base_color_path": str(resolved_path),
+            "base_color_file": resolved_path.name,
+            "base_color_key": self.material_texture_key(resolved_path),
+            "image_name": resolved_path.name,
+            "packed": False,
+            "manual_base_texture": True,
+        }
+        for target_entry in self.material_plan_entries_for_uid(uid):
+            target_entry.update(updates)
+            target_entry["warnings"] = self.filter_manual_material_texture_warnings(target_entry.get("warnings", []))
+            target_entry["keep"] = True
+        self.reset_material_combine_for_manual_texture(uid)
+        self.persist_current_material_plan()
+        self.populate_material_table()
+        self.refresh_material_preview()
+        updated_entry = self.entry_for_material_uid(uid)
+        if updated_entry:
+            self.show_material_texture_preview(updated_entry)
+        material_name = str(entry.get("material_name") or uid)
+        self.append_material_log(f"Manual base-color texture selected for {material_name}: {resolved_path}")
+        self.update_material_summary()
+
+    def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        if hasattr(self, "material_table") and watched is self.material_table.viewport():
+            if event.type() == QtCore.QEvent.Type.MouseMove:
+                try:
+                    pos = event.position().toPoint()  # type: ignore[attr-defined]
+                except Exception:
+                    pos = event.pos()  # type: ignore[attr-defined]
+                row = self.material_table.rowAt(pos.y())
+                self.update_material_texture_preview_for_row(row)
+            elif event.type() == QtCore.QEvent.Type.Leave:
+                self.clear_material_texture_preview()
+        if hasattr(self, "material_merge_table") and watched is self.material_merge_table.viewport():
+            if event.type() == QtCore.QEvent.Type.MouseMove:
+                try:
+                    pos = event.position().toPoint()  # type: ignore[attr-defined]
+                except Exception:
+                    pos = event.pos()  # type: ignore[attr-defined]
+                row = self.material_merge_table.rowAt(pos.y())
+                self.update_material_merge_texture_preview_for_row(row)
+            elif event.type() == QtCore.QEvent.Type.Leave:
+                self.clear_material_merge_texture_preview()
+        if hasattr(self, "bodygroup_table") and watched is self.bodygroup_table.viewport():
+            if event.type() == QtCore.QEvent.Type.MouseMove:
+                try:
+                    pos = event.position().toPoint()  # type: ignore[attr-defined]
+                except Exception:
+                    pos = event.pos()  # type: ignore[attr-defined]
+                row = self.bodygroup_table.rowAt(pos.y())
+                self.update_bodygroup_hover_for_row(row)
+            elif event.type() == QtCore.QEvent.Type.Leave:
+                self.clear_bodygroup_hover()
+        if hasattr(self, "flex_table") and watched is self.flex_table.viewport():
+            if event.type() == QtCore.QEvent.Type.MouseMove:
+                try:
+                    pos = event.position().toPoint()  # type: ignore[attr-defined]
+                except Exception:
+                    pos = event.pos()  # type: ignore[attr-defined]
+                row = self.flex_table.rowAt(pos.y())
+                self.update_flex_hover_for_row(row)
+            elif event.type() == QtCore.QEvent.Type.Leave:
+                self.clear_flex_hover()
+        if hasattr(self, "collision_table") and watched is self.collision_table.viewport():
+            if event.type() == QtCore.QEvent.Type.MouseMove:
+                try:
+                    pos = event.position().toPoint()  # type: ignore[attr-defined]
+                except Exception:
+                    pos = event.pos()  # type: ignore[attr-defined]
+                row = self.collision_table.rowAt(pos.y())
+                self.update_collision_hover_for_row(row)
+            elif event.type() == QtCore.QEvent.Type.Leave:
+                self.clear_collision_hover()
+        if hasattr(self, "collision_bone_table") and watched is self.collision_bone_table.viewport():
+            if event.type() == QtCore.QEvent.Type.MouseMove:
+                try:
+                    pos = event.position().toPoint()  # type: ignore[attr-defined]
+                except Exception:
+                    pos = event.pos()  # type: ignore[attr-defined]
+                row = self.collision_bone_table.rowAt(pos.y())
+                self.update_collision_bone_hover_for_row(row)
+            elif event.type() == QtCore.QEvent.Type.Leave:
+                self.clear_collision_bone_hover()
+        if hasattr(self, "collision_source_table") and watched is self.collision_source_table.viewport():
+            if event.type() == QtCore.QEvent.Type.MouseMove:
+                try:
+                    pos = event.position().toPoint()  # type: ignore[attr-defined]
+                except Exception:
+                    pos = event.pos()  # type: ignore[attr-defined]
+                row = self.collision_source_table.rowAt(pos.y())
+                self.update_collision_source_hover_for_row(row)
+            elif event.type() == QtCore.QEvent.Type.Leave:
+                self.clear_collision_source_hover()
+        if hasattr(self, "vrd_table") and watched is self.vrd_table.viewport():
+            if event.type() == QtCore.QEvent.Type.MouseMove:
+                try:
+                    pos = event.position().toPoint()  # type: ignore[attr-defined]
+                except Exception:
+                    pos = event.pos()  # type: ignore[attr-defined]
+                row = self.vrd_table.rowAt(pos.y())
+                self.update_vrd_hover_for_row(row)
+            elif event.type() == QtCore.QEvent.Type.Leave:
+                self.clear_vrd_hover()
+        if hasattr(self, "qc_bone_table") and watched is self.qc_bone_table.viewport():
+            if event.type() == QtCore.QEvent.Type.MouseMove:
+                try:
+                    pos = event.position().toPoint()  # type: ignore[attr-defined]
+                except Exception:
+                    pos = event.pos()  # type: ignore[attr-defined]
+                row = self.qc_bone_table.rowAt(pos.y())
+                self.update_qc_bone_hover_for_row(row)
+            elif event.type() == QtCore.QEvent.Type.Leave:
+                self.clear_qc_bone_hover()
+        return super().eventFilter(watched, event)
+
+    def entry_for_material_uid(self, uid: str) -> dict[str, object] | None:
+        for entry in self.material_entries():
+            if str(entry.get("uid") or "") == uid:
+                return entry
+        return None
+
+    def entry_for_merge_uid(self, uid: str) -> dict[str, object] | None:
+        for entry in self.merge_entries():
+            if str(entry.get("uid") or "") == uid:
+                return entry
+        return None
+
+    def update_material_texture_preview_for_row(self, row: int) -> None:
+        if row < 0 or row >= self.material_table.rowCount():
+            self.clear_material_texture_preview()
+            return
+        item = self.material_table.item(row, 0)
+        uid = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "") if item else ""
+        if uid == self._hover_material_uid:
+            return
+        self._hover_material_uid = uid
+        if self.material_preview is not None:
+            self.material_preview.set_hovered_material(uid)
+        entry = self.entry_for_material_uid(uid)
+        if not entry:
+            self.clear_material_texture_preview()
+            return
+        self.show_material_texture_preview(entry)
+
+    def clear_material_texture_preview(self) -> None:
+        self._hover_material_uid = ""
+        if hasattr(self, "material_preview") and self.material_preview is not None:
+            self.material_preview.set_hovered_material("")
+        if hasattr(self, "material_texture_preview_label"):
+            self.material_texture_preview_label.clear()
+            self.material_texture_preview_label.setText("Hover a material row")
+        if hasattr(self, "material_texture_info_label"):
+            self.set_material_texture_info("Base color texture preview", "", "", "")
+
+    def update_material_merge_texture_preview_for_row(self, row: int) -> None:
+        if row < 0 or row >= self.material_merge_table.rowCount():
+            self.clear_material_merge_texture_preview()
+            return
+        item = self.material_merge_table.item(row, 0)
+        uid = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "") if item else ""
+        if uid == self._hover_merge_material_uid:
+            return
+        self._hover_merge_material_uid = uid
+        if hasattr(self, "material_merge_preview") and self.material_merge_preview is not None:
+            self.material_merge_preview.set_hovered_material(uid)
+        entry = self.entry_for_merge_uid(uid)
+        if not entry:
+            self.clear_material_merge_texture_preview()
+            return
+        self.show_material_texture_preview(entry, self.material_merge_texture_preview_label, self.material_merge_texture_info_label)
+
+    def clear_material_merge_texture_preview(self) -> None:
+        self._hover_merge_material_uid = ""
+        if hasattr(self, "material_merge_preview") and self.material_merge_preview is not None:
+            self.material_merge_preview.set_hovered_material("")
+        if hasattr(self, "material_merge_texture_preview_label"):
+            self.material_merge_texture_preview_label.clear()
+            self.material_merge_texture_preview_label.setText("Hover a material row")
+        if hasattr(self, "material_merge_texture_info_label"):
+            self.set_material_texture_info("Base color texture preview", "", "", "", self.material_merge_texture_info_label)
+
+    @staticmethod
+    def load_texture_pixmap(path: Path) -> QtGui.QPixmap:
+        reader = QtGui.QImageReader(str(path))
+        reader.setAutoTransform(True)
+        image = reader.read()
+        if image.isNull():
+            try:
+                from PIL import Image
+
+                with Image.open(path) as pil_image:
+                    rgba = pil_image.convert("RGBA")
+                    data = rgba.tobytes("raw", "RGBA")
+                    image = QtGui.QImage(data, rgba.width, rgba.height, QtGui.QImage.Format.Format_RGBA8888).copy()
+            except Exception:
+                image = QtGui.QImage()
+        return QtGui.QPixmap.fromImage(image) if not image.isNull() else QtGui.QPixmap()
+
+    def set_material_texture_info(self, line1: str, line2: str, line3: str, full_path: str, info_label: QtWidgets.QLabel | None = None) -> None:
+        label = info_label or self.material_texture_info_label
+        width = max(160, int(label.width()) - 20) if label is not None else 420
+        metrics = label.fontMetrics()
+        path_line = metrics.elidedText(full_path, QtCore.Qt.TextElideMode.ElideMiddle, width) if full_path else ""
+        text = "\n".join((line1 or "", line2 or "", line3 or "", path_line))
+        label.setText(text)
+        tooltip_lines = [line for line in (line1, line2, line3, full_path) if line]
+        label.setToolTip("\n".join(tooltip_lines))
+
+    def show_material_texture_preview(
+        self,
+        entry: dict[str, object],
+        preview_label: QtWidgets.QLabel | None = None,
+        info_label: QtWidgets.QLabel | None = None,
+    ) -> None:
+        preview = preview_label or self.material_texture_preview_label
+        info = info_label or self.material_texture_info_label
+        name = str(entry.get("current_name") or entry.get("material_name") or "")
+        raw_path = str(entry.get("base_color_path") or "")
+        filename = str(entry.get("base_color_file") or Path(raw_path).name or "")
+        if not raw_path:
+            preview.clear()
+            preview.setText("No texture")
+            self.set_material_texture_info(name, "No base color texture was resolved.", "", "", info)
+            return
+        path = Path(raw_path)
+        if not path.exists():
+            preview.clear()
+            preview.setText("Missing")
+            self.set_material_texture_info(name, "Missing base color texture", filename, raw_path, info)
+            return
+        pixmap = self.load_texture_pixmap(path)
+        if pixmap.isNull():
+            preview.clear()
+            preview.setText("Cannot render")
+            self.set_material_texture_info(name, "Could not render texture", filename, raw_path, info)
+            return
+        target = preview.contentsRect().size()
+        if target.width() <= 8 or target.height() <= 8:
+            target = QtCore.QSize(220, 160)
+        scaled = pixmap.scaled(target, QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation)
+        preview.setText("")
+        preview.setPixmap(scaled)
+        self.set_material_texture_info(name, filename, f"{pixmap.width():,} x {pixmap.height():,}", raw_path, info)
+
+    def on_material_table_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
+        if self._updating_material_table or not self.current_material_plan:
+            return
+        uid = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+        if not uid:
+            return
+        changed_keep: bool | None = None
+        changed_name: str | None = None
+        for entry in self.material_entries():
+            if str(entry.get("uid") or "") != uid:
+                continue
+            if item.column() == 0:
+                changed_keep = item.checkState() == QtCore.Qt.CheckState.Checked
+                entry["keep"] = changed_keep
+            elif item.column() == 2:
+                changed_name = item.text().strip()
+                entry["proposed_name"] = changed_name
+            break
+        self.update_material_preview_entry(uid, keep=changed_keep, proposed_name=changed_name)
+        self.update_material_summary()
+
+    def on_material_table_selection_changed(self) -> None:
+        return
+
+    def sync_material_table_to_plan(self) -> None:
+        if not self.current_material_plan or not hasattr(self, "material_table"):
+            return
+        entries_by_uid = {str(entry.get("uid") or ""): entry for entry in self.material_entries()}
+        for row in range(self.material_table.rowCount()):
+            keep_item = self.material_table.item(row, 0)
+            if keep_item is None:
+                continue
+            uid = str(keep_item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+            entry = entries_by_uid.get(uid)
+            if entry is None:
+                continue
+            entry["keep"] = keep_item.checkState() == QtCore.Qt.CheckState.Checked
+            name_item = self.material_table.item(row, 2)
+            if name_item is not None:
+                entry["proposed_name"] = name_item.text().strip()
+
+    def refresh_material_preview(self) -> None:
+        if self.material_preview is not None:
+            self.material_preview.set_material_data(self.current_material_scan, self.current_material_plan)
+            self.material_preview.set_hovered_material(self._hover_material_uid)
+            self.material_preview.set_selected_material("")
+        self.refresh_material_merge_preview()
+
+    def update_material_preview_entry(self, uid: str, keep: bool | None = None, proposed_name: str | None = None) -> None:
+        updates: dict[str, object] = {}
+        if keep is not None:
+            updates["keep"] = bool(keep)
+        if proposed_name is not None:
+            updates["proposed_name"] = proposed_name
+        if not updates:
+            return
+        if self.material_preview is not None and hasattr(self.material_preview, "update_material_entry"):
+            self.material_preview.update_material_entry(uid, **updates)
+        if hasattr(self, "material_merge_preview") and self.material_merge_preview is not None and hasattr(self.material_merge_preview, "update_material_entry"):
+            self.material_merge_preview.update_material_entry(uid, **updates)
+
+    def merge_preview_plan(self) -> dict[str, object] | None:
+        if not self.current_material_merge_plan:
+            return None
+        scan_by_uid = {str(entry.get("uid") or ""): entry for entry in self.material_entries()}
+        preview_entries: list[dict[str, object]] = []
+        for entry in self.merge_entries():
+            uid = str(entry.get("uid") or "")
+            merged = dict(scan_by_uid.get(uid, {}))
+            merged.update(entry)
+            merged["keep"] = bool(entry.get("enabled", True))
+            merged["material_name"] = str(entry.get("current_name") or entry.get("material_name") or merged.get("material_name") or uid)
+            merged["proposed_name"] = str(entry.get("final_name") or merged.get("proposed_name") or merged["material_name"])
+            preview_entries.append(merged)
+        return {"materials": preview_entries}
+
+    def refresh_material_merge_preview(self) -> None:
+        if not hasattr(self, "material_merge_preview") or self.material_merge_preview is None:
+            return
+        self.material_merge_preview.set_material_data(self.current_material_scan, self.merge_preview_plan())
+        self.material_merge_preview.set_hovered_material(self._hover_merge_material_uid)
+        self.material_merge_preview.set_selected_material("")
+
+    @staticmethod
+    def safe_material_name(name: str) -> bool:
+        return bool(re.fullmatch(r"[A-Za-z0-9_]+", name or ""))
+
+    @staticmethod
+    def material_alpha_value(entry: dict[str, object], default: float = 1.0) -> float:
+        value = entry.get("alpha", default)
+        if value in (None, ""):
+            return float(default)
+        return float(value)
+
+    def update_material_summary(self) -> None:
+        if not self.current_material_plan:
+            self.material_summary_label.setText(
+                "Scan the step-4 blend, review which material regions to keep, then proceed to cleanup and texture-based combining."
+            )
+            return
+        entries = self.material_entries()
+        kept = sum(1 for entry in entries if entry.get("keep", True))
+        removed = len(entries) - kept
+        combine_ops = self.current_material_plan.get("combine_operations", [])
+        combine_count = len(combine_ops) if isinstance(combine_ops, list) else 0
+        alpha = sum(1 for entry in entries if self.material_alpha_value(entry) < 0.999)
+        self.material_summary_label.setText(
+            f"Materials: {len(entries):,} | Kept: {kept:,} | Removed: {removed:,} | First-round combines: {combine_count:,} | Alpha materials: {alpha:,} | Final target: {self.material_limit_spin.value():,}"
+        )
+
+    def validate_material_plan(self) -> None:
+        if not self.current_material_plan:
+            self.show_error("Validate materials", "Run Scan Materials before validating the material plan.")
+            return
+        self.sync_material_table_to_plan()
+        errors: list[str] = []
+        warnings: list[str] = []
+        seen: set[str] = set()
+        for entry in self.material_entries():
+            if not entry.get("keep", True):
+                continue
+            name = str(entry.get("proposed_name") or "").strip()
+            uid = str(entry.get("uid") or "")
+            if not self.safe_material_name(name):
+                errors.append(f"{uid}: unsafe proposed name: {name}")
+            if name in seen:
+                errors.append(f"{uid}: duplicate proposed name: {name}")
+            seen.add(name)
+            if not entry.get("has_base_texture"):
+                warnings.append(f"{entry.get('material_name')}: no base texture but kept.")
+            alpha = self.material_alpha_value(entry)
+            if alpha < 0.999:
+                warnings.append(f"{entry.get('material_name')}: alpha {alpha:.3f}.")
+        if errors:
+            self.show_error("Material validation", "Blocking errors:\n" + "\n".join(f"- {error}" for error in errors))
+            return
+        detail = "The current material cleanup plan is internally consistent."
+        if warnings:
+            detail += "\n\nWarnings:\n" + "\n".join(f"- {warning}" for warning in warnings[:24])
+        QtWidgets.QMessageBox.information(self, "Material validation", detail)
+
+    def start_material_apply(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        if not self.ensure_step_can_run(5):
+            return
+        self.set_step_working(5, "Preparing Step 5 material cleanup")
+        input_raw = self.material_input_row.value()
+        if not input_raw:
+            self.show_error("Apply materials failed", "Select the step-4 bone-sorted .blend first.")
+            return
+        if not self.current_material_plan:
+            self.show_error("Apply materials failed", "Run Scan Materials and confirm the material plan first.")
+            return
+        self.sync_material_table_to_plan()
+        input_blend = Path(input_raw)
+        if not input_blend.exists():
+            self.show_error("Apply materials failed", f"Bone-sorted .blend not found:\n{input_blend}")
+            return
+        self.material_log.clear()
+        self.set_material_progress(0, "Queued", "Preparing material cleanup", "#58a6ff")
+        self.material_scan_button.setEnabled(False)
+        self.material_apply_button.setEnabled(False)
+        self.detect_sort_blend_button.setEnabled(False)
+        self.material_cancel_button.setEnabled(True)
+        self.worker = MaterialApplyWorker(str(input_blend), self.current_material_plan, self.material_limit_spin.value())
+        self.worker.log.connect(self.append_material_log)
+        self.worker.done.connect(self.material_apply_done)
+        self.worker.failed.connect(self.material_failed)
+        self.worker.start()
+
+    def material_apply_done(self, result: dict) -> None:
+        self.material_scan_button.setEnabled(True)
+        self.material_apply_button.setEnabled(True)
+        self.detect_sort_blend_button.setEnabled(True)
+        self.material_cancel_button.setEnabled(False)
+        self.material_sorted_blend_path = str(result.get("output_blend", ""))
+        self.material_sorted_blend_label.setText(self.material_sorted_blend_path)
+        self.material_final_blend_label.setText("")
+        self.material_output_edit.setText(str(result.get("material_dir", "")))
+        self.material_plan_label.setText(str(result.get("plan", "")))
+        self.material_merge_plan_label.setText(str(result.get("merge_plan", "")))
+        self.material_log_label.setText(str(result.get("log", "")))
+        self.material_report_label.setText(str(result.get("report", "")))
+        self.material_mapping_label.setText(str(result.get("materials_json", "")))
+        self.open_material_folder_button.setEnabled(True)
+        report = result.get("report_data") if isinstance(result.get("report_data"), dict) else {}
+        after = report.get("after") if isinstance(report.get("after"), dict) else None
+        if isinstance(after, dict):
+            self.current_material_scan = after
+            self.current_material_plan = {"materials": after.get("materials", [])}
+        self.current_material_merge_plan = result.get("merge_plan_data") if isinstance(result.get("merge_plan_data"), dict) else None
+        self.populate_material_table()
+        self.populate_material_merge_table()
+        self.refresh_material_preview()
+        self.update_material_summary()
+        self.update_material_merge_summary()
+        post_count = len(self.material_entries())
+        limit = self.material_limit_spin.value()
+        merge_required = post_count > limit
+        open_merge = merge_required or self.material_always_merge_check.isChecked()
+        self.material_merge_button.setEnabled(self.current_material_merge_plan is not None and bool(self.material_sorted_blend_path))
+        if not merge_required:
+            self.material_final_blend_label.setText(self.material_sorted_blend_path)
+            if hasattr(self, "bodygroup_input_row") and self.material_sorted_blend_path:
+                self.bodygroup_input_row.set_value(self.material_sorted_blend_path)
+            self.complete_step_from_result(
+                5,
+                result,
+                "material_dir",
+                ["output_blend", "materials_json"],
+                report_key="report",
+                validation={"ok": True, "material_count": post_count, "merge_required": False},
+            )
+        if open_merge:
+            self.material_subtabs.setCurrentIndex(1)
+            title = "Cleanup Complete - Merge Required" if merge_required else "Cleanup Complete - Optional Merge"
+            detail = f"{post_count:,} materials after combining; limit is {limit:,}."
+            self.set_material_progress(100, title, detail, "#d29922" if merge_required else "#2ea043")
+        else:
+            self.material_subtabs.setCurrentIndex(0)
+            self.set_material_progress(100, "Cleanup Complete - Step 5 Ready", self.material_sorted_blend_path, "#2ea043")
+
+    def merge_entries(self) -> list[dict[str, object]]:
+        if not self.current_material_merge_plan:
+            return []
+        entries = self.current_material_merge_plan.get("materials", [])
+        return [entry for entry in entries if isinstance(entry, dict)] if isinstance(entries, list) else []
+
+    def populate_material_merge_table(self) -> None:
+        entries = self.merge_entries()
+        self._updating_material_merge_table = True
+        self.material_merge_table.setRowCount(len(entries))
+        for row, entry in enumerate(entries):
+            uid = str(entry.get("uid") or "")
+            use_item = QtWidgets.QTableWidgetItem("")
+            use_item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsUserCheckable | QtCore.Qt.ItemFlag.ItemIsSelectable)
+            use_item.setCheckState(QtCore.Qt.CheckState.Checked if entry.get("enabled", True) else QtCore.Qt.CheckState.Unchecked)
+            use_item.setData(QtCore.Qt.ItemDataRole.UserRole, uid)
+            self.material_merge_table.setItem(row, 0, use_item)
+            values = [
+                str(int(entry.get("group", 1) or 1)),
+                str(entry.get("final_name", "")),
+                str(entry.get("current_name") or entry.get("material_name") or ""),
+                f"{int(entry.get('vertex_count', 0) or 0):,}",
+                f"{int(entry.get('face_count', 0) or 0):,}",
+                str(entry.get("base_color_file") or entry.get("base_color_path") or ""),
+                "; ".join(str(w) for w in entry.get("warnings", []) if w) if isinstance(entry.get("warnings"), list) else "",
+            ]
+            for column, value in enumerate(values, start=1):
+                item = QtWidgets.QTableWidgetItem(value)
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, uid)
+                if column in (1, 2):
+                    item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsEditable)
+                else:
+                    item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                self.material_merge_table.setItem(row, column, item)
+        self._updating_material_merge_table = False
+        for row in range(self.material_merge_table.rowCount()):
+            self.material_merge_table.setRowHeight(row, 38)
+        self.update_material_merge_summary()
+        self.refresh_material_merge_preview()
+
+    def on_material_merge_table_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
+        if self._updating_material_merge_table or not self.current_material_merge_plan:
+            return
+        uid = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+        if not uid:
+            return
+        for entry in self.merge_entries():
+            if str(entry.get("uid") or "") != uid:
+                continue
+            if item.column() == 0:
+                entry["enabled"] = item.checkState() == QtCore.Qt.CheckState.Checked
+            elif item.column() == 1:
+                try:
+                    entry["group"] = max(1, int(item.text().strip()))
+                except ValueError:
+                    entry["group"] = 1
+                    item.setText("1")
+            elif item.column() == 2:
+                entry["final_name"] = item.text().strip()
+            break
+        self.update_material_merge_summary()
+        self.refresh_material_merge_preview()
+
+    def on_material_merge_selection_changed(self) -> None:
+        return
+
+    def update_material_merge_summary(self) -> None:
+        if not self.current_material_merge_plan:
+            self.material_merge_summary_label.setText("Run the first material cleanup step to generate an editable merge plan.")
+            return
+        entries = [entry for entry in self.merge_entries() if entry.get("enabled", True)]
+        groups = {int(entry.get("group", 0) or 0) for entry in entries}
+        self.current_material_merge_plan["estimated_final_material_count"] = len(groups)
+        required = len(entries) > self.material_limit_spin.value()
+        state = "required" if required else "optional"
+        self.material_merge_summary_label.setText(
+            f"Post-combine materials: {len(entries):,} | Merge groups: {len(groups):,} | Limit: {self.material_limit_spin.value():,} | Merging is {state}."
+        )
+
+    def validate_material_merge_plan(self) -> None:
+        if not self.current_material_merge_plan:
+            self.show_error("Validate material merge", "Run Proceed first to generate a merge plan.")
+            return
+        errors: list[str] = []
+        groups: dict[int, str] = {}
+        for entry in self.merge_entries():
+            if not entry.get("enabled", True):
+                continue
+            try:
+                group = int(entry.get("group", 0) or 0)
+            except Exception:
+                group = 0
+            name = str(entry.get("final_name") or "").strip()
+            if group <= 0:
+                errors.append(f"{entry.get('current_name')}: invalid group.")
+            if not self.safe_material_name(name):
+                errors.append(f"{entry.get('current_name')}: unsafe final name {name}.")
+            if group in groups and groups[group] != name:
+                errors.append(f"Group {group} has conflicting final names: {groups[group]} and {name}.")
+            groups[group] = name
+        final_names = list(groups.values())
+        if len(final_names) != len(set(final_names)):
+            errors.append("Final material names contain duplicates.")
+        if len(groups) > self.material_limit_spin.value():
+            errors.append(f"Final material group count remains above limit: {len(groups)} > {self.material_limit_spin.value()}.")
+        if errors:
+            self.show_error("Material merge validation", "Blocking errors:\n" + "\n".join(f"- {error}" for error in errors))
+            return
+        QtWidgets.QMessageBox.information(self, "Material merge validation", "The current material merge plan is internally consistent.")
+
+    def start_material_merge(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        if not self.ensure_step_can_run(5):
+            return
+        self.set_step_working(5, "Preparing Step 5 material merge")
+        if not self.current_material_merge_plan:
+            self.show_error("Material merge failed", "Run Proceed first to generate a merge plan.")
+            return
+        input_raw = self.material_sorted_blend_path or self.material_sorted_blend_label.text().strip()
+        if not input_raw:
+            self.show_error("Material merge failed", "No intermediate material-sorted blend is available.")
+            return
+        input_blend = Path(input_raw)
+        if not input_blend.exists():
+            self.show_error("Material merge failed", f"Intermediate .blend not found:\n{input_blend}")
+            return
+        output_blend = ""
+        post_count = len([entry for entry in self.merge_entries() if entry.get("enabled", True)])
+        if post_count <= self.material_limit_spin.value():
+            # Optional merge below the Source limit can overwrite the step-5-ready blend.
+            output_blend = str(input_blend)
+        self.material_log.clear()
+        self.set_material_progress(0, "Queued", "Preparing material merge", "#58a6ff")
+        self.material_scan_button.setEnabled(False)
+        self.material_apply_button.setEnabled(False)
+        self.material_merge_button.setEnabled(False)
+        self.detect_sort_blend_button.setEnabled(False)
+        self.material_cancel_button.setEnabled(True)
+        self.worker = MaterialMergeWorker(str(input_blend), self.current_material_merge_plan, self.material_limit_spin.value(), output_blend)
+        self.worker.log.connect(self.append_material_log)
+        self.worker.done.connect(self.material_merge_done)
+        self.worker.failed.connect(self.material_failed)
+        self.worker.start()
+
+    def material_merge_done(self, result: dict) -> None:
+        self.material_scan_button.setEnabled(True)
+        self.material_apply_button.setEnabled(True)
+        self.material_merge_button.setEnabled(True)
+        self.detect_sort_blend_button.setEnabled(True)
+        self.material_cancel_button.setEnabled(False)
+        self.material_final_blend_label.setText(str(result.get("output_blend", "")))
+        if hasattr(self, "bodygroup_input_row") and result.get("output_blend"):
+            self.bodygroup_input_row.set_value(str(result.get("output_blend", "")))
+        self.material_output_edit.setText(str(result.get("material_dir", "")))
+        self.material_merge_plan_label.setText(str(result.get("merge_plan", "")))
+        self.material_log_label.setText(str(result.get("log", "")))
+        self.material_report_label.setText(str(result.get("report", "")))
+        self.material_mapping_label.setText(str(result.get("materials_json", "")))
+        self.open_material_folder_button.setEnabled(True)
+        report = result.get("report_data") if isinstance(result.get("report_data"), dict) else {}
+        after = report.get("after") if isinstance(report.get("after"), dict) else None
+        if isinstance(after, dict):
+            self.current_material_scan = after
+            self.current_material_plan = {"materials": after.get("materials", [])}
+            self.populate_material_table()
+            self.refresh_material_preview()
+        validation = report.get("validation") if isinstance(report.get("validation"), dict) else {}
+        if validation.get("ok"):
+            self.set_material_progress(100, "Merge Complete", str(result.get("output_blend", "")), "#2ea043")
+            self.complete_step_from_result(
+                5,
+                result,
+                "material_dir",
+                ["output_blend", "materials_json"],
+                report_key="report",
+                validation=validation,
+            )
+            QtWidgets.QMessageBox.information(self, "Material merge complete", "The material plan was applied and validated.")
+        else:
+            self.set_material_progress(100, "Merge Complete With Warnings", str(result.get("output_blend", "")), "#d29922")
+
+    def set_bodygroup_progress(self, value: int, title: str, detail: str, color: str = "#58a6ff") -> None:
+        value = max(0, min(100, int(value)))
+        self.bodygroup_progress_bar.setValue(value)
+        self.bodygroup_progress_label.setText(
+            f'<span style="color:{color};">{html.escape(title)}</span> - {value}%'
+            f'<br><span style="color:#8f98a3;">{html.escape(detail)}</span>'
+        )
+
+    def append_bodygroup_log(self, message: str) -> None:
+        display = self.translate_runtime_text(str(message))
+        self.bodygroup_log.appendPlainText(display)
+        self.statusBar().showMessage(display[:160])
+        checks = [
+            ("Starting Blender bodygroup analysis", 10, "Starting Blender", "#58a6ff"),
+            ("Analyzing bodygroups", 25, "Analyzing Bodygroups", "#58a6ff"),
+            ("Wrote bodygroup analysis", 92, "Writing Analysis", "#2ea043"),
+            ("Starting Blender bodygroup sort", 10, "Starting Blender", "#58a6ff"),
+            ("Applying bodygroup plan", 25, "Applying Plan", "#d29922"),
+            ("Wrote bodygroup blend", 92, "Saving Blend", "#2ea043"),
+            ("Opening Blender for manual bodygroup edit", 35, "Waiting For Blender", "#d29922"),
+            ("Waiting for Blender to close", 40, "Waiting For Blender", "#d29922"),
+            ("Starting Blender manual bodygroup validation", 70, "Validating Manual Edit", "#58a6ff"),
+            ("Validating manually edited bodygroups", 78, "Validating Manual Edit", "#58a6ff"),
+        ]
+        for needle, value, title, color in checks:
+            if needle in message:
+                self.set_bodygroup_progress(value, title, message, color)
+                return
+
+    def set_bodygroup_outputs_visible(self, visible: bool) -> None:
+        self.bodygroup_output_group.setVisible(bool(visible))
+        self.bodygroup_outputs_toggle.setText("Hide Outputs" if visible else "Show Outputs")
+
+    def set_bodygroup_log_visible(self, visible: bool) -> None:
+        self.bodygroup_log_group.setVisible(bool(visible))
+        self.bodygroup_log_toggle.setText("Hide Log" if visible else "Show Log")
+
+    def bodygroup_entries(self) -> list[dict[str, object]]:
+        if not self.current_bodygroup_plan:
+            return []
+        entries = self.current_bodygroup_plan.get("bodygroups", [])
+        return [entry for entry in entries if isinstance(entry, dict)] if isinstance(entries, list) else []
+
+    def detect_step5_output(self) -> None:
+        candidates: list[Path] = []
+        for label_name in ("material_final_blend_label", "material_sorted_blend_label"):
+            label = getattr(self, label_name, None)
+            text = label.text().strip() if label is not None else ""
+            if text:
+                candidates.append(Path(text))
+        if self.material_sorted_blend_path:
+            candidates.append(Path(self.material_sorted_blend_path))
+        material_dir_text = self.material_output_edit.text().strip() if hasattr(self, "material_output_edit") else ""
+        if material_dir_text:
+            material_dir = Path(material_dir_text)
+            candidates.extend(sorted(material_dir.glob("*_materials_merged.blend")))
+            candidates.extend(sorted(material_dir.glob("*_materials_sorted.blend")))
+        workspace_text = self.workspace_edit.text().strip() if hasattr(self, "workspace_edit") else ""
+        if workspace_text:
+            workspace = Path(workspace_text)
+            candidates.extend(sorted(workspace.glob("5_sort_materials/*_materials_merged.blend")))
+            candidates.extend(sorted(workspace.glob("5_sort_materials/*_materials_sorted.blend")))
+        stored = self.settings_store.value("bodygroup_input_blend", "", str)
+        if stored:
+            candidates.append(Path(str(stored)))
+        for candidate in candidates:
+            if candidate.exists():
+                self.bodygroup_input_row.set_value(str(candidate))
+                self.switch_to_step(6)
+                return
+        self.show_error("Detect Step 5 Output", "No Step 5 .blend output was found. Run Step 5 or browse to the material-sorted blend.")
+
+    def on_bodygroup_input_changed(self, value: str) -> None:
+        self.current_bodygroup_analysis = None
+        self.current_bodygroup_plan = None
+        self.bodygroup_sorted_blend_path = ""
+        self.bodygroup_manual_edit_blend_path = ""
+        self.bodygroup_apply_button.setEnabled(False)
+        self.bodygroup_manual_button.setEnabled(False)
+        self.bodygroup_merge_button.setEnabled(False)
+        self.bodygroup_table.setRowCount(0)
+        if self.bodygroup_preview is not None:
+            self.bodygroup_preview.clear()
+        if value.strip():
+            self.update_bodygroup_output_preview(Path(value.strip()))
+        else:
+            self.bodygroup_output_edit.clear()
+            self.bodygroup_blend_label.clear()
+            self.bodygroup_manual_blend_label.clear()
+            self.bodygroup_analysis_label.clear()
+            self.bodygroup_plan_label.clear()
+            self.bodygroup_report_label.clear()
+            self.open_bodygroup_folder_button.setEnabled(False)
+        self.update_bodygroup_summary()
+        self.save_settings()
+
+    def update_bodygroup_output_preview(self, input_blend: Path) -> None:
+        try:
+            bodygroup_dir, output_blend, analysis_json, plan_json, report_json = core.bodygroup_paths_for_material_blend(input_blend)
+            manual_edit_blend = core.bodygroup_manual_edit_path_for_material_blend(input_blend)
+            self.bodygroup_output_edit.setText(str(bodygroup_dir))
+            self.bodygroup_blend_label.setText(str(output_blend) if output_blend.exists() else "")
+            self.bodygroup_manual_blend_label.setText(str(manual_edit_blend) if manual_edit_blend.exists() else "")
+            self.bodygroup_analysis_label.setText(str(analysis_json) if analysis_json.exists() else "")
+            self.bodygroup_plan_label.setText(str(plan_json) if plan_json.exists() else "")
+            self.bodygroup_report_label.setText(str(report_json) if report_json.exists() else "")
+            self.bodygroup_log_label.setText(str(bodygroup_dir / "blender_sort_bodygroups.log"))
+            self.open_bodygroup_folder_button.setEnabled(bodygroup_dir.exists())
+        except Exception:
+            self.bodygroup_output_edit.clear()
+            self.bodygroup_manual_blend_label.clear()
+
+    def start_bodygroup_analyze(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        if not self.ensure_step_can_run(6):
+            return
+        input_raw = self.bodygroup_input_row.value()
+        if not input_raw:
+            self.show_error("Analyze bodygroups failed", "Select the Step 5 final .blend first.")
+            return
+        input_blend = Path(input_raw)
+        if not input_blend.exists():
+            self.show_error("Analyze bodygroups failed", f"Step 5 .blend not found:\n{input_blend}")
+            return
+        self.current_bodygroup_analysis = None
+        self.current_bodygroup_plan = None
+        self.bodygroup_manual_edit_blend_path = ""
+        self.bodygroup_log.clear()
+        self.bodygroup_table.setRowCount(0)
+        if self.bodygroup_preview is not None:
+            self.bodygroup_preview.clear()
+        self.set_step_working(6, "Preparing Step 6 bodygroup analysis")
+        self.set_bodygroup_progress(0, "Queued", "Preparing bodygroup analysis", "#58a6ff")
+        self.bodygroup_analyze_button.setEnabled(False)
+        self.bodygroup_apply_button.setEnabled(False)
+        self.bodygroup_manual_button.setEnabled(False)
+        self.bodygroup_merge_button.setEnabled(False)
+        self.detect_material_blend_button.setEnabled(False)
+        self.bodygroup_always_auto_split_check.setEnabled(False)
+        self.bodygroup_rtx_limit_check.setEnabled(False)
+        self.bodygroup_cancel_button.setEnabled(True)
+        self.worker = BodygroupAnalyzeWorker(
+            str(input_blend),
+            self.bodygroup_scale_spin.value(),
+            self.bodygroup_scale_preset,
+            self.bodygroup_always_auto_split_check.isChecked(),
+            self.bodygroup_vertex_limit(),
+        )
+        self.worker.log.connect(self.append_bodygroup_log)
+        self.worker.done.connect(self.bodygroup_analyze_done)
+        self.worker.failed.connect(self.bodygroup_failed)
+        self.worker.start()
+
+    def bodygroup_analyze_done(self, result: dict) -> None:
+        self.bodygroup_analyze_button.setEnabled(True)
+        self.detect_material_blend_button.setEnabled(True)
+        self.bodygroup_always_auto_split_check.setEnabled(True)
+        self.bodygroup_rtx_limit_check.setEnabled(True)
+        self.bodygroup_cancel_button.setEnabled(False)
+        self.bodygroup_apply_button.setEnabled(True)
+        self.bodygroup_manual_edit_blend_path = str(result.get("manual_edit_blend", ""))
+        self.bodygroup_manual_blend_label.setText(self.bodygroup_manual_edit_blend_path)
+        self.bodygroup_manual_button.setEnabled(bool(self.bodygroup_manual_edit_blend_path and Path(self.bodygroup_manual_edit_blend_path).exists()))
+        self.bodygroup_merge_button.setEnabled(True)
+        self.current_bodygroup_analysis = result.get("analysis_data") if isinstance(result.get("analysis_data"), dict) else None
+        self.current_bodygroup_plan = result.get("plan_data") if isinstance(result.get("plan_data"), dict) else None
+        self.bodygroup_output_edit.setText(str(result.get("bodygroup_dir", "")))
+        self.bodygroup_analysis_label.setText(str(result.get("analysis", "")))
+        self.bodygroup_plan_label.setText(str(result.get("plan", "")))
+        self.bodygroup_log_label.setText(str(result.get("log", "")))
+        self.open_bodygroup_folder_button.setEnabled(True)
+        self.populate_bodygroup_table()
+        self.refresh_bodygroup_preview()
+        self.update_bodygroup_summary()
+        self.set_bodygroup_progress(100, "Analysis Complete", str(result.get("analysis", "")), "#2ea043")
+        self.clear_step_state(6, "Step 6 analysis complete")
+
+    def bodygroup_failed(self, message: str) -> None:
+        self.bodygroup_analyze_button.setEnabled(True)
+        self.detect_material_blend_button.setEnabled(True)
+        self.bodygroup_always_auto_split_check.setEnabled(True)
+        self.bodygroup_rtx_limit_check.setEnabled(True)
+        self.bodygroup_cancel_button.setEnabled(False)
+        manual_table = bool(isinstance(self.current_bodygroup_plan, dict) and self.current_bodygroup_plan.get("manual"))
+        self.bodygroup_apply_button.setEnabled(self.current_bodygroup_plan is not None and not manual_table)
+        self.bodygroup_manual_button.setEnabled(bool(self.bodygroup_manual_edit_blend_path and Path(self.bodygroup_manual_edit_blend_path).exists()))
+        self.bodygroup_merge_button.setEnabled(self.current_bodygroup_plan is not None and not manual_table)
+        self.set_bodygroup_progress(self.bodygroup_progress_bar.value(), "Bodygroup Step Failed", "See the log for details.", "#f85149")
+        self.set_step_failed(6, "Step 6 bodygroup step failed")
+        self.show_error("Bodygroup step failed", message)
+
+    def cancel_bodygroup(self) -> None:
+        if self.worker and self.worker.isRunning() and hasattr(self.worker, "cancel"):
+            self.worker.cancel()  # type: ignore[attr-defined]
+            self.append_bodygroup_log("Cancel requested.")
+
+    def populate_bodygroup_table(self) -> None:
+        entries = self.bodygroup_entries()
+        self._updating_bodygroup_table = True
+        self.bodygroup_table.setRowCount(len(entries))
+        for row, entry in enumerate(entries):
+            uid = str(entry.get("uid") or "")
+            use_item = QtWidgets.QTableWidgetItem("")
+            use_item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsUserCheckable | QtCore.Qt.ItemFlag.ItemIsSelectable)
+            use_item.setCheckState(QtCore.Qt.CheckState.Checked if entry.get("enabled", True) else QtCore.Qt.CheckState.Unchecked)
+            use_item.setData(QtCore.Qt.ItemDataRole.UserRole, uid)
+            self.bodygroup_table.setItem(row, 0, use_item)
+            values = [
+                str(entry.get("proposed_name", "")),
+                str(entry.get("category", "")),
+                f"{float(entry.get('confidence', 0.0) or 0.0):.3f}",
+                str(entry.get("source_bodygroup", "") or entry.get("source_bodygroup_uid", "")),
+                ", ".join(str(name) for name in entry.get("source_objects", [])[:8]) if isinstance(entry.get("source_objects"), list) else "",
+                f"{int(entry.get('vertex_count', 0) or 0):,}",
+                f"{int(entry.get('face_count', 0) or 0):,}",
+                ", ".join(str(name) for name in entry.get("related_vertex_groups", [])[:8]) if isinstance(entry.get("related_vertex_groups"), list) else "",
+                "; ".join(str(w) for w in entry.get("warnings", []) if w) if isinstance(entry.get("warnings"), list) else "",
+            ]
+            for column, value in enumerate(values, start=1):
+                item = QtWidgets.QTableWidgetItem(value)
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, uid)
+                if value:
+                    item.setToolTip(value)
+                if column == 1:
+                    item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsEditable)
+                else:
+                    item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                self.bodygroup_table.setItem(row, column, item)
+        self._updating_bodygroup_table = False
+        for row in range(self.bodygroup_table.rowCount()):
+            self.bodygroup_table.setRowHeight(row, 38)
+
+    def bodygroup_entry_for_uid(self, uid: str) -> dict[str, object] | None:
+        for entry in self.bodygroup_entries():
+            if str(entry.get("uid") or "") == uid:
+                return entry
+        return None
+
+    def bodygroup_preview_scan(self) -> dict[str, object] | None:
+        if not self.current_bodygroup_analysis or not self.current_bodygroup_plan:
+            return None
+        preview = self.current_bodygroup_analysis.get("model_preview") if isinstance(self.current_bodygroup_analysis, dict) else None
+        if not isinstance(preview, dict):
+            return None
+        source_entries = self.current_bodygroup_analysis.get("sources", []) if isinstance(self.current_bodygroup_analysis, dict) else []
+        source_by_uid = {
+            str(entry.get("uid") or ""): entry
+            for entry in source_entries
+            if isinstance(entry, dict) and entry.get("uid")
+        }
+        splits = self.current_bodygroup_plan.get("splits", []) if isinstance(self.current_bodygroup_plan, dict) else []
+        split_by_new_uid = {
+            str(split.get("new_uid") or ""): split
+            for split in splits
+            if isinstance(split, dict) and split.get("type") in {"component_cluster", "region_cluster"} and split.get("new_uid")
+        }
+        enabled_split_uids: set[str] = set()
+        for group in self.bodygroup_entries():
+            if not group.get("enabled", True):
+                continue
+            for source_uid in group.get("source_uids", []):
+                source_uid = str(source_uid)
+                if source_uid in split_by_new_uid:
+                    enabled_split_uids.add(source_uid)
+        excluded_components_by_source: dict[str, set[int]] = {}
+        excluded_polygons_by_source: dict[str, set[int]] = {}
+        for split_uid in enabled_split_uids:
+            split = split_by_new_uid.get(split_uid, {})
+            source_uid = str(split.get("source_uid") or "")
+            excluded_components_by_source.setdefault(source_uid, set()).update(
+                int(value) for value in split.get("component_ids", []) if str(value).isdigit()
+            )
+            excluded_polygons_by_source.setdefault(source_uid, set()).update(
+                int(value) for value in split.get("polygon_indices", []) if str(value).isdigit()
+            )
+        source_to_preview: dict[str, list[tuple[dict[str, object], str, set[int] | None, set[int], set[int] | None, set[int]]]] = {}
+        preview_entries: list[dict[str, object]] = []
+        for group in self.bodygroup_entries():
+            group_uid = str(group.get("uid") or "")
+            if not group_uid:
+                continue
+            source_uids = group.get("preview_source_uids", [])
+            if not source_uids:
+                source_uids = group.get("source_uids", [])
+            for source_uid in source_uids if isinstance(source_uids, list) else []:
+                source_uid = str(source_uid)
+                split = split_by_new_uid.get(source_uid)
+                include_components: set[int] | None = None
+                exclude_components: set[int] = set()
+                base_source_uid = source_uid
+                if split:
+                    base_source_uid = str(split.get("source_uid") or "")
+                    include_components = {int(value) for value in split.get("component_ids", []) if str(value).isdigit()}
+                    include_polygons = {int(value) for value in split.get("polygon_indices", []) if str(value).isdigit()}
+                else:
+                    exclude_components = set(excluded_components_by_source.get(source_uid, set()))
+                    include_polygons = None
+                exclude_polygons = set(excluded_polygons_by_source.get(source_uid, set())) if not split else set()
+                source = source_by_uid.get(base_source_uid, {})
+                preview_uid = f"{group_uid}::{source_uid}"
+                material_names = source.get("material_names", []) if isinstance(source, dict) else []
+                material_name = ", ".join(str(name) for name in material_names[:3]) if isinstance(material_names, list) else ""
+                preview_entries.append(
+                    {
+                        "uid": preview_uid,
+                        "bodygroup_uid": group_uid,
+                        "highlight_group": group_uid,
+                        "material_name": f"{group.get('proposed_name', group_uid)} / {material_name or source.get('proposed_name', source_uid)}",
+                        "proposed_name": group.get("proposed_name", group_uid),
+                        "keep": bool(group.get("enabled", True)),
+                        "render_when_highlighted": bool(group.get("split_candidate", False)),
+                        "preview_color": group.get("preview_color") or source.get("preview_color") or [0.8, 0.8, 0.8, 1.0],
+                        "base_color_path": source.get("base_color_path", "") or group.get("base_color_path", ""),
+                        "base_color_file": source.get("base_color_file", "") or group.get("base_color_file", ""),
+                        "alpha": 1.0,
+                    }
+                )
+                source_to_preview.setdefault(base_source_uid, []).append((group, preview_uid, include_components, exclude_components, include_polygons, exclude_polygons))
+        triangles: list[dict[str, object]] = []
+        for triangle in preview.get("triangles", []):
+            if not isinstance(triangle, dict):
+                continue
+            source_uid = str(triangle.get("material_uid") or "")
+            try:
+                component_id = int(triangle.get("component_id", 0) or 0)
+            except Exception:
+                component_id = 0
+            try:
+                polygon_index = int(triangle.get("polygon_index", -1) or -1)
+            except Exception:
+                polygon_index = -1
+            for group, preview_uid, include_components, exclude_components, include_polygons, exclude_polygons in source_to_preview.get(source_uid, []):
+                if include_polygons is not None and polygon_index not in include_polygons:
+                    continue
+                if include_polygons is None and include_components is not None and component_id not in include_components:
+                    continue
+                if exclude_polygons and polygon_index in exclude_polygons:
+                    continue
+                if exclude_components and component_id in exclude_components:
+                    continue
+                copied = dict(triangle)
+                copied["material_uid"] = preview_uid
+                copied["color"] = group.get("preview_color") or copied.get("color") or [0.8, 0.8, 0.8, 1.0]
+                triangles.append(copied)
+        return {
+            "materials": preview_entries,
+            "material_count": len(self.bodygroup_entries()),
+            "model_preview": {**preview, "triangles": triangles, "sampled_triangle_count": len(triangles)},
+        }
+
+    def refresh_bodygroup_preview(self) -> None:
+        if self.bodygroup_preview is None:
+            return
+        scan = self.bodygroup_preview_scan()
+        self.bodygroup_preview.set_material_data(scan, scan)
+        self.bodygroup_preview.set_hovered_material(self._hover_bodygroup_uid)
+        self.bodygroup_preview.set_highlighted_materials(self.selected_bodygroup_uids())
+
+    def update_bodygroup_hover_for_row(self, row: int) -> None:
+        if row < 0 or row >= self.bodygroup_table.rowCount():
+            self.clear_bodygroup_hover()
+            return
+        item = self.bodygroup_table.item(row, 0)
+        uid = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "") if item else ""
+        if uid == self._hover_bodygroup_uid:
+            return
+        self._hover_bodygroup_uid = uid
+        if self.bodygroup_preview is not None:
+            self.bodygroup_preview.set_hovered_material(uid)
+
+    def clear_bodygroup_hover(self) -> None:
+        self._hover_bodygroup_uid = ""
+        if self.bodygroup_preview is not None:
+            self.bodygroup_preview.set_hovered_material("")
+
+    def selected_bodygroup_uids(self) -> set[str]:
+        if not hasattr(self, "bodygroup_table"):
+            return set()
+        rows = sorted({index.row() for index in self.bodygroup_table.selectionModel().selectedRows()})
+        uids: set[str] = set()
+        for row in rows:
+            item = self.bodygroup_table.item(row, 0)
+            if item:
+                uid = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+                if uid:
+                    uids.add(uid)
+        return uids
+
+    def on_bodygroup_table_selection_changed(self) -> None:
+        if self.bodygroup_preview is not None:
+            self.bodygroup_preview.set_highlighted_materials(self.selected_bodygroup_uids())
+
+    def on_bodygroup_table_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
+        if self._updating_bodygroup_table or not self.current_bodygroup_plan:
+            return
+        uid = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+        entry = self.bodygroup_entry_for_uid(uid)
+        if not entry:
+            return
+        if item.column() == 0:
+            entry["enabled"] = item.checkState() == QtCore.Qt.CheckState.Checked
+        elif item.column() == 1:
+            entry["proposed_name"] = item.text().strip()
+        self.refresh_bodygroup_preview()
+        self.update_bodygroup_summary()
+
+    def update_bodygroup_summary(self) -> None:
+        if not self.current_bodygroup_plan:
+            self.bodygroup_summary_label.setText("Detect a Step 5 blend and analyze bodygroups.")
+            return
+        entries = self.bodygroup_entries()
+        enabled = sum(1 for entry in entries if entry.get("enabled", True))
+        split_count = sum(1 for entry in entries if entry.get("split_candidate"))
+        scale = self.current_bodygroup_analysis.get("scale", {}) if isinstance(self.current_bodygroup_analysis, dict) else {}
+        scale_text = ""
+        if isinstance(scale, dict) and scale:
+            scale_text = f" | Height: {float(scale.get('height_before', 0.0) or 0.0):.3f} -> {float(scale.get('height_after', 0.0) or 0.0):.3f}"
+            mode = str(scale.get("scale_preset") or scale.get("scale_mode") or "")
+            actual_scale = float(scale.get("actual_scale", 0.0) or 0.0)
+            if mode and mode != "factor":
+                scale_text += f" | Scale preset: {mode} ({actual_scale:.4f}x)"
+            elif actual_scale:
+                scale_text += f" | Scale: {actual_scale:.4f}x"
+        split_text = f" | Auto-split candidates: {split_count:,}" if split_count else ""
+        auto_text = ""
+        auto_split = self.current_bodygroup_analysis.get("auto_split", {}) if isinstance(self.current_bodygroup_analysis, dict) else {}
+        if isinstance(auto_split, dict) and auto_split:
+            reason = str(auto_split.get("reason") or "")
+            over_limit = auto_split.get("over_limit_sources", [])
+            if reason == "always":
+                auto_text = " | Auto-split: always"
+            elif reason == "source_vertex_limit":
+                auto_text = f" | Auto-split: vertex limit ({len(over_limit) if isinstance(over_limit, list) else 0})"
+            elif reason == "manual":
+                auto_text = " | Manual edit accepted"
+            else:
+                auto_text = " | Auto-split: not needed"
+        self.bodygroup_summary_label.setText(
+            f"Bodygroups: {len(entries):,} | Enabled: {enabled:,} | Vertex limit: {self.bodygroup_vertex_limit():,}{split_text}{auto_text}{scale_text}"
+        )
+
+    def load_manual_bodygroup_report_into_table(self, report: dict[str, object]) -> None:
+        groups = report.get("bodygroups", []) if isinstance(report, dict) else []
+        entries: list[dict[str, object]] = []
+        if not isinstance(groups, list):
+            groups = []
+        for index, group in enumerate(groups, start=1):
+            if not isinstance(group, dict):
+                continue
+            name = str(group.get("name") or f"Bodygroup_{index:03d}")
+            warnings = [str(value) for value in group.get("warnings", []) if value] if isinstance(group.get("warnings"), list) else []
+            errors = [str(value) for value in group.get("errors", []) if value] if isinstance(group.get("errors"), list) else []
+            entries.append(
+                {
+                    "uid": f"manual_{index:03d}_{self.safe_group_name(name)}",
+                    "enabled": True,
+                    "proposed_name": name,
+                    "category": "manual",
+                    "confidence": 1.0 if not errors else 0.0,
+                    "source_bodygroup": "manual_edit",
+                    "source_objects": [name],
+                    "vertex_count": int(group.get("vertex_count", 0) or 0),
+                    "face_count": int(group.get("face_count", 0) or 0),
+                    "related_vertex_groups": group.get("tracking_vertex_groups", []) if isinstance(group.get("tracking_vertex_groups"), list) else [],
+                    "warnings": warnings + errors,
+                }
+            )
+        self.current_bodygroup_plan = {
+            "version": 3,
+            "manual": True,
+            "bodygroups": entries,
+            "splits": [],
+        }
+        self.current_bodygroup_analysis = {
+            "version": 3,
+            "manual": True,
+            "scale": {},
+            "auto_split": {"reason": "manual"},
+            "validation": report.get("validation", {}) if isinstance(report.get("validation"), dict) else {},
+        }
+        self.populate_bodygroup_table()
+        self.refresh_bodygroup_preview()
+        self.update_bodygroup_summary()
+
+    def merge_selected_bodygroups(self) -> None:
+        if not self.current_bodygroup_plan:
+            return
+        rows = sorted({index.row() for index in self.bodygroup_table.selectionModel().selectedRows()})
+        if len(rows) < 2:
+            self.show_error("Merge bodygroups", "Select at least two bodygroup rows to merge.")
+            return
+        selected = []
+        for row in rows:
+            item = self.bodygroup_table.item(row, 0)
+            entry = self.bodygroup_entry_for_uid(str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "")) if item else None
+            if entry:
+                selected.append(entry)
+        if len(selected) < 2:
+            return
+        existing = [entry for entry in self.bodygroup_entries() if entry not in selected]
+        name = self.safe_group_name(str(selected[0].get("proposed_name") or "bodygroup") + "_merged")
+        uid = self.unique_bodygroup_uid("bg_manual")
+        merged = {
+            "uid": uid,
+            "enabled": True,
+            "proposed_name": name,
+            "source_uids": [source for entry in selected for source in entry.get("source_uids", [])],
+            "preview_source_uids": [source for entry in selected for source in entry.get("preview_source_uids", entry.get("source_uids", []))],
+            "source_objects": [obj for entry in selected for obj in entry.get("source_objects", [])],
+            "material_names": sorted({mat for entry in selected for mat in entry.get("material_names", [])}),
+            "related_vertex_groups": sorted({group for entry in selected for group in entry.get("related_vertex_groups", [])}),
+            "category": "merged",
+            "confidence": min(float(entry.get("confidence", 0.0) or 0.0) for entry in selected),
+            "vertex_count": sum(int(entry.get("vertex_count", 0) or 0) for entry in selected),
+            "face_count": sum(int(entry.get("face_count", 0) or 0) for entry in selected),
+            "preview_color": selected[0].get("preview_color", [0.8, 0.8, 0.8, 1.0]),
+            "base_color_path": selected[0].get("base_color_path", ""),
+            "base_color_file": selected[0].get("base_color_file", ""),
+            "warnings": ["Manually merged in GUI."],
+        }
+        self.current_bodygroup_plan["bodygroups"] = existing + [merged]
+        self.populate_bodygroup_table()
+        self.refresh_bodygroup_preview()
+        self.update_bodygroup_summary()
+
+    def safe_group_name(self, name: str) -> str:
+        safe = re.sub(r"[^A-Za-z0-9_]+", "", name.replace(" ", "_"))
+        if not safe:
+            return "Bodygroup"
+        parts = [part for part in safe.split("_") if part]
+        out = []
+        for part in parts:
+            if part.upper() in {"L", "R"}:
+                out.append(part.upper())
+            elif part.isdigit():
+                out.append(part)
+            else:
+                out.append(part[:1].upper() + part[1:])
+        return "_".join(out) or "Bodygroup"
+
+    def unique_bodygroup_uid(self, prefix: str) -> str:
+        used = {str(entry.get("uid") or "") for entry in self.bodygroup_entries()}
+        index = 1
+        while f"{prefix}_{index:03d}" in used:
+            index += 1
+        return f"{prefix}_{index:03d}"
+
+    def show_bodygroup_context_menu(self, point: QtCore.QPoint) -> None:
+        row = self.bodygroup_table.rowAt(point.y())
+        if row < 0:
+            return
+        item = self.bodygroup_table.item(row, 0)
+        entry = self.bodygroup_entry_for_uid(str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "")) if item else None
+        if not entry:
+            return
+        groups = [str(group) for group in entry.get("related_vertex_groups", []) if group]
+        menu = QtWidgets.QMenu(self)
+        split_menu = menu.addMenu("Split Tracking Vertex Group")
+        if groups:
+            for group_name in groups[:48]:
+                action = split_menu.addAction(group_name)
+                action.triggered.connect(lambda _checked=False, g=group_name, e=entry: self.split_bodygroup_vertex_group(e, g))
+        else:
+            action = split_menu.addAction("No related tracking groups")
+            action.setEnabled(False)
+        menu.exec(self.bodygroup_table.viewport().mapToGlobal(point))
+
+    def split_bodygroup_vertex_group(self, entry: dict[str, object], vertex_group: str) -> None:
+        if not self.current_bodygroup_plan:
+            return
+        split_uid = self.unique_bodygroup_uid("bg_split")
+        name = self.safe_group_name(vertex_group.replace("mci_final_", "").replace("mci_mat_", ""))
+        self.current_bodygroup_plan.setdefault("splits", []).append(
+            {
+                "source_bodygroup_uid": entry.get("uid"),
+                "vertex_group": vertex_group,
+                "new_uid": split_uid,
+                "proposed_name": name,
+            }
+        )
+        vertex_count = 0
+        for related in entry.get("related_vertex_groups", []):
+            if isinstance(related, dict) and related.get("name") == vertex_group:
+                vertex_count = int(related.get("vertex_count", 0) or 0)
+        new_entry = {
+            "uid": split_uid,
+            "enabled": True,
+            "proposed_name": name,
+            "source_uids": [split_uid],
+            "preview_source_uids": list(entry.get("source_uids", [])),
+            "source_objects": list(entry.get("source_objects", [])),
+            "material_names": list(entry.get("material_names", [])),
+            "related_vertex_groups": [vertex_group],
+            "category": "split",
+            "confidence": 1.0,
+            "vertex_count": vertex_count,
+            "face_count": 0,
+            "preview_color": entry.get("preview_color", [0.8, 0.8, 0.8, 1.0]),
+            "base_color_path": entry.get("base_color_path", ""),
+            "base_color_file": entry.get("base_color_file", ""),
+            "warnings": ["Preview reuses the source bodygroup until apply creates the split object."],
+        }
+        self.current_bodygroup_plan["bodygroups"].append(new_entry)
+        self.populate_bodygroup_table()
+        self.refresh_bodygroup_preview()
+        self.update_bodygroup_summary()
+
+    def validate_bodygroup_plan(self) -> list[str]:
+        errors: list[str] = []
+        seen: set[str] = set()
+        enabled = 0
+        for entry in self.bodygroup_entries():
+            if not entry.get("enabled", True):
+                continue
+            enabled += 1
+            name = str(entry.get("proposed_name") or "").strip()
+            if not self.safe_material_name(name):
+                errors.append(f"{entry.get('uid')}: unsafe bodygroup name {name}.")
+            if name in seen:
+                errors.append(f"{entry.get('uid')}: duplicate bodygroup name {name}.")
+            seen.add(name)
+        if enabled <= 0:
+            errors.append("No enabled bodygroups.")
+        return errors
+
+    def start_bodygroup_manual(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        if not self.ensure_step_can_run(6):
+            return
+        manual_raw = self.bodygroup_manual_edit_blend_path or self.bodygroup_manual_blend_label.text().strip()
+        if not manual_raw:
+            self.show_error("Manual bodygroup edit", "Run Analyze Bodygroups first to create the manual edit .blend.")
+            return
+        manual_blend = Path(manual_raw)
+        if not manual_blend.exists():
+            self.show_error("Manual bodygroup edit", f"Manual edit .blend not found:\n{manual_blend}")
+            return
+
+        message = QtWidgets.QMessageBox(self)
+        message.setIcon(QtWidgets.QMessageBox.Icon.Information)
+        message.setWindowTitle("Manual Bodygroup Editing")
+        message.setText("Blender will open the Step 6 manual edit blend.")
+        vertex_limit = self.bodygroup_vertex_limit()
+        message.setInformativeText(
+            "Edit the bodygroups directly in Blender, then close Blender to continue.\n\n"
+            "Rules:\n"
+            "- Use only English letters, numbers, and underscore in bodygroup object names.\n"
+            "- Keep names capitalized; every model must include Face and Body.\n"
+            f"- Keep each bodygroup at or below {vertex_limit:,} vertices.\n"
+            "- Keep the main armature and Armature modifiers intact.\n"
+            "- Preserve materials, UVs, vertex groups, and weights.\n\n"
+            "After Blender closes, the program will validate the edited blend and write the normal Step 6 output."
+        )
+        message.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Ok | QtWidgets.QMessageBox.StandardButton.Cancel)
+        message.setDefaultButton(QtWidgets.QMessageBox.StandardButton.Ok)
+        if message.exec() != QtWidgets.QMessageBox.StandardButton.Ok:
+            return
+
+        self.set_step_working(6, "Waiting for manual Step 6 bodygroup edit")
+        self.bodygroup_log.clear()
+        self.set_bodygroup_progress(35, "Waiting For Blender", str(manual_blend), "#d29922")
+        self.bodygroup_analyze_button.setEnabled(False)
+        self.bodygroup_apply_button.setEnabled(False)
+        self.bodygroup_manual_button.setEnabled(False)
+        self.bodygroup_merge_button.setEnabled(False)
+        self.detect_material_blend_button.setEnabled(False)
+        self.bodygroup_always_auto_split_check.setEnabled(False)
+        self.bodygroup_rtx_limit_check.setEnabled(False)
+        self.bodygroup_cancel_button.setEnabled(True)
+        self.worker = BodygroupManualEditWorker(str(manual_blend), self.bodygroup_vertex_limit())
+        self.worker.log.connect(self.append_bodygroup_log)
+        self.worker.manual_report.connect(self.bodygroup_manual_report_available)
+        self.worker.done.connect(self.bodygroup_manual_done)
+        self.worker.failed.connect(self.bodygroup_failed)
+        self.worker.start()
+
+    def bodygroup_manual_done(self, result: dict) -> None:
+        self.bodygroup_apply_done(result)
+
+    def bodygroup_manual_report_available(self, result: dict) -> None:
+        report = result.get("report_data") if isinstance(result.get("report_data"), dict) else {}
+        if report:
+            self.load_manual_bodygroup_report_into_table(report)
+        self.bodygroup_output_edit.setText(str(result.get("bodygroup_dir", "")))
+        self.bodygroup_analysis_label.setText(str(result.get("analysis", "")))
+        self.bodygroup_plan_label.setText(str(result.get("plan", "")))
+        self.bodygroup_report_label.setText(str(result.get("report", "")))
+
+    def start_bodygroup_apply(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        if not self.ensure_step_can_run(6):
+            return
+        input_raw = self.bodygroup_input_row.value()
+        if not input_raw:
+            self.show_error("Sort bodygroups failed", "Select the Step 5 final .blend first.")
+            return
+        if not self.current_bodygroup_plan:
+            self.show_error("Sort bodygroups failed", "Run Analyze Bodygroups first.")
+            return
+        errors = self.validate_bodygroup_plan()
+        if errors:
+            self.show_error("Bodygroup validation", "Blocking errors:\n" + "\n".join(f"- {error}" for error in errors))
+            return
+        input_blend = Path(input_raw)
+        if not input_blend.exists():
+            self.show_error("Sort bodygroups failed", f"Step 5 .blend not found:\n{input_blend}")
+            return
+        self.set_step_working(6, "Preparing Step 6 bodygroup apply")
+        self.bodygroup_log.clear()
+        self.set_bodygroup_progress(0, "Queued", "Preparing bodygroup apply", "#58a6ff")
+        self.current_bodygroup_plan["vertex_limit"] = self.bodygroup_vertex_limit()
+        self.current_bodygroup_plan["scale_factor"] = self.bodygroup_scale_spin.value()
+        self.current_bodygroup_plan["scale_preset"] = self.bodygroup_scale_preset
+        self.bodygroup_analyze_button.setEnabled(False)
+        self.bodygroup_apply_button.setEnabled(False)
+        self.bodygroup_manual_button.setEnabled(False)
+        self.bodygroup_merge_button.setEnabled(False)
+        self.detect_material_blend_button.setEnabled(False)
+        self.bodygroup_always_auto_split_check.setEnabled(False)
+        self.bodygroup_rtx_limit_check.setEnabled(False)
+        self.bodygroup_cancel_button.setEnabled(True)
+        self.worker = BodygroupApplyWorker(
+            str(input_blend),
+            self.current_bodygroup_plan,
+            self.bodygroup_scale_spin.value(),
+            self.bodygroup_scale_preset,
+            self.bodygroup_always_auto_split_check.isChecked(),
+            self.bodygroup_vertex_limit(),
+        )
+        self.worker.log.connect(self.append_bodygroup_log)
+        self.worker.done.connect(self.bodygroup_apply_done)
+        self.worker.failed.connect(self.bodygroup_failed)
+        self.worker.start()
+
+    def bodygroup_apply_done(self, result: dict) -> None:
+        self.bodygroup_analyze_button.setEnabled(True)
+        self.bodygroup_apply_button.setEnabled(True)
+        self.bodygroup_manual_button.setEnabled(bool(self.bodygroup_manual_edit_blend_path and Path(self.bodygroup_manual_edit_blend_path).exists()))
+        self.bodygroup_merge_button.setEnabled(True)
+        self.detect_material_blend_button.setEnabled(True)
+        self.bodygroup_always_auto_split_check.setEnabled(True)
+        self.bodygroup_rtx_limit_check.setEnabled(True)
+        self.bodygroup_cancel_button.setEnabled(False)
+        self.bodygroup_sorted_blend_path = str(result.get("output_blend", ""))
+        self.bodygroup_blend_label.setText(self.bodygroup_sorted_blend_path)
+        if hasattr(self, "flex_input_row") and self.bodygroup_sorted_blend_path:
+            self.flex_input_row.set_value(self.bodygroup_sorted_blend_path)
+        self.bodygroup_output_edit.setText(str(result.get("bodygroup_dir", "")))
+        self.bodygroup_analysis_label.setText(str(result.get("analysis", "")))
+        self.bodygroup_plan_label.setText(str(result.get("plan", "")))
+        if self.bodygroup_manual_edit_blend_path:
+            self.bodygroup_manual_blend_label.setText(self.bodygroup_manual_edit_blend_path)
+        self.bodygroup_log_label.setText(str(result.get("log", "")))
+        self.bodygroup_report_label.setText(str(result.get("report", "")))
+        self.open_bodygroup_folder_button.setEnabled(True)
+        report = result.get("report_data") if isinstance(result.get("report_data"), dict) else {}
+        validation = report.get("validation") if isinstance(report.get("validation"), dict) else {}
+        if validation.get("ok"):
+            if result.get("manual"):
+                self.load_manual_bodygroup_report_into_table(report)
+                self.bodygroup_apply_button.setEnabled(False)
+                self.bodygroup_merge_button.setEnabled(False)
+            self.set_bodygroup_progress(100, "Bodygroups Complete", self.bodygroup_sorted_blend_path, "#2ea043")
+            self.complete_step_from_result(
+                6,
+                result,
+                "bodygroup_dir",
+                ["output_blend", "plan"],
+                report_key="report",
+                validation=validation,
+            )
+            if result.get("manual"):
+                QtWidgets.QMessageBox.information(self, "Manual bodygroups complete", "The manually edited bodygroup blend was validated and accepted.")
+            else:
+                QtWidgets.QMessageBox.information(self, "Bodygroups complete", "The bodygroup plan was applied and validated.")
+        else:
+            self.set_bodygroup_progress(100, "Bodygroups Complete With Warnings", self.bodygroup_sorted_blend_path, "#d29922")
+
+    def set_flex_progress(self, value: int, title: str, detail: str, color: str = "#58a6ff") -> None:
+        value = max(0, min(100, int(value)))
+        self.flex_progress_bar.setValue(value)
+        self.flex_progress_label.setText(
+            f'<span style="color:{color};">{html.escape(title)}</span> - {value}%'
+            f'<br><span style="color:#8f98a3;">{html.escape(detail)}</span>'
+        )
+
+    def append_flex_log(self, message: str) -> None:
+        display = self.translate_runtime_text(str(message))
+        self.flex_log.appendPlainText(display)
+        self.statusBar().showMessage(display[:160])
+        checks = [
+            ("Starting Blender flex analysis", 10, "Starting Blender", "#58a6ff"),
+            ("Analyzing flexes", 25, "Analyzing Flexes", "#58a6ff"),
+            ("Wrote flex analysis", 92, "Writing Analysis", "#2ea043"),
+            ("Starting Blender flex sort", 10, "Starting Blender", "#58a6ff"),
+            ("Applying flex plan", 25, "Applying Plan", "#d29922"),
+            ("Wrote flex blend", 92, "Saving Blend", "#2ea043"),
+        ]
+        for needle, value, title, color in checks:
+            if needle in message:
+                self.set_flex_progress(value, title, message, color)
+                return
+
+    def set_flex_outputs_visible(self, visible: bool) -> None:
+        self.flex_output_group.setVisible(bool(visible))
+        self.flex_outputs_toggle.setText("Hide Outputs" if visible else "Show Outputs")
+
+    def set_flex_log_visible(self, visible: bool) -> None:
+        self.flex_log_group.setVisible(bool(visible))
+        self.flex_log_toggle.setText("Hide Log" if visible else "Show Log")
+
+    def flex_entries(self) -> list[dict[str, object]]:
+        if not self.current_flex_plan:
+            return []
+        entries = self.current_flex_plan.get("flexes", [])
+        return [entry for entry in entries if isinstance(entry, dict)] if isinstance(entries, list) else []
+
+    def enabled_flex_count(self) -> int:
+        return sum(
+            1
+            for entry in self.flex_entries()
+            if entry.get("enabled", True) and str(entry.get("action") or "keep") != "remove"
+        )
+
+    def flex_float(self, value: object, default: float) -> float:
+        if value is None or value == "":
+            return float(default)
+        return float(value)
+
+    def detect_step6_output(self) -> None:
+        candidates: list[Path] = []
+        if self.bodygroup_sorted_blend_path:
+            candidates.append(Path(self.bodygroup_sorted_blend_path))
+        label_text = self.bodygroup_blend_label.text().strip() if hasattr(self, "bodygroup_blend_label") else ""
+        if label_text:
+            candidates.append(Path(label_text))
+        bodygroup_dir_text = self.bodygroup_output_edit.text().strip() if hasattr(self, "bodygroup_output_edit") else ""
+        if bodygroup_dir_text:
+            candidates.extend(sorted(Path(bodygroup_dir_text).glob("*_bodygroups_sorted.blend")))
+        workspace_text = self.workspace_edit.text().strip() if hasattr(self, "workspace_edit") else ""
+        if workspace_text:
+            candidates.extend(sorted(Path(workspace_text).glob("6_sort_bodygroups/*_bodygroups_sorted.blend")))
+        stored = self.settings_store.value("flex_input_blend", "", str)
+        if stored:
+            candidates.append(Path(str(stored)))
+        for candidate in candidates:
+            if candidate.exists():
+                self.flex_input_row.set_value(str(candidate))
+                self.switch_to_step(7)
+                return
+        self.show_error("Detect Step 6 Output", "No Step 6 .blend output was found. Run Step 6 or browse to the bodygroup-sorted blend.")
+
+    def on_flex_input_changed(self, value: str) -> None:
+        self.current_flex_analysis = None
+        self.current_flex_plan = None
+        self.flex_sorted_blend_path = ""
+        self.flex_apply_button.setEnabled(False)
+        self.flex_merge_button.setEnabled(False)
+        self.flex_remove_button.setEnabled(False)
+        self.flex_table.setRowCount(0)
+        if self.flex_preview is not None:
+            self.flex_preview.clear()
+        if value.strip():
+            self.update_flex_output_preview(Path(value.strip()))
+        else:
+            self.flex_output_edit.clear()
+            self.open_flex_folder_button.setEnabled(False)
+        self.update_flex_summary()
+        self.save_settings()
+
+    def update_flex_output_preview(self, input_blend: Path) -> None:
+        try:
+            flex_dir, output_blend, analysis_json, plan_json, report_json, flexes_json = core.flex_paths_for_bodygroup_blend(input_blend)
+            self.flex_output_edit.setText(str(flex_dir))
+            self.flex_blend_label.setText(str(output_blend) if output_blend.exists() else "")
+            self.flex_analysis_label.setText(str(analysis_json) if analysis_json.exists() else "")
+            self.flex_plan_label.setText(str(plan_json) if plan_json.exists() else "")
+            self.flex_report_label.setText(str(report_json) if report_json.exists() else "")
+            self.flex_json_label.setText(str(flexes_json) if flexes_json.exists() else "")
+            self.flex_log_label.setText(str(flex_dir / "blender_sort_flexes.log"))
+            self.open_flex_folder_button.setEnabled(flex_dir.exists())
+        except Exception:
+            self.flex_output_edit.clear()
+
+    def start_flex_analyze(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        if not self.ensure_step_can_run(7):
+            return
+        input_raw = self.flex_input_row.value()
+        if not input_raw:
+            self.show_error("Analyze flexes failed", "Select the Step 6 .blend first.")
+            return
+        input_blend = Path(input_raw)
+        if not input_blend.exists():
+            self.show_error("Analyze flexes failed", f"Step 6 .blend not found:\n{input_blend}")
+            return
+        self.current_flex_analysis = None
+        self.current_flex_plan = None
+        self.flex_log.clear()
+        self.flex_table.setRowCount(0)
+        if self.flex_preview is not None:
+            self.flex_preview.clear()
+        self.set_step_working(7, "Preparing Step 7 flex analysis")
+        self.set_flex_progress(0, "Queued", "Preparing flex analysis", "#58a6ff")
+        self.flex_analyze_button.setEnabled(False)
+        self.flex_apply_button.setEnabled(False)
+        self.flex_merge_button.setEnabled(False)
+        self.flex_remove_button.setEnabled(False)
+        self.detect_bodygroup_blend_button.setEnabled(False)
+        self.flex_cancel_button.setEnabled(True)
+        self.worker = FlexAnalyzeWorker(str(input_blend))
+        self.worker.log.connect(self.append_flex_log)
+        self.worker.done.connect(self.flex_analyze_done)
+        self.worker.failed.connect(self.flex_failed)
+        self.worker.start()
+
+    def flex_analyze_done(self, result: dict) -> None:
+        self.flex_analyze_button.setEnabled(True)
+        self.detect_bodygroup_blend_button.setEnabled(True)
+        self.flex_cancel_button.setEnabled(False)
+        self.flex_apply_button.setEnabled(True)
+        self.flex_merge_button.setEnabled(True)
+        self.flex_remove_button.setEnabled(True)
+        self.current_flex_analysis = result.get("analysis_data") if isinstance(result.get("analysis_data"), dict) else None
+        self.current_flex_plan = result.get("plan_data") if isinstance(result.get("plan_data"), dict) else None
+        self.flex_output_edit.setText(str(result.get("flex_dir", "")))
+        self.flex_analysis_label.setText(str(result.get("analysis", "")))
+        self.flex_plan_label.setText(str(result.get("plan", "")))
+        self.flex_log_label.setText(str(result.get("log", "")))
+        self.open_flex_folder_button.setEnabled(True)
+        removed_for_limit = self.auto_mark_excess_flexes_for_removal()
+        self.populate_flex_table()
+        self.update_flex_summary()
+        self.set_flex_progress(100, "Analysis Complete", str(result.get("analysis", "")), "#2ea043")
+        self.clear_step_state(7, "Step 7 analysis complete")
+        if self.flex_preview_status_label is not None:
+            self.flex_preview_status_label.setText("Flex analysis complete. Building preview...")
+        QtCore.QTimer.singleShot(50, self.refresh_flex_preview)
+        if removed_for_limit:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Flex limit",
+                (
+                    f"The model has more than 94 enabled flexes. "
+                    f"{removed_for_limit} low-priority flexes were marked for removal so the kept count is "
+                    f"{self.enabled_flex_count()}.\n\n"
+                    "Review the Use column before applying. Step 7 will not apply while 95 or more flexes are enabled."
+                ),
+            )
+
+    def flex_failed(self, message: str) -> None:
+        self.flex_analyze_button.setEnabled(True)
+        self.detect_bodygroup_blend_button.setEnabled(True)
+        self.flex_cancel_button.setEnabled(False)
+        self.flex_apply_button.setEnabled(self.current_flex_plan is not None)
+        self.flex_merge_button.setEnabled(self.current_flex_plan is not None)
+        self.flex_remove_button.setEnabled(self.current_flex_plan is not None)
+        self.set_flex_progress(self.flex_progress_bar.value(), "Flex Step Failed", "See the log for details.", "#f85149")
+        self.set_step_failed(7, "Step 7 flex step failed")
+        self.show_error("Flex step failed", message)
+
+    def cancel_flex(self) -> None:
+        if self.worker and self.worker.isRunning() and hasattr(self.worker, "cancel"):
+            self.worker.cancel()  # type: ignore[attr-defined]
+            self.append_flex_log("Cancel requested.")
+
+    def auto_mark_excess_flexes_for_removal(self) -> int:
+        entries = self.flex_entries()
+        enabled_entries = [
+            entry
+            for entry in entries
+            if entry.get("enabled", True) and str(entry.get("action") or "keep") != "remove"
+        ]
+        target_keep = 94
+        if len(enabled_entries) <= target_keep:
+            return 0
+
+        def keep_priority(entry: dict[str, object], index: int) -> tuple[float, int]:
+            category = str(entry.get("category") or "").lower()
+            bodygroup = str(entry.get("bodygroup") or "").lower()
+            name = str(entry.get("final_name") or entry.get("original_name") or "").lower()
+            action = str(entry.get("action") or "keep")
+            try:
+                confidence = float(entry.get("confidence", 0.0) or 0.0)
+            except Exception:
+                confidence = 0.0
+            priority = confidence * 20.0
+            if action == "merge":
+                priority += 100.0
+            if bodygroup == "face":
+                priority += 15.0
+            if category in {"mouth", "eye", "eyes", "brow", "brows"}:
+                priority += 40.0
+            if any(token in name for token in ("blink", "smile", "mouth", "eye", "brow", "angry", "sad", "happy")):
+                priority += 15.0
+            if category in {"body", "misc", "unknown"}:
+                priority -= 12.0
+            if str(entry.get("final_name") or "").startswith(("face_flex_", "body_flex_")):
+                priority -= 8.0
+            return (priority, -index)
+
+        indexed = [
+            (entry, index)
+            for index, entry in enumerate(entries)
+            if entry.get("enabled", True) and str(entry.get("action") or "keep") != "remove"
+        ]
+        indexed.sort(key=lambda item: keep_priority(item[0], item[1]))
+        remove_count = max(0, len(enabled_entries) - target_keep)
+        for entry, _index in indexed[:remove_count]:
+            entry["enabled"] = False
+            if str(entry.get("action") or "keep") != "merge":
+                entry["action"] = "remove"
+            warnings = entry.setdefault("warnings", [])
+            if isinstance(warnings, list) and "Auto-marked for removal because Source flex count must stay below 95." not in warnings:
+                warnings.append("Auto-marked for removal because Source flex count must stay below 95.")
+        return remove_count
+
+    def populate_flex_table(self) -> None:
+        self.sync_merged_flex_sources()
+        entries = self.flex_entries()
+        self._updating_flex_table = True
+        self.flex_table.setRowCount(len(entries))
+        for row, entry in enumerate(entries):
+            uid = str(entry.get("uid") or "")
+            use_item = QtWidgets.QTableWidgetItem("")
+            use_item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsUserCheckable | QtCore.Qt.ItemFlag.ItemIsSelectable)
+            use_item.setCheckState(QtCore.Qt.CheckState.Checked if entry.get("enabled", True) else QtCore.Qt.CheckState.Unchecked)
+            use_item.setData(QtCore.Qt.ItemDataRole.UserRole, uid)
+            self.flex_table.setItem(row, 0, use_item)
+            source_text = ""
+            if str(entry.get("action") or "") == "merge":
+                parts = []
+                for source in entry.get("source_flexes", []):
+                    if not isinstance(source, dict):
+                        continue
+                    label = str(source.get("final_name") or source.get("original_name") or source.get("uid"))
+                    try:
+                        weight = self.flex_float(source.get("weight", 1.0), 1.0)
+                        label = f"{label} x {weight:.3f}"
+                    except Exception:
+                        pass
+                    parts.append(label)
+                source_text = ", ".join(parts)
+            values = [
+                str(entry.get("final_name", "")),
+                str(entry.get("original_name", "")),
+                str(entry.get("bodygroup", "")),
+                str(entry.get("category", "")),
+                f"{self.flex_float(entry.get('confidence', 0.0), 0.0):.3f}",
+                f"{self.flex_float(entry.get('rest_value', 0.0), 0.0):.3f}",
+                f"{self.flex_float(entry.get('max_amplitude', 1.0), 1.0):.3f}",
+                source_text or str(entry.get("action", "keep")),
+                "; ".join(str(w) for w in entry.get("warnings", []) if w) if isinstance(entry.get("warnings"), list) else "",
+            ]
+            for column, value in enumerate(values, start=1):
+                item = QtWidgets.QTableWidgetItem(value)
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, uid)
+                if value:
+                    item.setToolTip(value)
+                if column in {1, 6, 7}:
+                    item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsEditable)
+                else:
+                    item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                self.flex_table.setItem(row, column, item)
+        self._updating_flex_table = False
+        for row in range(self.flex_table.rowCount()):
+            self.flex_table.setRowHeight(row, 38)
+
+    def flex_entry_for_uid(self, uid: str) -> dict[str, object] | None:
+        for entry in self.flex_entries():
+            if str(entry.get("uid") or "") == uid:
+                return entry
+        return None
+
+    def selected_flex_uids(self) -> set[str]:
+        if not hasattr(self, "flex_table"):
+            return set()
+        rows = sorted({index.row() for index in self.flex_table.selectionModel().selectedRows()})
+        uids: set[str] = set()
+        for row in rows:
+            item = self.flex_table.item(row, 0)
+            if item:
+                uid = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+                if uid:
+                    uids.add(uid)
+        return uids
+
+    def sync_merged_flex_sources(self) -> None:
+        entries = self.flex_entries()
+        by_uid = {str(entry.get("uid") or ""): entry for entry in entries if entry.get("uid")}
+        for entry in entries:
+            if str(entry.get("action") or "keep") != "merge":
+                continue
+            sources = entry.get("source_flexes", [])
+            if not isinstance(sources, list):
+                continue
+            for source in sources:
+                if not isinstance(source, dict) or not source.get("uid"):
+                    continue
+                source_entry = by_uid.get(str(source.get("uid") or ""))
+                if not source_entry:
+                    continue
+                try:
+                    rest_value = self.flex_float(source_entry.get("rest_value", 0.0), 0.0)
+                except Exception:
+                    rest_value = 0.0
+                try:
+                    max_amplitude = self.flex_float(source_entry.get("max_amplitude", 1.0), 1.0)
+                except Exception:
+                    max_amplitude = 1.0
+                source["bodygroup"] = source_entry.get("bodygroup")
+                source["original_name"] = source_entry.get("original_name")
+                source["final_name"] = source_entry.get("final_name")
+                source["rest_value"] = rest_value
+                source["max_amplitude"] = max_amplitude
+                source["weight"] = max_amplitude - rest_value
+
+    def refresh_flex_preview(self) -> None:
+        if self.flex_preview is None:
+            return
+        if not self.current_flex_analysis:
+            self.flex_preview.clear()
+            return
+        self.sync_merged_flex_sources()
+        scan = {
+            "materials": self.current_flex_analysis.get("materials", []),
+            "material_count": self.current_flex_analysis.get("material_count", 0),
+            "model_preview": self.current_flex_analysis.get("model_preview", {}),
+        }
+        self.flex_preview.set_material_data(scan, self.current_flex_plan or {})
+        self.refresh_flex_preview_state()
+
+    def refresh_flex_preview_plan(self) -> None:
+        if self.flex_preview is None:
+            return
+        self.sync_merged_flex_sources()
+        if hasattr(self.flex_preview, "set_flex_plan"):
+            self.flex_preview.set_flex_plan(self.current_flex_plan or {})
+        self.refresh_flex_preview_state()
+
+    def refresh_flex_preview_state(self) -> None:
+        if self.flex_preview is None:
+            return
+        uid = self._hover_flex_uid
+        if not uid and self.selected_flex_uids():
+            uid = sorted(self.selected_flex_uids())[0]
+        entry = self.flex_entry_for_uid(uid) if uid else None
+        self.flex_preview.set_active_flex(uid, 1.0 if entry else 0.0)
+        if entry and self.flex_isolate_bodygroup_check.isChecked():
+            bodygroup = str(entry.get("bodygroup") or "")
+            if bodygroup == "multiple":
+                sources = entry.get("source_flexes", [])
+                if isinstance(sources, list):
+                    for source in sources:
+                        if isinstance(source, dict) and source.get("bodygroup"):
+                            bodygroup = str(source["bodygroup"])
+                            break
+            self.flex_preview.set_isolated_bodygroup(bodygroup)
+        else:
+            self.flex_preview.set_isolated_bodygroup("")
+
+    def update_flex_hover_for_row(self, row: int) -> None:
+        if row < 0 or row >= self.flex_table.rowCount():
+            self.clear_flex_hover()
+            return
+        item = self.flex_table.item(row, 0)
+        uid = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "") if item else ""
+        if uid == self._hover_flex_uid:
+            return
+        self._hover_flex_uid = uid
+        self.refresh_flex_preview_state()
+
+    def clear_flex_hover(self) -> None:
+        self._hover_flex_uid = ""
+        self.refresh_flex_preview_state()
+
+    def on_flex_table_selection_changed(self) -> None:
+        self.refresh_flex_preview_state()
+
+    def on_flex_table_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
+        if self._updating_flex_table or not self.current_flex_plan:
+            return
+        uid = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+        entry = self.flex_entry_for_uid(uid)
+        if not entry:
+            return
+        if item.column() == 0:
+            entry["enabled"] = item.checkState() == QtCore.Qt.CheckState.Checked
+            if str(entry.get("action") or "keep") != "merge":
+                entry["action"] = "keep" if entry["enabled"] else "remove"
+        elif item.column() == 1:
+            entry["final_name"] = re.sub(r"[^A-Za-z0-9_]+", "", item.text().strip()).lower()
+            if item.text() != entry["final_name"]:
+                self._updating_flex_table = True
+                item.setText(str(entry["final_name"]))
+                self._updating_flex_table = False
+        elif item.column() == 6:
+            try:
+                entry["rest_value"] = float(item.text())
+            except Exception:
+                entry["rest_value"] = 0.0
+        elif item.column() == 7:
+            try:
+                entry["max_amplitude"] = float(item.text())
+            except Exception:
+                entry["max_amplitude"] = 1.0
+        self.update_flex_summary()
+        if item.column() in {0, 1, 6, 7}:
+            self.refresh_flex_preview_plan()
+        else:
+            self.refresh_flex_preview_state()
+
+    def remove_selected_flexes(self) -> None:
+        if not self.current_flex_plan:
+            return
+        selected_uids = sorted(self.selected_flex_uids())
+        if not selected_uids:
+            self.show_error("Remove flexes", "Select one or more flex rows to remove.")
+            return
+        for uid in selected_uids:
+            entry = self.flex_entry_for_uid(uid)
+            if not entry:
+                continue
+            entry["enabled"] = False
+            if str(entry.get("action") or "keep") != "merge":
+                entry["action"] = "remove"
+            warnings = entry.setdefault("warnings", [])
+            if isinstance(warnings, list) and "Marked for removal by user." not in warnings:
+                warnings.append("Marked for removal by user.")
+        self.populate_flex_table()
+        self.refresh_flex_preview()
+        self.update_flex_summary()
+
+    def merge_selected_flexes(self) -> None:
+        if not self.current_flex_plan:
+            return
+        selected = []
+        for uid in sorted(self.selected_flex_uids()):
+            entry = self.flex_entry_for_uid(uid)
+            if entry and entry.get("enabled", True):
+                selected.append(entry)
+        if len(selected) < 2:
+            self.show_error("Merge flexes", "Select at least two enabled flex rows to merge.")
+            return
+        new_uid = self.unique_flex_uid()
+        base_name = re.sub(r"[^A-Za-z0-9_]+", "", str(selected[0].get("final_name") or "merged_flex")) or "merged_flex"
+        base_name = base_name.lower()
+        used = {str(entry.get("final_name") or "") for entry in self.flex_entries()}
+        final_name = base_name
+        index = 2
+        while final_name in used:
+            final_name = f"{base_name}_{index:02d}"
+            index += 1
+        source_flexes = []
+        for entry in selected:
+            try:
+                rest_value = self.flex_float(entry.get("rest_value", 0.0), 0.0)
+            except Exception:
+                rest_value = 0.0
+            try:
+                max_amplitude = self.flex_float(entry.get("max_amplitude", 1.0), 1.0)
+            except Exception:
+                max_amplitude = 1.0
+            source_flexes.append(
+                {
+                    "uid": entry.get("uid"),
+                    "bodygroup": entry.get("bodygroup"),
+                    "original_name": entry.get("original_name"),
+                    "final_name": entry.get("final_name"),
+                    "rest_value": rest_value,
+                    "max_amplitude": max_amplitude,
+                    "weight": max_amplitude - rest_value,
+                }
+            )
+        bodygroups = sorted({str(entry.get("bodygroup") or "") for entry in selected})
+        merged = {
+            "uid": new_uid,
+            "enabled": True,
+            "action": "merge",
+            "final_name": final_name,
+            "original_name": "",
+            "bodygroup": bodygroups[0] if len(bodygroups) == 1 else "multiple",
+            "category": "merged",
+            "confidence": min(self.flex_float(entry.get("confidence", 0.0), 0.0) for entry in selected),
+            "rest_value": 0.0,
+            "max_amplitude": 1.0,
+            "source_flexes": source_flexes,
+            "warnings": ["Additive merged flex; source flexes remain unchanged."],
+        }
+        self.current_flex_plan.setdefault("flexes", []).append(merged)
+        self.populate_flex_table()
+        self.refresh_flex_preview()
+        self.update_flex_summary()
+
+    def unique_flex_uid(self) -> str:
+        used = {str(entry.get("uid") or "") for entry in self.flex_entries()}
+        index = 1
+        while f"flex_merge_{index:03d}" in used:
+            index += 1
+        return f"flex_merge_{index:03d}"
+
+    def update_flex_summary(self) -> None:
+        if not self.current_flex_plan:
+            self.flex_summary_label.setText("Detect a Step 6 blend and analyze flexes.")
+            return
+        entries = self.flex_entries()
+        enabled = self.enabled_flex_count()
+        removed = len(entries) - enabled
+        merge_count = sum(1 for entry in entries if str(entry.get("action") or "") == "merge")
+        bodygroups = sorted({str(entry.get("bodygroup") or "") for entry in entries if entry.get("bodygroup")})
+        limit_text = "OK" if enabled < 95 else "too many"
+        self.flex_summary_label.setText(
+            f"Flexes: {len(entries):,} | Keep: {enabled:,}/94 ({limit_text}) | Remove: {removed:,} | "
+            f"Merged: {merge_count:,} | Bodygroups with flexes: {len(bodygroups):,}"
+        )
+
+    def validate_flex_plan(self) -> list[str]:
+        errors: list[str] = []
+        seen: set[str] = set()
+        self.sync_merged_flex_sources()
+        keep_count = self.enabled_flex_count()
+        if keep_count >= 95:
+            errors.append(f"Source flex count must be smaller than 95; {keep_count} flexes are currently enabled.")
+        for entry in self.flex_entries():
+            if not entry.get("enabled", True) or str(entry.get("action") or "keep") == "remove":
+                continue
+            name = str(entry.get("final_name") or "").strip()
+            if not re.fullmatch(r"[a-z0-9_]+", name):
+                errors.append(f"{entry.get('uid')}: flex name must use lowercase letters, numbers, and underscores: {name}.")
+            if name in seen:
+                errors.append(f"{entry.get('uid')}: duplicate flex name {name}.")
+            seen.add(name)
+            if str(entry.get("action") or "keep") == "merge" and not entry.get("source_flexes"):
+                errors.append(f"{entry.get('uid')}: merged flex has no sources.")
+            try:
+                rest_value = self.flex_float(entry.get("rest_value", 0.0), 0.0)
+            except Exception:
+                errors.append(f"{entry.get('uid')}: invalid rest value.")
+                rest_value = 0.0
+            try:
+                max_amplitude = self.flex_float(entry.get("max_amplitude", 1.0), 1.0)
+            except Exception:
+                errors.append(f"{entry.get('uid')}: invalid max value.")
+                max_amplitude = 1.0
+            if abs(max_amplitude - rest_value) <= 1e-8:
+                errors.append(f"{entry.get('uid')}: max value must be different from rest value.")
+        return errors
+
+    def start_flex_apply(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        if not self.ensure_step_can_run(7):
+            return
+        input_raw = self.flex_input_row.value()
+        if not input_raw:
+            self.show_error("Apply flexes failed", "Select the Step 6 .blend first.")
+            return
+        if not self.current_flex_plan:
+            self.show_error("Apply flexes failed", "Run Analyze Flexes first.")
+            return
+        errors = self.validate_flex_plan()
+        if errors:
+            self.show_error("Flex validation", "Blocking errors:\n" + "\n".join(f"- {error}" for error in errors))
+            return
+        input_blend = Path(input_raw)
+        if not input_blend.exists():
+            self.show_error("Apply flexes failed", f"Step 6 .blend not found:\n{input_blend}")
+            return
+        self.set_step_working(7, "Preparing Step 7 flex apply")
+        self.flex_log.clear()
+        self.set_flex_progress(0, "Queued", "Preparing flex apply", "#58a6ff")
+        self.flex_analyze_button.setEnabled(False)
+        self.flex_apply_button.setEnabled(False)
+        self.flex_merge_button.setEnabled(False)
+        self.flex_remove_button.setEnabled(False)
+        self.detect_bodygroup_blend_button.setEnabled(False)
+        self.flex_cancel_button.setEnabled(True)
+        self.worker = FlexApplyWorker(str(input_blend), self.current_flex_plan)
+        self.worker.log.connect(self.append_flex_log)
+        self.worker.done.connect(self.flex_apply_done)
+        self.worker.failed.connect(self.flex_failed)
+        self.worker.start()
+
+    def flex_apply_done(self, result: dict) -> None:
+        self.flex_analyze_button.setEnabled(True)
+        self.flex_apply_button.setEnabled(True)
+        self.flex_merge_button.setEnabled(True)
+        self.flex_remove_button.setEnabled(True)
+        self.detect_bodygroup_blend_button.setEnabled(True)
+        self.flex_cancel_button.setEnabled(False)
+        self.flex_sorted_blend_path = str(result.get("output_blend", ""))
+        self.flex_blend_label.setText(self.flex_sorted_blend_path)
+        self.flex_output_edit.setText(str(result.get("flex_dir", "")))
+        self.flex_analysis_label.setText(str(result.get("analysis", "")))
+        self.flex_plan_label.setText(str(result.get("plan", "")))
+        self.flex_log_label.setText(str(result.get("log", "")))
+        self.flex_report_label.setText(str(result.get("report", "")))
+        self.flex_json_label.setText(str(result.get("flexes_json", "")))
+        self.open_flex_folder_button.setEnabled(True)
+        report = result.get("report_data") if isinstance(result.get("report_data"), dict) else {}
+        validation = report.get("validation") if isinstance(report.get("validation"), dict) else {}
+        if validation.get("ok"):
+            self.set_flex_progress(100, "Flexes Complete", self.flex_sorted_blend_path, "#2ea043")
+            self.complete_step_from_result(
+                7,
+                result,
+                "flex_dir",
+                ["output_blend", "flexes_json"],
+                report_key="report",
+                validation=validation,
+            )
+            QtWidgets.QMessageBox.information(self, "Flexes complete", "The flex plan was applied and validated.")
+        else:
+            self.set_flex_progress(100, "Flexes Complete With Warnings", self.flex_sorted_blend_path, "#d29922")
+
+    def append_collision_log(self, message: str) -> None:
+        display = self.translate_runtime_text(str(message))
+        self.collision_log.appendPlainText(display)
+        self.statusBar().showMessage(display[:160])
+        bone_progress = re.search(r"\[Step8 Collision\]\s+\[(\d+)\s*/\s*(\d+)\]\s+Preparing\s+(.+?)\.", message)
+        if bone_progress:
+            current = max(1, int(bone_progress.group(1)))
+            total = max(current, int(bone_progress.group(2)))
+            bone_name = bone_progress.group(3)
+            value = 20 + round((current / total) * 65)
+            self.set_collision_progress(value, f"Collision Bone {current}/{total}", bone_name, "#58a6ff")
+        elif "Starting Blender collision analysis" in message:
+            self.set_collision_progress(20, "Analyzing Collision", message, "#58a6ff")
+        elif "collision source scan" in message.lower() or "available collision source bodygroup" in message:
+            self.set_collision_progress(max(self.collision_progress_bar.value(), 35), "Scanning Source Bodygroups", message, "#58a6ff")
+        elif "CoACD cache hit" in message:
+            self.set_collision_progress(max(self.collision_progress_bar.value(), 35), "Using Cached CoACD", message, "#2ea043")
+        elif "running" in message.lower() and "coacd" in message.lower():
+            self.set_collision_progress(max(self.collision_progress_bar.value(), 35), "Running CoACD", message, "#58a6ff")
+        elif "Indexed" in message and "source bodygroup" in message:
+            self.set_collision_progress(max(self.collision_progress_bar.value(), 30), "Indexing Source Meshes", message, "#58a6ff")
+        elif "Wrote collision analysis" in message or "Wrote collision plan" in message:
+            self.set_collision_progress(max(self.collision_progress_bar.value(), 70), "Writing Collision Plan", message, "#2ea043")
+        elif "Starting Blender collision generation" in message:
+            self.set_collision_progress(25, "Generating Collision", message, "#58a6ff")
+        elif "Saved collision-sorted blend" in message:
+            self.set_collision_progress(90, "Saving Blend", message, "#2ea043")
+        elif "Blender collision" in message and "finished" in message:
+            self.set_collision_progress(100, "Collision Step Complete", message, "#2ea043")
+
+    def set_collision_progress(self, value: int, title: str, detail: str, color: str = "#58a6ff") -> None:
+        value = max(0, min(100, int(value)))
+        self.collision_progress_bar.setValue(value)
+        self.collision_progress_label.setText(
+            f'<span style="color:{color};">{html.escape(title)}</span> - {value}%'
+            f'<br><span style="color:#8f98a3;">{html.escape(detail)}</span>'
+        )
+
+    def collision_entries(self) -> list[dict[str, object]]:
+        if not self.current_collision_plan:
+            return []
+        entries = self.current_collision_plan.setdefault("collision_parts", [])
+        if not isinstance(entries, list):
+            self.current_collision_plan["collision_parts"] = []
+            return []
+        return [entry for entry in entries if isinstance(entry, dict)]
+
+    def detect_step7_output(self) -> None:
+        candidates: list[Path] = []
+
+        def add_candidate(raw: object) -> None:
+            if raw is None:
+                return
+            text = str(raw).strip()
+            if text:
+                candidates.append(Path(text))
+
+        def add_sorted_glob(root: Path, pattern: str) -> None:
+            try:
+                matches = sorted(root.glob(pattern), key=lambda item: item.stat().st_mtime, reverse=True)
+            except Exception:
+                return
+            candidates.extend(matches)
+
+        for raw in (
+            self.collision_input_row.value() if hasattr(self, "collision_input_row") else "",
+            self.flex_sorted_blend_path,
+            self.flex_blend_label.text() if hasattr(self, "flex_blend_label") else "",
+            self.settings_store.value("collision_input_blend", "", str),
+        ):
+            add_candidate(raw)
+
+        flex_output_text = self.flex_output_edit.text().strip() if hasattr(self, "flex_output_edit") else ""
+        if flex_output_text:
+            add_sorted_glob(Path(flex_output_text), "*_flexes_sorted.blend")
+
+        workspace_text = self.workspace_edit.text().strip() if hasattr(self, "workspace_edit") else ""
+        if workspace_text:
+            add_sorted_glob(Path(workspace_text), "7_sort_flexes/*_flexes_sorted.blend")
+
+        for raw in (
+            self.settings_store.value("flex_input_blend", "", str),
+            self.flex_input_row.value() if hasattr(self, "flex_input_row") else "",
+        ):
+            if raw:
+                candidate = Path(str(raw).strip())
+                if candidate.name.endswith("_flexes_sorted.blend"):
+                    candidates.append(candidate)
+                    continue
+                try:
+                    flex_dir, output_blend, *_rest = core.flex_paths_for_bodygroup_blend(candidate)
+                    candidates.append(output_blend)
+                    add_sorted_glob(flex_dir, "*_flexes_sorted.blend")
+                except Exception:
+                    pass
+
+        add_sorted_glob(core.workspaces_root(), "*/7_sort_flexes/*_flexes_sorted.blend")
+
+        seen: set[Path] = set()
+        for candidate in candidates:
+            try:
+                candidate = candidate.resolve()
+            except Exception:
+                candidate = candidate.absolute()
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if candidate.exists():
+                self.collision_input_row.set_value(str(candidate))
+                self.switch_to_step(8)
+                return
+        self.show_error("Detect Step 7 Output", "No Step 7 .blend output was found. Run Step 7 or browse to the flex-sorted blend.")
+
+    def on_collision_input_changed(self, value: str) -> None:
+        self.current_collision_bones = None
+        self.current_collision_sources = None
+        self.current_collision_analysis = None
+        self.current_collision_plan = None
+        self.collision_sorted_blend_path = ""
+        self.collision_apply_button.setEnabled(False)
+        self.collision_validate_button.setEnabled(False)
+        self.collision_bone_table.setRowCount(0)
+        self.collision_bone_group.setVisible(False)
+        self.collision_source_table.setRowCount(0)
+        self.collision_source_group.setVisible(False)
+        self.collision_table.setRowCount(0)
+        if self.collision_preview is not None:
+            self.collision_preview.clear()
+        if value.strip():
+            self.update_collision_output_preview(Path(value.strip()))
+        else:
+            self.collision_output_edit.clear()
+            self.open_collision_folder_button.setEnabled(False)
+        self.update_collision_summary()
+        self.save_settings()
+
+    def update_collision_output_preview(self, input_blend: Path) -> None:
+        try:
+            collision_dir, output_blend, analysis_json, plan_json, report_json, physics_settings_json, physics_smd = core.collision_paths_for_flex_blend(input_blend)
+            self.collision_output_edit.setText(str(collision_dir))
+            self.collision_blend_label.setText(str(output_blend) if output_blend.exists() else "")
+            self.collision_analysis_label.setText(str(analysis_json) if analysis_json.exists() else "")
+            self.collision_plan_label.setText(str(plan_json) if plan_json.exists() else "")
+            self.collision_report_label.setText(str(report_json) if report_json.exists() else "")
+            self.collision_settings_label.setText(str(physics_settings_json) if physics_settings_json.exists() else "")
+            self.collision_smd_label.setText(str(physics_smd) if physics_smd.exists() else "")
+            self.collision_log_label.setText(str(collision_dir / "blender_sort_collision.log"))
+            self.open_collision_folder_button.setEnabled(collision_dir.exists())
+        except Exception:
+            self.collision_output_edit.clear()
+
+    def collision_bone_entries(self) -> list[dict[str, object]]:
+        if not self.current_collision_bones:
+            return []
+        entries = self.current_collision_bones.get("bones", [])
+        return [entry for entry in entries if isinstance(entry, dict)] if isinstance(entries, list) else []
+
+    def collision_rotation_presets(self) -> list[dict[str, object]]:
+        if not self.current_collision_bones:
+            return []
+        presets = self.current_collision_bones.get("rotation_presets", [])
+        return [entry for entry in presets if isinstance(entry, dict)] if isinstance(presets, list) else []
+
+    def collision_bone_name_for_row(self, row: int) -> str:
+        item = self.collision_bone_table.item(row, 2) if 0 <= row < self.collision_bone_table.rowCount() else None
+        return str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "") if item else ""
+
+    def selected_collision_bone_groups(self) -> list[dict[str, object]] | None:
+        if not self.current_collision_bones:
+            return None
+        grouped: dict[int, dict[str, object]] = {}
+        for row in range(self.collision_bone_table.rowCount()):
+            group_widget = self.collision_bone_table.cellWidget(row, 0)
+            if not isinstance(group_widget, QtWidgets.QComboBox):
+                continue
+            try:
+                group_id = int(group_widget.currentData() or 0)
+            except Exception:
+                group_id = 0
+            if group_id <= 0:
+                continue
+            bone_name = self.collision_bone_name_for_row(row)
+            if not bone_name:
+                continue
+            rotation_widget = self.collision_bone_table.cellWidget(row, 1)
+            rotation_type = ""
+            if isinstance(rotation_widget, QtWidgets.QComboBox):
+                rotation_type = str(rotation_widget.currentData() or "").upper()
+            entry = grouped.setdefault(group_id, {"group": group_id, "bones": [], "rotation_type": rotation_type})
+            if rotation_type and not str(entry.get("rotation_type") or ""):
+                entry["rotation_type"] = rotation_type
+            entry.setdefault("_rotation_types", set()).add(rotation_type)
+            entry["bones"].append(bone_name)
+        result: list[dict[str, object]] = []
+        for group_id in sorted(grouped):
+            entry = grouped[group_id]
+            result.append(
+                {
+                    "group": group_id,
+                    "bones": [str(name) for name in entry.get("bones", []) if str(name)],
+                    "rotation_type": str(entry.get("rotation_type") or ""),
+                }
+            )
+        return result or None
+
+    def validate_collision_bone_groups(self) -> list[str]:
+        if not self.current_collision_bones:
+            return []
+        groups = self.selected_collision_bone_groups() or []
+        if not groups:
+            return []
+        errors: list[str] = []
+        entries = self.collision_bone_entries()
+        by_name = {str(entry.get("name") or ""): entry for entry in entries}
+        parent_by_name = {name: str(entry.get("parent") or "") for name, entry in by_name.items()}
+        children_by_name: dict[str, list[str]] = {name: [] for name in by_name}
+        for name, parent in parent_by_name.items():
+            if parent in children_by_name:
+                children_by_name[parent].append(name)
+        rotations_by_group: dict[int, set[str]] = {}
+        for row in range(self.collision_bone_table.rowCount()):
+            group_widget = self.collision_bone_table.cellWidget(row, 0)
+            rotation_widget = self.collision_bone_table.cellWidget(row, 1)
+            if not isinstance(group_widget, QtWidgets.QComboBox):
+                continue
+            try:
+                group_id = int(group_widget.currentData() or 0)
+            except Exception:
+                group_id = 0
+            if group_id <= 0:
+                continue
+            rotation_type = ""
+            if isinstance(rotation_widget, QtWidgets.QComboBox):
+                rotation_type = str(rotation_widget.currentData() or "").upper()
+            rotations_by_group.setdefault(group_id, set()).add(rotation_type)
+        for group_id, rotations in rotations_by_group.items():
+            nonblank = {rotation for rotation in rotations if rotation}
+            if len(nonblank) > 1:
+                errors.append(f"CoACD bone group {group_id} has conflicting rotation types.")
+        if len(groups) > 14:
+            errors.append("At most 14 additional CoACD bone groups are allowed.")
+        if len(groups) + 18 > 32:
+            errors.append("At most 32 total collision parts are allowed.")
+        used: set[str] = set()
+        for group in groups:
+            group_id = int(group.get("group", 0) or 0)
+            bones = [str(name) for name in group.get("bones", []) if str(name)] if isinstance(group.get("bones"), list) else []
+            rotation_type = str(group.get("rotation_type") or "")
+            if not rotation_type:
+                errors.append(f"CoACD bone group {group_id} needs a rotation type.")
+            selected = set(bones)
+            for bone_name in bones:
+                entry = by_name.get(bone_name)
+                if entry is None:
+                    errors.append(f"CoACD bone group {group_id} references missing bone {bone_name}.")
+                    continue
+                if bool(entry.get("is_default_target", False)):
+                    errors.append(f"CoACD bone group {group_id} cannot use default target bone {bone_name}.")
+                if bone_name in used:
+                    errors.append(f"CoACD bone {bone_name} is assigned to more than one group.")
+                used.add(bone_name)
+            roots = [name for name in bones if parent_by_name.get(name, "") not in selected]
+            if len(roots) != 1:
+                errors.append(f"CoACD bone group {group_id} must form one direct parent-child chain.")
+                continue
+            ordered = [roots[0]]
+            current = roots[0]
+            while True:
+                selected_children = [name for name in children_by_name.get(current, []) if name in selected]
+                if not selected_children:
+                    break
+                if len(selected_children) > 1:
+                    errors.append(f"CoACD bone group {group_id} branches at {current}; choose one chain.")
+                    break
+                current = selected_children[0]
+                ordered.append(current)
+            if set(ordered) != selected:
+                errors.append(f"CoACD bone group {group_id} must be a continuous direct parent-child chain.")
+        return sorted(set(errors))
+
+    def populate_collision_bone_table(self) -> None:
+        entries = self.collision_bone_entries()
+        presets = self.collision_rotation_presets()
+        self._updating_collision_bone_table = True
+        self.collision_bone_table.setRowCount(len(entries))
+        for row, entry in enumerate(entries):
+            name = str(entry.get("name") or "")
+            is_default = bool(entry.get("is_default_target", False))
+            group_combo = QtWidgets.QComboBox()
+            group_combo.addItem("", 0)
+            for group_id in range(1, 15):
+                group_combo.addItem(str(group_id), group_id)
+            group_combo.setEnabled(not is_default)
+            group_combo.currentIndexChanged.connect(lambda _index, r=row: self.on_collision_bone_combo_changed(r))
+            self.collision_bone_table.setCellWidget(row, 0, group_combo)
+
+            rotation_combo = QtWidgets.QComboBox()
+            rotation_combo.addItem("", "")
+            for preset in presets:
+                code = str(preset.get("code") or "")
+                label = str(preset.get("label") or code)
+                if code:
+                    rotation_combo.addItem(f"{code} - {label}", code)
+            rotation_combo.setEnabled(False)
+            rotation_combo.currentIndexChanged.connect(lambda _index, r=row: self.on_collision_bone_combo_changed(r))
+            self.collision_bone_table.setCellWidget(row, 1, rotation_combo)
+
+            children = entry.get("children", [])
+            children_text = ", ".join(str(child) for child in children if child) if isinstance(children, list) else ""
+            warnings = "; ".join(str(warning) for warning in entry.get("warnings", []) if warning) if isinstance(entry.get("warnings"), list) else ""
+            values = [
+                name,
+                str(entry.get("parent") or ""),
+                children_text,
+                "Yes" if is_default else "No",
+                warnings,
+            ]
+            for column, value in enumerate(values, start=2):
+                item = QtWidgets.QTableWidgetItem(value)
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, name)
+                if value:
+                    item.setToolTip(value)
+                item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                self.collision_bone_table.setItem(row, column, item)
+        self._updating_collision_bone_table = False
+        for row in range(self.collision_bone_table.rowCount()):
+            self.collision_bone_table.setRowHeight(row, 34)
+
+    def on_collision_bone_combo_changed(self, row: int) -> None:
+        if self._updating_collision_bone_table:
+            return
+        group_widget = self.collision_bone_table.cellWidget(row, 0)
+        rotation_widget = self.collision_bone_table.cellWidget(row, 1)
+        group_id = 0
+        if isinstance(group_widget, QtWidgets.QComboBox):
+            try:
+                group_id = int(group_widget.currentData() or 0)
+            except Exception:
+                group_id = 0
+        if isinstance(rotation_widget, QtWidgets.QComboBox):
+            rotation_widget.setEnabled(group_id > 0)
+            if group_id <= 0 and rotation_widget.currentIndex() != 0:
+                self._updating_collision_bone_table = True
+                rotation_widget.setCurrentIndex(0)
+                self._updating_collision_bone_table = False
+        if self.current_collision_plan is not None:
+            self.current_collision_analysis = None
+            self.current_collision_plan = None
+            self.collision_table.setRowCount(0)
+            self.collision_apply_button.setEnabled(False)
+            self.collision_validate_button.setEnabled(False)
+        self.refresh_collision_bone_preview()
+        self.update_collision_summary()
+
+    def start_collision_bone_scan(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        if not self.ensure_step_can_run(8):
+            return
+        input_raw = self.collision_input_row.value()
+        if not input_raw:
+            self.show_error("Select CoACD bones failed", "Select the Step 7 .blend first.")
+            return
+        input_blend = Path(input_raw)
+        if not input_blend.exists():
+            self.show_error("Select CoACD bones failed", f"Step 7 .blend not found:\n{input_blend}")
+            return
+        self.set_step_working(8, "Preparing Step 8 collision bone scan")
+        self.collision_log.clear()
+        self.set_collision_progress(0, "Queued", "Scanning optional collision bones", "#58a6ff")
+        self.collision_bones_button.setEnabled(False)
+        self.collision_sources_button.setEnabled(False)
+        self.collision_analyze_button.setEnabled(False)
+        self.collision_apply_button.setEnabled(False)
+        self.collision_validate_button.setEnabled(False)
+        self.detect_flex_blend_button.setEnabled(False)
+        self.collision_cancel_button.setEnabled(True)
+        self.worker = CollisionBoneScanWorker(str(input_blend))
+        self.worker.log.connect(self.append_collision_log)
+        self.worker.done.connect(self.collision_bone_scan_done)
+        self.worker.failed.connect(self.collision_failed)
+        self.worker.start()
+
+    def collision_bone_scan_done(self, result: dict) -> None:
+        self.collision_bones_button.setEnabled(True)
+        self.collision_sources_button.setEnabled(True)
+        self.collision_analyze_button.setEnabled(True)
+        self.detect_flex_blend_button.setEnabled(True)
+        self.collision_cancel_button.setEnabled(False)
+        self.current_collision_bones = result.get("bones_data") if isinstance(result.get("bones_data"), dict) else None
+        self.collision_output_edit.setText(str(result.get("collision_dir", "")))
+        self.collision_log_label.setText(str(result.get("log", "")))
+        self.open_collision_folder_button.setEnabled(True)
+        self.populate_collision_bone_table()
+        self.collision_bone_group.setVisible(True)
+        self.refresh_collision_bone_preview()
+        self.update_collision_summary()
+        self.set_collision_progress(100, "Bone Scan Complete", str(result.get("bones", "")), "#2ea043")
+        self.clear_step_state(8, "Step 8 bone scan complete")
+
+    def refresh_collision_bone_preview(self) -> None:
+        if self.collision_preview is None or not self.current_collision_bones:
+            return
+        scan = {
+            "materials": self.current_collision_bones.get("materials", []),
+            "material_count": self.current_collision_bones.get("material_count", 0),
+            "model_preview": self.current_collision_bones.get("model_preview", {}),
+        }
+        self.collision_preview.set_material_data(scan, {})
+        self.collision_preview.set_bone_overlay(self.current_collision_bones.get("bone_preview", {}))
+        self.collision_preview.set_collision_overlay(self.collision_preview_from_plan() if self.current_collision_plan else {})
+        self.refresh_collision_bone_preview_state()
+
+    def refresh_collision_bone_preview_state(self) -> None:
+        if self.collision_preview is None:
+            return
+        highlighted: set[str] = set()
+        groups = self.selected_collision_bone_groups() or []
+        for group in groups:
+            bones = group.get("bones", [])
+            if isinstance(bones, list):
+                highlighted.update(str(name) for name in bones if str(name))
+        rows = sorted({index.row() for index in self.collision_bone_table.selectionModel().selectedRows()}) if hasattr(self, "collision_bone_table") else []
+        for row in rows:
+            name = self.collision_bone_name_for_row(row)
+            if name:
+                highlighted.add(name)
+        self.collision_preview.set_highlighted_bone_overlay(highlighted)
+        self.collision_preview.set_hovered_bone_overlay(self._hover_collision_bone_uid)
+
+    def update_collision_bone_hover_for_row(self, row: int) -> None:
+        if row < 0 or row >= self.collision_bone_table.rowCount():
+            self.clear_collision_bone_hover()
+            return
+        uid = self.collision_bone_name_for_row(row)
+        if uid == self._hover_collision_bone_uid:
+            return
+        self._hover_collision_bone_uid = uid
+        self.refresh_collision_bone_preview_state()
+
+    def clear_collision_bone_hover(self) -> None:
+        self._hover_collision_bone_uid = ""
+        self.refresh_collision_bone_preview_state()
+
+    def on_collision_bone_table_selection_changed(self) -> None:
+        self.refresh_collision_bone_preview_state()
+
+    def selected_collision_source_bodygroups(self) -> list[str] | None:
+        if not self.current_collision_sources:
+            return None
+        enabled: list[str] = []
+        for row in range(self.collision_source_table.rowCount()):
+            item = self.collision_source_table.item(row, 0)
+            if item and item.checkState() == QtCore.Qt.CheckState.Checked:
+                name = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+                if name:
+                    enabled.append(name)
+        return enabled
+
+    def start_collision_source_scan(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        if not self.ensure_step_can_run(8):
+            return
+        input_raw = self.collision_input_row.value()
+        if not input_raw:
+            self.show_error("Select CoACD bodygroups failed", "Select the Step 7 .blend first.")
+            return
+        input_blend = Path(input_raw)
+        if not input_blend.exists():
+            self.show_error("Select CoACD bodygroups failed", f"Step 7 .blend not found:\n{input_blend}")
+            return
+        self.set_step_working(8, "Preparing Step 8 collision source scan")
+        self.collision_log.clear()
+        self.set_collision_progress(0, "Queued", "Scanning collision source bodygroups", "#58a6ff")
+        additional_groups = self.selected_collision_bone_groups()
+        self.collision_sources_button.setEnabled(False)
+        self.collision_bones_button.setEnabled(False)
+        self.collision_analyze_button.setEnabled(False)
+        self.collision_apply_button.setEnabled(False)
+        self.collision_validate_button.setEnabled(False)
+        self.detect_flex_blend_button.setEnabled(False)
+        self.collision_cancel_button.setEnabled(True)
+        self.worker = CollisionSourceScanWorker(str(input_blend), additional_groups)
+        self.worker.log.connect(self.append_collision_log)
+        self.worker.done.connect(self.collision_source_scan_done)
+        self.worker.failed.connect(self.collision_failed)
+        self.worker.start()
+
+    def collision_source_scan_done(self, result: dict) -> None:
+        self.collision_sources_button.setEnabled(True)
+        self.collision_bones_button.setEnabled(True)
+        self.collision_analyze_button.setEnabled(True)
+        self.detect_flex_blend_button.setEnabled(True)
+        self.collision_cancel_button.setEnabled(False)
+        self.current_collision_sources = result.get("sources_data") if isinstance(result.get("sources_data"), dict) else None
+        self.collision_output_edit.setText(str(result.get("collision_dir", "")))
+        self.collision_log_label.setText(str(result.get("log", "")))
+        self.open_collision_folder_button.setEnabled(True)
+        self.populate_collision_source_table()
+        self.collision_source_group.setVisible(True)
+        self.refresh_collision_source_preview()
+        self.update_collision_summary()
+        self.set_collision_progress(100, "Source Scan Complete", str(result.get("sources", "")), "#2ea043")
+        self.clear_step_state(8, "Step 8 source scan complete")
+
+    def collision_source_entries(self) -> list[dict[str, object]]:
+        if not self.current_collision_sources:
+            return []
+        entries = self.current_collision_sources.get("source_bodygroups", [])
+        return [entry for entry in entries if isinstance(entry, dict)] if isinstance(entries, list) else []
+
+    def populate_collision_source_table(self) -> None:
+        entries = self.collision_source_entries()
+        self._updating_collision_source_table = True
+        self.collision_source_table.setRowCount(len(entries))
+        for row, entry in enumerate(entries):
+            name = str(entry.get("name") or "")
+            use_item = QtWidgets.QTableWidgetItem("")
+            use_item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsUserCheckable | QtCore.Qt.ItemFlag.ItemIsSelectable)
+            use_item.setCheckState(QtCore.Qt.CheckState.Checked if entry.get("enabled", True) else QtCore.Qt.CheckState.Unchecked)
+            use_item.setData(QtCore.Qt.ItemDataRole.UserRole, name)
+            self.collision_source_table.setItem(row, 0, use_item)
+            warnings = "; ".join(str(warning) for warning in entry.get("warnings", []) if warning) if isinstance(entry.get("warnings"), list) else ""
+            values = [
+                name,
+                f"{int(entry.get('vertex_count', 0) or 0):,}",
+                f"{int(entry.get('face_count', 0) or 0):,}",
+                f"{int(entry.get('material_count', 0) or 0):,}",
+                f"{int(entry.get('target_weighted_vertex_count', 0) or 0):,}",
+                warnings,
+            ]
+            for column, value in enumerate(values, start=1):
+                item = QtWidgets.QTableWidgetItem(value)
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, name)
+                if value:
+                    item.setToolTip(value)
+                item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                self.collision_source_table.setItem(row, column, item)
+        self._updating_collision_source_table = False
+        for row in range(self.collision_source_table.rowCount()):
+            self.collision_source_table.setRowHeight(row, 32)
+
+    def refresh_collision_source_preview(self) -> None:
+        if self.collision_preview is None or not self.current_collision_sources:
+            return
+        enabled = set(self.selected_collision_source_bodygroups() or [])
+        scan = {
+            "materials": [],
+            "material_count": self.current_collision_sources.get("material_count", 0),
+            "model_preview": self.current_collision_sources.get("model_preview", {}),
+        }
+        materials = self.current_collision_sources.get("materials", [])
+        if isinstance(materials, list):
+            for raw in materials:
+                if not isinstance(raw, dict):
+                    continue
+                entry = dict(raw)
+                bodygroup = str(entry.get("bodygroup") or "")
+                entry["keep"] = bodygroup in enabled if enabled else False
+                entry["render_when_highlighted"] = True
+                scan["materials"].append(entry)
+        self.collision_preview.set_material_data(scan, {})
+        if self.current_collision_bones:
+            self.collision_preview.set_bone_overlay(self.current_collision_bones.get("bone_preview", {}))
+        self.collision_preview.set_collision_overlay(self.collision_preview_from_plan() if self.current_collision_plan else {})
+        self.refresh_collision_bone_preview_state()
+        self.refresh_collision_preview_state()
+
+    def collision_source_highlight_uid(self, bodygroup: str) -> str:
+        if not self.current_collision_sources:
+            return ""
+        materials = self.current_collision_sources.get("materials", [])
+        if not isinstance(materials, list):
+            return ""
+        for raw in materials:
+            if isinstance(raw, dict) and str(raw.get("bodygroup") or "") == bodygroup:
+                return str(raw.get("bodygroup_uid") or raw.get("highlight_group") or raw.get("uid") or "")
+        return ""
+
+    def update_collision_source_hover_for_row(self, row: int) -> None:
+        if self.collision_preview is None:
+            return
+        if row < 0 or row >= self.collision_source_table.rowCount():
+            self.clear_collision_source_hover()
+            return
+        item = self.collision_source_table.item(row, 0)
+        bodygroup = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "") if item else ""
+        if bodygroup == self._hover_collision_source_bodygroup:
+            return
+        self._hover_collision_source_bodygroup = bodygroup
+        highlight_uid = self.collision_source_highlight_uid(bodygroup)
+        self.collision_preview.set_highlighted_materials({highlight_uid} if highlight_uid else set())
+        self.collision_preview.set_isolated_bodygroup(bodygroup)
+
+    def clear_collision_source_hover(self) -> None:
+        self._hover_collision_source_bodygroup = ""
+        if self.collision_preview is not None:
+            self.collision_preview.set_highlighted_materials(set())
+            self.collision_preview.set_isolated_bodygroup("")
+
+    def on_collision_source_table_selection_changed(self) -> None:
+        rows = sorted({index.row() for index in self.collision_source_table.selectionModel().selectedRows()})
+        if rows:
+            self.update_collision_source_hover_for_row(rows[0])
+
+    def on_collision_source_table_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
+        if self._updating_collision_source_table or not self.current_collision_sources:
+            return
+        name = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+        for entry in self.collision_source_entries():
+            if str(entry.get("name") or "") == name:
+                entry["enabled"] = item.checkState() == QtCore.Qt.CheckState.Checked
+                break
+        if self.current_collision_plan is not None:
+            self.current_collision_analysis = None
+            self.current_collision_plan = None
+            self.collision_table.setRowCount(0)
+            self.collision_apply_button.setEnabled(False)
+            self.collision_validate_button.setEnabled(False)
+        self.refresh_collision_source_preview()
+        self.update_collision_summary()
+
+    def start_collision_analyze(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        if not self.ensure_step_can_run(8):
+            return
+        input_raw = self.collision_input_row.value()
+        if not input_raw:
+            self.show_error("Analyze collision failed", "Select the Step 7 .blend first.")
+            return
+        input_blend = Path(input_raw)
+        if not input_blend.exists():
+            self.show_error("Analyze collision failed", f"Step 7 .blend not found:\n{input_blend}")
+            return
+        source_bodygroups = self.selected_collision_source_bodygroups()
+        if source_bodygroups is not None and not source_bodygroups:
+            self.show_error("Analyze collision failed", "Select at least one CoACD source bodygroup.")
+            return
+        bone_errors = self.validate_collision_bone_groups()
+        if bone_errors:
+            self.show_error("Analyze collision failed", "Fix the CoACD bone selection:\n" + "\n".join(f"- {error}" for error in bone_errors))
+            return
+        additional_groups = self.selected_collision_bone_groups()
+        quality_preset = str(self.collision_quality_combo.currentData() or "fast_preview") if hasattr(self, "collision_quality_combo") else "fast_preview"
+        self.current_collision_analysis = None
+        self.current_collision_plan = None
+        self.collision_log.clear()
+        self.collision_table.setRowCount(0)
+        if self.collision_preview is not None:
+            self.collision_preview.clear()
+        self.set_step_working(8, "Preparing Step 8 collision analysis")
+        self.set_collision_progress(0, "Queued", "Preparing collision analysis", "#58a6ff")
+        self.collision_analyze_button.setEnabled(False)
+        self.collision_apply_button.setEnabled(False)
+        self.collision_validate_button.setEnabled(False)
+        self.collision_sources_button.setEnabled(False)
+        self.collision_bones_button.setEnabled(False)
+        self.detect_flex_blend_button.setEnabled(False)
+        self.collision_quality_combo.setEnabled(False)
+        self.collision_cancel_button.setEnabled(True)
+        self.worker = CollisionAnalyzeWorker(str(input_blend), source_bodygroups, additional_groups, quality_preset)
+        self.worker.log.connect(self.append_collision_log)
+        self.worker.done.connect(self.collision_analyze_done)
+        self.worker.failed.connect(self.collision_failed)
+        self.worker.start()
+
+    def collision_analyze_done(self, result: dict) -> None:
+        self.collision_analyze_button.setEnabled(True)
+        self.collision_sources_button.setEnabled(True)
+        self.collision_bones_button.setEnabled(True)
+        self.detect_flex_blend_button.setEnabled(True)
+        self.collision_quality_combo.setEnabled(True)
+        self.collision_cancel_button.setEnabled(False)
+        self.collision_apply_button.setEnabled(True)
+        self.collision_validate_button.setEnabled(True)
+        self.current_collision_analysis = result.get("analysis_data") if isinstance(result.get("analysis_data"), dict) else None
+        self.current_collision_plan = result.get("plan_data") if isinstance(result.get("plan_data"), dict) else None
+        if self.current_collision_analysis and not self.current_collision_sources:
+            self.current_collision_sources = {
+                "source_bodygroups": self.current_collision_analysis.get("source_bodygroups", []),
+                "selected_source_bodygroups": self.current_collision_analysis.get("selected_source_bodygroups", []),
+                "materials": self.current_collision_analysis.get("materials", []),
+                "material_count": self.current_collision_analysis.get("material_count", 0),
+                "model_preview": self.current_collision_analysis.get("model_preview", {}),
+            }
+            selected = set(str(name) for name in self.current_collision_analysis.get("selected_source_bodygroups", []) if name)
+            for entry in self.collision_source_entries():
+                if selected:
+                    entry["enabled"] = str(entry.get("name") or "") in selected
+            self.populate_collision_source_table()
+            self.collision_source_group.setVisible(True)
+        for entry in self.collision_entries():
+            entry.setdefault("base_shrink", entry.get("shrink", 1.0))
+        self.collision_output_edit.setText(str(result.get("collision_dir", "")))
+        self.collision_analysis_label.setText(str(result.get("analysis", "")))
+        self.collision_plan_label.setText(str(result.get("plan", "")))
+        self.collision_log_label.setText(str(result.get("log", "")))
+        self.collision_settings_label.setText(str(result.get("physics_settings", "")))
+        self.collision_smd_label.setText(str(result.get("physics_smd", "")))
+        self.open_collision_folder_button.setEnabled(True)
+        self.populate_collision_table()
+        self.refresh_collision_preview()
+        self.update_collision_summary()
+        self.set_collision_progress(100, "Analysis Complete", str(result.get("analysis", "")), "#2ea043")
+        self.clear_step_state(8, "Step 8 analysis complete")
+
+    def collision_failed(self, message: str) -> None:
+        self.collision_analyze_button.setEnabled(True)
+        self.collision_sources_button.setEnabled(True)
+        self.collision_bones_button.setEnabled(True)
+        self.detect_flex_blend_button.setEnabled(True)
+        self.collision_quality_combo.setEnabled(True)
+        self.collision_cancel_button.setEnabled(False)
+        self.collision_apply_button.setEnabled(self.current_collision_plan is not None)
+        self.collision_validate_button.setEnabled(self.current_collision_plan is not None)
+        self.set_collision_progress(self.collision_progress_bar.value(), "Collision Step Failed", "See the log for details.", "#f85149")
+        self.set_step_failed(8, "Step 8 collision step failed")
+        self.show_error("Collision step failed", message)
+
+    def cancel_collision(self) -> None:
+        if self.worker and self.worker.isRunning() and hasattr(self.worker, "cancel"):
+            self.worker.cancel()  # type: ignore[attr-defined]
+            self.append_collision_log("Cancel requested.")
+
+    def populate_collision_table(self) -> None:
+        entries = self.collision_entries()
+        self._updating_collision_table = True
+        self.collision_table.setRowCount(len(entries))
+        for row, entry in enumerate(entries):
+            uid = str(entry.get("uid") or "")
+            use_item = QtWidgets.QTableWidgetItem("")
+            use_item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsUserCheckable | QtCore.Qt.ItemFlag.ItemIsSelectable)
+            use_item.setCheckState(QtCore.Qt.CheckState.Checked if entry.get("enabled", True) else QtCore.Qt.CheckState.Unchecked)
+            use_item.setData(QtCore.Qt.ItemDataRole.UserRole, uid)
+            self.collision_table.setItem(row, 0, use_item)
+            settings = ", ".join(str(item.get("line") or "") for item in entry.get("settings", []) if isinstance(item, dict))
+            warnings = "; ".join(str(w) for w in entry.get("warnings", []) if w) if isinstance(entry.get("warnings"), list) else ""
+            hull_count = int(entry.get("hull_piece_count", 0) or 0)
+            hull_text = f"{hull_count} hull piece{'s' if hull_count != 1 else ''}" if hull_count else "no hull pieces"
+            try:
+                metric_text = f"coverage {float(entry.get('coverage_score', 0.0) or 0.0):.2f}"
+            except Exception:
+                metric_text = ""
+            region = entry.get("region", {}) if isinstance(entry.get("region"), dict) else {}
+            region_text = ""
+            if region:
+                try:
+                    influence_count = len(region.get("influence_bones", [])) if isinstance(region.get("influence_bones", []), list) else 0
+                    region_text = (
+                        f"weight threshold {float(region.get('weight_threshold', 0.0) or 0.0):.3f}; "
+                        f"region faces {int(region.get('selected_face_count', 0) or 0):,}; "
+                        f"child faces {int(region.get('child_face_count', 0) or 0):,}; "
+                        f"influence bones {influence_count:,}"
+                    )
+                except Exception:
+                    region_text = ""
+            coacd = entry.get("coacd", {}) if isinstance(entry.get("coacd"), dict) else {}
+            coacd_text = ""
+            if coacd:
+                quality = str(coacd.get("quality_label") or coacd.get("quality_preset") or "")
+                sampled = coacd.get("sampled_faces", "")
+                duration = coacd.get("duration_seconds", "")
+                cache_text = "cache hit" if coacd.get("cache_hit", False) else "computed"
+                coacd_bits = ["CoACD " + ("available" if coacd.get("available", False) else "unavailable"), cache_text]
+                if quality:
+                    coacd_bits.append(quality)
+                if sampled != "":
+                    coacd_bits.append(f"sampled faces {int(sampled):,}")
+                try:
+                    if duration != "":
+                        coacd_bits.append(f"{float(duration):.2f}s")
+                except Exception:
+                    pass
+                coacd_text = ", ".join(coacd_bits)
+            values = [
+                str(entry.get("bone", "")),
+                str(entry.get("shape_type", "")),
+                f"{self.flex_float(entry.get('shrink', 1.0), 1.0):.3f}",
+                f"{self.flex_float(entry.get('volume', 0.0), 0.0):.4f}",
+                f"{int(entry.get('vertex_count', 0) or 0):,}",
+                f"{int(entry.get('face_count', 0) or 0):,}",
+                f"{int(entry.get('source_vertex_count', 0) or 0):,}",
+                f"{self.flex_float(entry.get('fit_confidence', 0.0), 0.0):.3f}",
+                "; ".join(part for part in (hull_text, metric_text, region_text, coacd_text, settings, warnings) if part),
+            ]
+            for column, value in enumerate(values, start=1):
+                item = QtWidgets.QTableWidgetItem(value)
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, uid)
+                if value:
+                    item.setToolTip(value)
+                if column == 3:
+                    item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsEditable)
+                else:
+                    item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                self.collision_table.setItem(row, column, item)
+        self._updating_collision_table = False
+        for row in range(self.collision_table.rowCount()):
+            self.collision_table.setRowHeight(row, 38)
+
+    def collision_entry_for_uid(self, uid: str) -> dict[str, object] | None:
+        for entry in self.collision_entries():
+            if str(entry.get("uid") or "") == uid:
+                return entry
+        return None
+
+    def selected_collision_uid(self) -> str:
+        if not hasattr(self, "collision_table"):
+            return ""
+        rows = sorted({index.row() for index in self.collision_table.selectionModel().selectedRows()})
+        if not rows:
+            return ""
+        item = self.collision_table.item(rows[0], 0)
+        return str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "") if item else ""
+
+    def collision_preview_from_plan(self) -> dict[str, object]:
+        triangles: list[dict[str, object]] = []
+        for entry in self.collision_entries():
+            uid = str(entry.get("uid") or "")
+            vertices = entry.get("preview_vertices", entry.get("vertices", []))
+            faces = entry.get("faces", [])
+            center_raw = entry.get("preview_center", entry.get("center", [0.0, 0.0, 0.0]))
+            if not isinstance(vertices, list) or not isinstance(faces, list) or not isinstance(center_raw, list) or len(center_raw) < 3:
+                continue
+            try:
+                center = [float(center_raw[0]), float(center_raw[1]), float(center_raw[2])]
+                shrink = self.flex_float(entry.get("shrink", 1.0), 1.0)
+                base_shrink = max(0.001, self.flex_float(entry.get("base_shrink", shrink), shrink))
+                ratio = max(0.1, min(3.0, shrink / base_shrink))
+            except Exception:
+                center = [0.0, 0.0, 0.0]
+                ratio = 1.0
+            scaled_vertices = []
+            for raw in vertices:
+                if isinstance(raw, list) and len(raw) >= 3:
+                    scaled_vertices.append(
+                        [
+                            center[0] + (float(raw[0]) - center[0]) * ratio,
+                            center[1] + (float(raw[1]) - center[1]) * ratio,
+                            center[2] + (float(raw[2]) - center[2]) * ratio,
+                        ]
+                    )
+            color = entry.get("preview_color") or [0.2, 0.75, 1.0, 0.85]
+            if not isinstance(color, list):
+                color = [0.2, 0.75, 1.0, 0.85]
+            for face in faces:
+                if not isinstance(face, list) or len(face) < 3:
+                    continue
+                try:
+                    points = [scaled_vertices[int(face[index])] for index in range(3)]
+                except Exception:
+                    continue
+                triangles.append(
+                    {
+                        "points": points,
+                        "uid": uid,
+                        "bone": str(entry.get("bone") or uid),
+                        "color": color,
+                    }
+                )
+        return {"triangles": triangles, "triangle_count": len(triangles)}
+
+    def refresh_collision_preview(self) -> None:
+        if self.collision_preview is None:
+            return
+        if not self.current_collision_analysis:
+            self.collision_preview.clear()
+            return
+        scan = {
+            "materials": self.current_collision_analysis.get("materials", []),
+            "material_count": self.current_collision_analysis.get("material_count", 0),
+            "model_preview": self.current_collision_analysis.get("model_preview", {}),
+        }
+        self.collision_preview.set_material_data(scan, {})
+        if self.current_collision_bones:
+            self.collision_preview.set_bone_overlay(self.current_collision_bones.get("bone_preview", {}))
+        self.collision_preview.set_collision_overlay(self.collision_preview_from_plan())
+        self.refresh_collision_bone_preview_state()
+        self.refresh_collision_preview_state()
+
+    def refresh_collision_preview_state(self) -> None:
+        if self.collision_preview is None:
+            return
+        selected = self.selected_collision_uid()
+        highlighted = {selected} if selected else set()
+        self.collision_preview.set_highlighted_collisions(highlighted)
+        self.collision_preview.set_hovered_collision(self._hover_collision_uid)
+
+    def update_collision_hover_for_row(self, row: int) -> None:
+        if row < 0 or row >= self.collision_table.rowCount():
+            self.clear_collision_hover()
+            return
+        item = self.collision_table.item(row, 0)
+        uid = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "") if item else ""
+        if uid == self._hover_collision_uid:
+            return
+        self._hover_collision_uid = uid
+        self.refresh_collision_preview_state()
+
+    def clear_collision_hover(self) -> None:
+        self._hover_collision_uid = ""
+        self.refresh_collision_preview_state()
+
+    def on_collision_table_selection_changed(self) -> None:
+        self.refresh_collision_preview_state()
+
+    def on_collision_table_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
+        if self._updating_collision_table or not self.current_collision_plan:
+            return
+        uid = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+        entry = self.collision_entry_for_uid(uid)
+        if not entry:
+            return
+        if item.column() == 0:
+            entry["enabled"] = item.checkState() == QtCore.Qt.CheckState.Checked
+        elif item.column() == 3:
+            try:
+                entry["shrink"] = max(0.25, min(1.25, float(item.text())))
+            except Exception:
+                entry["shrink"] = entry.get("base_shrink", 1.0)
+            self._updating_collision_table = True
+            item.setText(f"{self.flex_float(entry.get('shrink', 1.0), 1.0):.3f}")
+            self._updating_collision_table = False
+        self.update_collision_summary()
+        self.collision_preview.set_collision_overlay(self.collision_preview_from_plan()) if self.collision_preview is not None else None
+        self.refresh_collision_preview_state()
+
+    def update_collision_summary(self) -> None:
+        if not self.current_collision_plan:
+            bone_groups = self.selected_collision_bone_groups() or []
+            if self.current_collision_sources:
+                total_sources = len(self.collision_source_entries())
+                enabled_sources = len(self.selected_collision_source_bodygroups() or [])
+                self.collision_summary_label.setText(
+                    f"CoACD source bodygroups: {enabled_sources:,}/{total_sources:,} enabled. "
+                    f"Additional bone groups: {len(bone_groups):,}. Analyze collision when the selection is ready."
+                )
+            elif self.current_collision_bones:
+                total_bones = len(self.collision_bone_entries())
+                self.collision_summary_label.setText(
+                    f"CoACD bones scanned: {total_bones:,}. Additional bone groups: {len(bone_groups):,}. "
+                    "Optionally select source bodygroups, then analyze collision volumes."
+                )
+            else:
+                self.collision_summary_label.setText("Detect a Step 7 blend, optionally select CoACD bones/bodygroups, then analyze collision volumes.")
+            return
+        entries = self.collision_entries()
+        enabled = sum(1 for entry in entries if entry.get("enabled", True))
+        sparse = sum(1 for entry in entries if int(entry.get("source_vertex_count", 0) or 0) < 12)
+        hulls = sum(int(entry.get("hull_piece_count", 0) or 0) for entry in entries)
+        errors = self.validate_collision_plan()
+        source_text = ""
+        selected_sources = self.current_collision_plan.get("selected_source_bodygroups", [])
+        if isinstance(selected_sources, list) and selected_sources:
+            source_text = f" | Source bodygroups: {len(selected_sources):,}"
+        quality_text = ""
+        quality = self.current_collision_plan.get("coacd_quality", {}) if isinstance(self.current_collision_plan, dict) else {}
+        if isinstance(quality, dict):
+            quality_label = str(quality.get("label") or quality.get("preset") or "")
+            if quality_label:
+                quality_text = f" | Quality: {quality_label}"
+        additional_text = ""
+        groups = self.current_collision_plan.get("additional_collision_groups", [])
+        if isinstance(groups, list) and groups:
+            additional_text = f" | Additional bone groups: {len(groups):,}"
+        self.collision_summary_label.setText(
+            f"Physics parts: {len(entries):,} | Enabled: {enabled:,}/{len(entries):,} | "
+            f"Hulls: {hulls:,} | Sparse fallback parts: {sparse:,} | "
+            f"Validation: {'OK' if not errors else f'{len(errors)} blocking issue(s)'}{source_text}{additional_text}{quality_text}"
+        )
+
+    def validate_collision_plan(self) -> list[str]:
+        if not self.current_collision_plan:
+            return ["Run Analyze Collision first."]
+        target_bones = [str(item) for item in self.current_collision_plan.get("target_bones", [])] or [
+            str(entry.get("bone") or "") for entry in self.collision_entries()
+        ]
+        by_bone = {str(entry.get("bone") or ""): entry for entry in self.collision_entries()}
+        errors: list[str] = []
+        for bone in target_bones:
+            entry = by_bone.get(bone)
+            if not entry:
+                errors.append(f"Missing collision part for {bone}.")
+                continue
+            if not entry.get("enabled", True):
+                errors.append(f"Collision part for {bone} is disabled.")
+            try:
+                shrink = self.flex_float(entry.get("shrink", 1.0), 1.0)
+            except Exception:
+                shrink = 0.0
+            if shrink <= 0.0:
+                errors.append(f"{bone}: shrink must be positive.")
+            if self.flex_float(entry.get("volume", 0.0), 0.0) <= 0.0:
+                errors.append(f"{bone}: generated volume is zero.")
+            if int(entry.get("hull_piece_count", 0) or 0) <= 0:
+                errors.append(f"{bone}: no hull pieces were generated.")
+            if int(entry.get("hull_piece_count", 0) or 0) > 1:
+                errors.append(f"{bone}: multiple disconnected collision pieces were generated; exactly one connected piece is required.")
+        return errors
+
+    def show_collision_validation(self) -> None:
+        errors = self.validate_collision_plan()
+        if errors:
+            self.show_error("Collision validation", "Blocking errors:\n" + "\n".join(f"- {error}" for error in errors))
+            return
+        QtWidgets.QMessageBox.information(self, "Collision validation", "The collision plan is ready to apply.")
+
+    def start_collision_apply(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        if not self.ensure_step_can_run(8):
+            return
+        input_raw = self.collision_input_row.value()
+        if not input_raw:
+            self.show_error("Apply collision failed", "Select the Step 7 .blend first.")
+            return
+        if not self.current_collision_plan:
+            self.show_error("Apply collision failed", "Run Analyze Collision first.")
+            return
+        errors = self.validate_collision_plan()
+        if errors:
+            self.show_error("Collision validation", "Blocking errors:\n" + "\n".join(f"- {error}" for error in errors))
+            return
+        input_blend = Path(input_raw)
+        if not input_blend.exists():
+            self.show_error("Apply collision failed", f"Step 7 .blend not found:\n{input_blend}")
+            return
+        self.set_step_working(8, "Preparing Step 8 collision apply")
+        self.collision_log.clear()
+        self.set_collision_progress(0, "Queued", "Preparing collision generation", "#58a6ff")
+        self.collision_analyze_button.setEnabled(False)
+        self.collision_sources_button.setEnabled(False)
+        self.collision_bones_button.setEnabled(False)
+        self.collision_apply_button.setEnabled(False)
+        self.collision_validate_button.setEnabled(False)
+        self.detect_flex_blend_button.setEnabled(False)
+        self.collision_quality_combo.setEnabled(False)
+        self.collision_cancel_button.setEnabled(True)
+        self.worker = CollisionApplyWorker(str(input_blend), self.current_collision_plan)
+        self.worker.log.connect(self.append_collision_log)
+        self.worker.done.connect(self.collision_apply_done)
+        self.worker.failed.connect(self.collision_failed)
+        self.worker.start()
+
+    def collision_apply_done(self, result: dict) -> None:
+        self.collision_analyze_button.setEnabled(True)
+        self.collision_sources_button.setEnabled(True)
+        self.collision_bones_button.setEnabled(True)
+        self.collision_apply_button.setEnabled(True)
+        self.collision_validate_button.setEnabled(True)
+        self.detect_flex_blend_button.setEnabled(True)
+        self.collision_quality_combo.setEnabled(True)
+        self.collision_cancel_button.setEnabled(False)
+        self.collision_sorted_blend_path = str(result.get("output_blend", ""))
+        self.collision_blend_label.setText(self.collision_sorted_blend_path)
+        if self.collision_sorted_blend_path and hasattr(self, "proportion_input_row"):
+            self.proportion_input_row.set_value(self.collision_sorted_blend_path)
+        self.collision_output_edit.setText(str(result.get("collision_dir", "")))
+        self.collision_analysis_label.setText(str(result.get("analysis", "")))
+        self.collision_plan_label.setText(str(result.get("plan", "")))
+        self.collision_log_label.setText(str(result.get("log", "")))
+        self.collision_report_label.setText(str(result.get("report", "")))
+        self.collision_settings_label.setText(str(result.get("physics_settings", "")))
+        self.collision_smd_label.setText(str(result.get("physics_smd", "")))
+        self.open_collision_folder_button.setEnabled(True)
+        report = result.get("report_data") if isinstance(result.get("report_data"), dict) else {}
+        validation = report.get("validation") if isinstance(report.get("validation"), dict) else {}
+        if validation.get("ok"):
+            self.set_collision_progress(100, "Collision Complete", self.collision_sorted_blend_path, "#2ea043")
+            self.complete_step_from_result(
+                8,
+                result,
+                "collision_dir",
+                ["output_blend", "physics_smd", "physics_settings"],
+                report_key="report",
+                validation=validation,
+            )
+            QtWidgets.QMessageBox.information(self, "Collision complete", "The Physics mesh was generated and validated.")
+        else:
+            self.set_collision_progress(100, "Collision Complete With Warnings", self.collision_sorted_blend_path, "#d29922")
+
+    def append_proportion_log(self, message: str) -> None:
+        display = self.translate_runtime_text(str(message))
+        self.proportion_log.appendPlainText(display)
+        self.statusBar().showMessage(display[:160])
+        checks = [
+            ("Starting Blender proportion export", 3, "Starting Blender", "#58a6ff"),
+            ("Opening collision-sorted blend", 8, "Opening Step 8 Blend", "#58a6ff"),
+            ("Pre-processing Face Basis", 14, "Pre-processing Meshes", "#58a6ff"),
+            ("Checking ", 24, "Checking Bone Weights", "#58a6ff"),
+            ("Zero-weight cleanup removed", 27, "Removing Zero-Weight Bones", "#d29922"),
+            ("Face Basis stacking check", 22, "Fixing Face Vertex Stacking", "#58a6ff"),
+            ("Preparing armature", 30, "Preparing Armature", "#58a6ff"),
+            ("Saving prepared pre-proportion blend", 36, "Saving Pre-Proportion Blend", "#d29922"),
+            ("Exporting raw Source files", 45, "Raw SMD/VTA Export", "#58a6ff"),
+            ("Opening proportion trick template", 54, "Opening Proportion Template", "#58a6ff"),
+            ("Importing raw Body.smd", 60, "Importing Raw Body", "#58a6ff"),
+            ("Importing raw SMD", 66, "Importing Raw SMDs", "#58a6ff"),
+            ("Importing raw VTA", 70, "Importing Raw VTAs", "#58a6ff"),
+            ("Running Proportion Trick Full", 78, "Running Proportion Trick", "#d29922"),
+            ("Exporting final Source files", 88, "Final Source Export", "#58a6ff"),
+            ("Replacing final VTA", 94, "Replacing VTA Files", "#d29922"),
+            ("Wrote proportion export report", 98, "Writing Report", "#2ea043"),
+            ("Blender proportion export finished", 100, "Step 9 Complete", "#2ea043"),
+        ]
+        for needle, value, title, color in checks:
+            if needle in message:
+                self.set_proportion_progress(value, title, message, color)
+                break
+
+    def set_proportion_progress(self, value: int, title: str, detail: str, color: str = "#58a6ff") -> None:
+        value = max(0, min(100, int(value)))
+        self.proportion_progress_bar.setValue(value)
+        self.proportion_progress_label.setText(
+            f'<span style="color:{color};">{html.escape(title)}</span> - {value}%'
+            f'<br><span style="color:#8f98a3;">{html.escape(detail)}</span>'
+        )
+
+    def detect_step8_output(self) -> None:
+        candidates: list[Path] = []
+
+        def add_candidate(raw: object) -> None:
+            if raw is None:
+                return
+            text = str(raw).strip()
+            if text:
+                candidates.append(Path(text))
+
+        def add_sorted_glob(root: Path, pattern: str) -> None:
+            try:
+                matches = sorted(root.glob(pattern), key=lambda item: item.stat().st_mtime, reverse=True)
+            except Exception:
+                return
+            candidates.extend(matches)
+
+        for raw in (
+            self.proportion_input_row.value() if hasattr(self, "proportion_input_row") else "",
+            self.collision_sorted_blend_path,
+            self.collision_blend_label.text() if hasattr(self, "collision_blend_label") else "",
+            self.settings_store.value("proportion_input_blend", "", str),
+            self.settings_store.value("collision_input_blend", "", str),
+        ):
+            add_candidate(raw)
+
+        collision_output_text = self.collision_output_edit.text().strip() if hasattr(self, "collision_output_edit") else ""
+        if collision_output_text:
+            add_sorted_glob(Path(collision_output_text), "*_collision_sorted.blend")
+
+        workspace_text = self.workspace_edit.text().strip() if hasattr(self, "workspace_edit") else ""
+        if workspace_text:
+            add_sorted_glob(Path(workspace_text), "8_sort_collision/*_collision_sorted.blend")
+
+        for raw in (
+            self.settings_store.value("flex_input_blend", "", str),
+            self.flex_sorted_blend_path,
+            self.flex_blend_label.text() if hasattr(self, "flex_blend_label") else "",
+        ):
+            if raw:
+                candidate = Path(str(raw).strip())
+                if candidate.name.endswith("_collision_sorted.blend"):
+                    candidates.append(candidate)
+                    continue
+                if candidate.name.endswith("_flexes_sorted.blend") or candidate.parent.name == "7_sort_flexes":
+                    try:
+                        collision_dir, output_blend, *_rest = core.collision_paths_for_flex_blend(candidate)
+                        candidates.append(output_blend)
+                        add_sorted_glob(collision_dir, "*_collision_sorted.blend")
+                    except Exception:
+                        pass
+
+        add_sorted_glob(core.workspaces_root(), "*/8_sort_collision/*_collision_sorted.blend")
+
+        seen: set[Path] = set()
+        for candidate in candidates:
+            try:
+                candidate = candidate.resolve()
+            except Exception:
+                candidate = candidate.absolute()
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if candidate.exists():
+                self.proportion_input_row.set_value(str(candidate))
+                self.switch_to_step(9)
+                return
+        self.show_error("Detect Step 8 Output", "No Step 8 .blend output was found. Run Step 8 or browse to the collision-sorted blend.")
+
+    def on_proportion_input_changed(self, value: str) -> None:
+        self.proportion_export_dir = ""
+        self.proportion_files_table.setRowCount(0)
+        if value.strip():
+            self.update_proportion_output_preview(Path(value.strip()))
+        else:
+            self.proportion_output_edit.clear()
+            self.open_proportion_folder_button.setEnabled(False)
+        self.save_settings()
+
+    def update_proportion_output_preview(self, input_blend: Path) -> None:
+        try:
+            (
+                proportion_dir,
+                raw_dir,
+                workspace_dir,
+                final_dir,
+                pre_blend,
+                processed_blend,
+                report_json,
+                files_json,
+                log_path,
+            ) = core.proportion_paths_for_collision_blend(input_blend)
+            self.proportion_output_edit.setText(str(proportion_dir))
+            self.proportion_raw_label.setText(str(raw_dir))
+            self.proportion_workspace_label.setText(str(workspace_dir))
+            self.proportion_final_label.setText(str(final_dir))
+            self.proportion_pre_blend_label.setText(str(pre_blend) if pre_blend.exists() else str(pre_blend))
+            self.proportion_processed_blend_label.setText(str(processed_blend) if processed_blend.exists() else str(processed_blend))
+            self.proportion_report_label.setText(str(report_json) if report_json.exists() else str(report_json))
+            self.proportion_files_json_label.setText(str(files_json) if files_json.exists() else str(files_json))
+            self.proportion_log_label.setText(str(log_path))
+            self.open_proportion_folder_button.setEnabled(proportion_dir.exists())
+            if files_json.exists():
+                try:
+                    data = json.loads(files_json.read_text(encoding="utf-8"))
+                    self.populate_proportion_files(data.get("files", []))
+                except Exception:
+                    pass
+        except Exception:
+            self.proportion_output_edit.clear()
+
+    def start_proportion_run(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        if not self.ensure_step_can_run(9):
+            return
+        input_raw = self.proportion_input_row.value()
+        if not input_raw:
+            self.show_error("Run Step 9 failed", "Select the Step 8 .blend first.")
+            return
+        input_blend = Path(input_raw)
+        if not input_blend.exists():
+            self.show_error("Run Step 9 failed", f"Step 8 .blend not found:\n{input_blend}")
+            return
+        self.set_step_working(9, "Preparing Step 9 proportion export")
+        self.proportion_log.clear()
+        self.proportion_files_table.setRowCount(0)
+        self.set_proportion_progress(0, "Queued", "Preparing raw SMD export and proportion trick", "#58a6ff")
+        self.proportion_run_button.setEnabled(False)
+        self.detect_collision_blend_button.setEnabled(False)
+        self.proportion_cancel_button.setEnabled(True)
+        self.worker = ProportionRunWorker(
+            str(input_blend),
+            remove_zero_weight_bones=self.proportion_remove_zero_weight_check.isChecked(),
+        )
+        self.worker.log.connect(self.append_proportion_log)
+        self.worker.done.connect(self.proportion_done)
+        self.worker.failed.connect(self.proportion_failed)
+        self.worker.start()
+
+    def proportion_done(self, result: dict) -> None:
+        self.proportion_run_button.setEnabled(True)
+        self.detect_collision_blend_button.setEnabled(True)
+        self.proportion_cancel_button.setEnabled(False)
+        self.proportion_export_dir = str(result.get("proportion_dir", ""))
+        self.proportion_output_edit.setText(self.proportion_export_dir)
+        self.proportion_raw_label.setText(str(result.get("raw_dir", "")))
+        self.proportion_workspace_label.setText(str(result.get("workspace_dir", "")))
+        self.proportion_final_label.setText(str(result.get("final_dir", "")))
+        if result.get("final_dir") and hasattr(self, "carms_input_row"):
+            self.carms_input_row.set_value(str(result.get("final_dir", "")))
+        self.proportion_pre_blend_label.setText(str(result.get("pre_blend", "")))
+        self.proportion_processed_blend_label.setText(str(result.get("processed_blend", "")))
+        self.proportion_report_label.setText(str(result.get("report", "")))
+        self.proportion_files_json_label.setText(str(result.get("files", "")))
+        self.proportion_log_label.setText(str(result.get("log", "")))
+        self.open_proportion_folder_button.setEnabled(bool(self.proportion_export_dir))
+        files_data = result.get("files_data") if isinstance(result.get("files_data"), dict) else {}
+        self.populate_proportion_files(files_data.get("files", []))
+        count = self.proportion_files_table.rowCount()
+        self.proportion_summary_label.setText(f"Step 9 complete. Final export files: {count:,}.")
+        self.set_proportion_progress(100, "Step 9 Complete", str(result.get("final_dir", "")), "#2ea043")
+        self.complete_step_from_result(
+            9,
+            result,
+            "proportion_dir",
+            ["final_dir", "files", "processed_blend"],
+            report_key="report",
+            validation={"ok": True, "file_count": count},
+        )
+        QtWidgets.QMessageBox.information(self, "Step 9 complete", "Raw Source export and proportion trick completed.")
+
+    def proportion_failed(self, message: str) -> None:
+        self.proportion_run_button.setEnabled(True)
+        self.detect_collision_blend_button.setEnabled(True)
+        self.proportion_cancel_button.setEnabled(False)
+        self.set_proportion_progress(self.proportion_progress_bar.value(), "Step 9 Failed", "See the log for details.", "#f85149")
+        self.set_step_failed(9, "Step 9 proportion export failed")
+        self.show_error("Step 9 failed", message)
+
+    def cancel_proportion(self) -> None:
+        if self.worker and self.worker.isRunning() and hasattr(self.worker, "cancel"):
+            self.worker.cancel()  # type: ignore[attr-defined]
+            self.append_proportion_log("Cancel requested.")
+
+    def populate_proportion_files(self, files: object) -> None:
+        rows = files if isinstance(files, list) else []
+        self.proportion_files_table.setRowCount(len(rows))
+        for row, entry in enumerate(rows):
+            if not isinstance(entry, dict):
+                entry = {}
+            values = [
+                str(entry.get("relative_path") or entry.get("name") or ""),
+                str(entry.get("type") or ""),
+                self.format_file_size(int(entry.get("size", 0) or 0)),
+                str(entry.get("source_stage") or ""),
+                str(entry.get("warnings") or ""),
+            ]
+            for column, value in enumerate(values):
+                item = QtWidgets.QTableWidgetItem(value)
+                if value:
+                    item.setToolTip(value)
+                self.proportion_files_table.setItem(row, column, item)
+        self.proportion_files_table.resizeRowsToContents()
+
+    def format_file_size(self, size: int) -> str:
+        size = max(0, int(size))
+        units = ("B", "KB", "MB", "GB", "TB")
+        value = float(size)
+        unit = units[0]
+        for unit in units:
+            if value < 1024 or unit == units[-1]:
+                break
+            value /= 1024.0
+        if unit == "B":
+            return f"{int(value)} B"
+        return f"{value:.1f} {unit}"
+
+    def update_workspace_cache_size_label(self, calculating: bool = False) -> None:
+        label = getattr(self, "main_workspace_cache_size_label", None)
+        if not isinstance(label, QtWidgets.QLabel):
+            return
+        label.setToolTip(str(core.workspaces_root()))
+        if calculating:
+            label.setText(self._t("main.workspace_cache_calculating", "Workspace cache: calculating..."))
+            button = getattr(self, "main_clear_workspace_cache_button", None)
+            if isinstance(button, QtWidgets.QPushButton):
+                button.setEnabled(False)
+            return
+        if self.workspace_cache_size_bytes <= 0 and self.workspace_cache_folder_count <= 0:
+            label.setText(self._t("main.workspace_cache_empty", "Workspace cache: empty"))
+        else:
+            label.setText(
+                self._t(
+                    "main.workspace_cache_size",
+                    "Workspace cache: {size} ({count} folders)",
+                    size=self.format_file_size(self.workspace_cache_size_bytes),
+                    count=self.workspace_cache_folder_count,
+                )
+            )
+        button = getattr(self, "main_clear_workspace_cache_button", None)
+        if isinstance(button, QtWidgets.QPushButton):
+            cleanup_running = bool(self.workspace_cleanup_worker and self.workspace_cleanup_worker.isRunning())
+            button.setEnabled(not cleanup_running and (self.workspace_cache_size_bytes > 0 or self.workspace_cache_folder_count > 0))
+
+    def refresh_workspace_cache_size(self) -> None:
+        worker = self.workspace_size_worker
+        if worker is not None and worker.isRunning():
+            return
+        self.update_workspace_cache_size_label(calculating=True)
+        worker = WorkspaceSizeWorker(core.workspaces_root())
+        self.workspace_size_worker = worker
+        worker.done.connect(self.workspace_cache_size_ready)
+        worker.failed.connect(self.workspace_cache_size_failed)
+        worker.finished.connect(self.workspace_cache_size_finished)
+        worker.start()
+
+    def workspace_cache_size_ready(self, size: int, folder_count: int) -> None:
+        self.workspace_cache_size_bytes = max(0, int(size))
+        self.workspace_cache_folder_count = max(0, int(folder_count))
+        self.update_workspace_cache_size_label()
+
+    def workspace_cache_size_failed(self, message: str) -> None:
+        self.workspace_cache_size_bytes = 0
+        self.workspace_cache_folder_count = 0
+        label = getattr(self, "main_workspace_cache_size_label", None)
+        if isinstance(label, QtWidgets.QLabel):
+            label.setText(self._t("main.workspace_cache_failed", "Workspace cache: size scan failed"))
+            label.setToolTip(str(message))
+
+    def workspace_cache_size_finished(self) -> None:
+        self.workspace_size_worker = None
+
+    def clear_workspace_cache(self) -> None:
+        if self.worker and self.worker.isRunning():
+            self.show_error(
+                self._t("main.clear_workspace_cache_title", "Clear workspace cache"),
+                self._t("main.clear_workspace_cache_busy", "Wait for the current workflow step to finish before clearing workspace files."),
+            )
+            return
+        if self.workspace_cleanup_worker and self.workspace_cleanup_worker.isRunning():
+            return
+        root = core.workspaces_root()
+        if not root.exists():
+            self.workspace_cache_size_bytes = 0
+            self.workspace_cache_folder_count = 0
+            self.update_workspace_cache_size_label()
+            return
+        if self.workspace_cache_size_bytes <= 0 and self.workspace_cache_folder_count <= 0:
+            self.refresh_workspace_cache_size()
+            if self.workspace_cache_size_bytes <= 0 and self.workspace_cache_folder_count <= 0:
+                return
+        message = self._t(
+            "main.clear_workspace_cache_confirm",
+            "This will permanently delete all generated workspace folders and loose files inside:\n{path}\n\nCurrent size: {size}\n\nContinue?",
+            path=str(root),
+            size=self.format_file_size(self.workspace_cache_size_bytes),
+        )
+        reply = QtWidgets.QMessageBox.warning(
+            self,
+            self._t("main.clear_workspace_cache_title", "Clear workspace cache"),
+            message,
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        button = getattr(self, "main_clear_workspace_cache_button", None)
+        if isinstance(button, QtWidgets.QPushButton):
+            button.setEnabled(False)
+        label = getattr(self, "main_workspace_cache_size_label", None)
+        if isinstance(label, QtWidgets.QLabel):
+            label.setText(self._t("main.workspace_cache_clearing", "Workspace cache: clearing..."))
+        worker = WorkspaceCleanupWorker(root)
+        self.workspace_cleanup_worker = worker
+        worker.done.connect(self.workspace_cache_cleared)
+        worker.failed.connect(self.workspace_cache_cleanup_failed)
+        worker.finished.connect(self.workspace_cache_cleanup_finished)
+        worker.start()
+
+    def workspace_cache_cleared(self, result: dict) -> None:
+        removed = int(result.get("removed", 0) or 0) if isinstance(result, dict) else 0
+        failures = result.get("failures", []) if isinstance(result, dict) else []
+        failure_rows = [str(item) for item in failures if item]
+        self.workspace_cache_size_bytes = 0
+        self.workspace_cache_folder_count = 0
+        self.current_workspace = None
+        self.current_main_workspace = None
+        if hasattr(self, "main_workspace_edit"):
+            self.main_workspace_edit.clear()
+        if hasattr(self, "workspace_edit"):
+            self.workspace_edit.clear()
+        if hasattr(self, "open_workspace_button"):
+            self.open_workspace_button.setEnabled(False)
+        self.refresh_workflow_statuses()
+        self.refresh_workspace_cache_size()
+        self.append_main_log(f"Cleared workspace cache entries: {removed}")
+        if failure_rows:
+            details = "\n".join(failure_rows[:20])
+            if len(failure_rows) > 20:
+                details += f"\n... {len(failure_rows) - 20} more"
+            self.show_error(self._t("main.clear_workspace_cache_failed", "Workspace cache cleanup had errors"), details)
+        else:
+            self.statusBar().showMessage(self._t("main.clear_workspace_cache_complete", "Workspace cache cleared."))
+
+    def workspace_cache_cleanup_failed(self, message: str) -> None:
+        self.show_error(self._t("main.clear_workspace_cache_failed", "Workspace cache cleanup had errors"), message)
+        self.refresh_workspace_cache_size()
+
+    def workspace_cache_cleanup_finished(self) -> None:
+        self.workspace_cleanup_worker = None
+        self.update_workspace_cache_size_label()
+
+    def set_proportion_outputs_visible(self, visible: bool) -> None:
+        self.proportion_output_group.setVisible(bool(visible))
+        self.proportion_outputs_toggle.setText("Hide Outputs" if visible else "Show Outputs")
+
+    def set_proportion_log_visible(self, visible: bool) -> None:
+        self.proportion_log_group.setVisible(bool(visible))
+        self.proportion_log_toggle.setText("Hide Log" if visible else "Show Log")
+
+    def append_carms_log(self, message: str) -> None:
+        display = self.translate_runtime_text(str(message))
+        self.carms_log.appendPlainText(display)
+        self.statusBar().showMessage(display[:160])
+        checks = [
+            ("Starting Blender c_arms sorting", 4, "Starting Blender", "#58a6ff"),
+            ("Opening a clean Blender scene", 8, "Preparing Scene", "#58a6ff"),
+            ("Importing base c_arms source SMD", 20, "Importing Body SMD", "#58a6ff"),
+            ("Importing additional c_arms source SMD", 34, "Importing Bodygroups", "#58a6ff"),
+            ("target bone set contains", 48, "Detecting Forearm Bones", "#58a6ff"),
+            ("Kept ", 62, "Filtering Meshes", "#58a6ff"),
+            ("Removing empty c_arms bodygroup", 66, "Removing Empty Bodygroups", "#d29922"),
+            ("Saving c_arms workspace blend", 74, "Saving Workspace", "#d29922"),
+            ("Exporting c_arms SMD files", 84, "Exporting c_arms", "#58a6ff"),
+            ("Copied ", 90, "Copying Anims", "#58a6ff"),
+            ("Wrote c_arms report", 96, "Writing Report", "#2ea043"),
+            ("Blender c_arms sorting finished", 100, "Step 10 Complete", "#2ea043"),
+        ]
+        for needle, value, title, color in checks:
+            if needle in message:
+                self.set_carms_progress(max(self.carms_progress_bar.value(), value), title, message, color)
+                break
+
+    def set_carms_progress(self, value: int, title: str, detail: str, color: str = "#58a6ff") -> None:
+        value = max(0, min(100, int(value)))
+        self.carms_progress_bar.setValue(value)
+        self.carms_progress_label.setText(
+            f'<span style="color:{color};">{html.escape(title)}</span> - {value}%'
+            f'<br><span style="color:#8f98a3;">{html.escape(detail)}</span>'
+        )
+
+    def detect_step9_output(self, target: str = "carms") -> None:
+        candidates: list[Path] = []
+
+        def add_candidate(raw: object) -> None:
+            if raw is None:
+                return
+            text = str(raw).strip()
+            if text:
+                path = Path(text)
+                if path.name == "9_export_proportion_trick":
+                    path = path / "2_proportion_export"
+                candidates.append(path)
+
+        def add_sorted_glob(root: Path, pattern: str) -> None:
+            try:
+                matches = sorted(root.glob(pattern), key=lambda item: item.stat().st_mtime, reverse=True)
+            except Exception:
+                return
+            candidates.extend(matches)
+
+        for raw in (
+            self.carms_input_row.value() if hasattr(self, "carms_input_row") else "",
+            self.vrd_input_row.value() if hasattr(self, "vrd_input_row") else "",
+            self.proportion_final_label.text() if hasattr(self, "proportion_final_label") else "",
+            self.proportion_export_dir,
+            self.proportion_output_edit.text() if hasattr(self, "proportion_output_edit") else "",
+            self.settings_store.value("carms_input_dir", "", str),
+            self.settings_store.value("vrd_input_dir", "", str),
+        ):
+            add_candidate(raw)
+
+        workspace_text = self.workspace_edit.text().strip() if hasattr(self, "workspace_edit") else ""
+        if workspace_text:
+            add_sorted_glob(Path(workspace_text), "9_export_proportion_trick/2_proportion_export")
+
+        add_sorted_glob(core.workspaces_root(), "*/9_export_proportion_trick/2_proportion_export")
+
+        seen: set[Path] = set()
+        for candidate in candidates:
+            try:
+                candidate = candidate.resolve()
+            except Exception:
+                candidate = candidate.absolute()
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if candidate.exists() and any(candidate.glob("*.smd")):
+                if target == "vrd" and hasattr(self, "vrd_input_row"):
+                    self.vrd_input_row.set_value(str(candidate))
+                    if hasattr(self, "vrd_tab"):
+                        self.tabs.setCurrentWidget(self.vrd_tab)
+                else:
+                    self.carms_input_row.set_value(str(candidate))
+                    if hasattr(self, "carms_tab"):
+                        self.tabs.setCurrentWidget(self.carms_tab)
+                return
+        self.show_error("Detect Step 9 Output", "No Step 9 proportion export folder was found. Run Step 9 or browse to 2_proportion_export.")
+
+    def on_carms_input_changed(self, value: str) -> None:
+        self.carms_output_dir = ""
+        self.carms_files_table.setRowCount(0)
+        if self.carms_preview is not None:
+            self.carms_preview.clear()
+        if value.strip():
+            self.update_carms_output_preview(Path(value.strip()))
+        else:
+            self.carms_output_edit.clear()
+            self.open_carms_folder_button.setEnabled(False)
+        self.save_settings()
+
+    def update_carms_output_preview(self, input_dir: Path) -> None:
+        try:
+            final_dir, carms_dir, workspace_blend, report_json, files_json = core.carms_paths_for_proportion_export(input_dir)
+            self.carms_output_edit.setText(str(carms_dir))
+            self.carms_workspace_blend_label.setText(str(workspace_blend))
+            self.carms_report_label.setText(str(report_json))
+            self.carms_files_json_label.setText(str(files_json))
+            self.carms_log_label.setText(str(carms_dir / "blender_sort_carms.log"))
+            self.open_carms_folder_button.setEnabled(carms_dir.exists())
+            if files_json.exists():
+                try:
+                    data = json.loads(files_json.read_text(encoding="utf-8"))
+                    self.populate_carms_files(data.get("files", []))
+                except Exception:
+                    pass
+            if report_json.exists():
+                try:
+                    report = json.loads(report_json.read_text(encoding="utf-8"))
+                    self.refresh_carms_preview(report)
+                except Exception:
+                    pass
+        except Exception:
+            self.carms_output_edit.clear()
+
+    def start_carms_run(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        if not self.ensure_step_can_run(10):
+            return
+        input_raw = self.carms_input_row.value()
+        if not input_raw:
+            self.show_error("Run Step 10 failed", "Select the Step 9 export folder first.")
+            return
+        input_dir = Path(input_raw)
+        if not input_dir.exists():
+            self.show_error("Run Step 10 failed", f"Step 9 export folder not found:\n{input_dir}")
+            return
+        self.set_step_working(10, "Preparing Step 10 c_arms export")
+        self.carms_log.clear()
+        self.carms_files_table.setRowCount(0)
+        if self.carms_preview is not None:
+            self.carms_preview.clear()
+        self.set_carms_progress(0, "Queued", "Preparing c_arms sorting", "#58a6ff")
+        self.carms_run_button.setEnabled(False)
+        self.detect_proportion_export_button.setEnabled(False)
+        self.carms_cancel_button.setEnabled(True)
+        self.worker = CArmsRunWorker(str(input_dir), self.carms_weight_spin.value())
+        self.worker.log.connect(self.append_carms_log)
+        self.worker.done.connect(self.carms_done)
+        self.worker.failed.connect(self.carms_failed)
+        self.worker.start()
+
+    def carms_done(self, result: dict) -> None:
+        self.carms_run_button.setEnabled(True)
+        self.detect_proportion_export_button.setEnabled(True)
+        self.carms_cancel_button.setEnabled(False)
+        self.carms_output_dir = str(result.get("carms_dir", ""))
+        self.carms_output_edit.setText(self.carms_output_dir)
+        self.carms_workspace_blend_label.setText(str(result.get("workspace_blend", "")))
+        self.carms_report_label.setText(str(result.get("report", "")))
+        self.carms_files_json_label.setText(str(result.get("files", "")))
+        self.carms_log_label.setText(str(result.get("log", "")))
+        self.open_carms_folder_button.setEnabled(bool(self.carms_output_dir))
+        files_data = result.get("files_data") if isinstance(result.get("files_data"), dict) else {}
+        self.populate_carms_files(files_data.get("files", []))
+        report = result.get("report_data") if isinstance(result.get("report_data"), dict) else {}
+        self.refresh_carms_preview(report)
+        kept = int(report.get("kept_bodygroup_count", 0) or 0)
+        exported = int(report.get("exported_file_count", 0) or 0)
+        self.carms_summary_label.setText(f"Step 10 complete. Kept bodygroups: {kept:,}; exported c_arms SMDs: {exported:,}.")
+        self.set_carms_progress(100, "Step 10 Complete", self.carms_output_dir, "#2ea043")
+        self.complete_step_from_result(
+            10,
+            result,
+            "carms_dir",
+            ["workspace_blend", "files"],
+            report_key="report",
+            validation={"ok": True, "exported_file_count": exported},
+        )
+        QtWidgets.QMessageBox.information(self, "Step 10 complete", "c_arms SMD export completed.")
+
+    def carms_failed(self, message: str) -> None:
+        self.carms_run_button.setEnabled(True)
+        self.detect_proportion_export_button.setEnabled(True)
+        self.carms_cancel_button.setEnabled(False)
+        self.set_carms_progress(self.carms_progress_bar.value(), "Step 10 Failed", "See the log for details.", "#f85149")
+        self.set_step_failed(10, "Step 10 c_arms export failed")
+        self.show_error("Step 10 failed", message)
+
+    def cancel_carms(self) -> None:
+        if self.worker and self.worker.isRunning() and hasattr(self.worker, "cancel"):
+            self.worker.cancel()  # type: ignore[attr-defined]
+            self.append_carms_log("Cancel requested.")
+
+    def refresh_carms_preview(self, report: dict[str, object]) -> None:
+        if self.carms_preview is None or not isinstance(report, dict):
+            return
+        scan = {
+            "materials": report.get("materials", []),
+            "material_count": report.get("material_count", 0),
+            "model_preview": report.get("model_preview", {}),
+        }
+        self.carms_preview.set_material_data(scan, {})
+
+    def populate_carms_files(self, files: object) -> None:
+        rows = files if isinstance(files, list) else []
+        self.carms_files_table.setRowCount(len(rows))
+        for row, entry in enumerate(rows):
+            if not isinstance(entry, dict):
+                entry = {}
+            values = [
+                str(entry.get("relative_path") or entry.get("name") or ""),
+                str(entry.get("type") or ""),
+                self.format_file_size(int(entry.get("size", 0) or 0)),
+                f"{int(entry.get('vertices', 0) or 0):,}",
+                f"{int(entry.get('faces', 0) or 0):,}",
+                str(entry.get("source_stage") or ""),
+                str(entry.get("warnings") or ""),
+            ]
+            for column, value in enumerate(values):
+                item = QtWidgets.QTableWidgetItem(value)
+                if value:
+                    item.setToolTip(value)
+                self.carms_files_table.setItem(row, column, item)
+        self.carms_files_table.resizeRowsToContents()
+
+    def set_carms_outputs_visible(self, visible: bool) -> None:
+        self.carms_output_group.setVisible(bool(visible))
+        self.carms_outputs_toggle.setText("Hide Outputs" if visible else "Show Outputs")
+
+    def set_carms_log_visible(self, visible: bool) -> None:
+        self.carms_log_group.setVisible(bool(visible))
+        self.carms_log_toggle.setText("Hide Log" if visible else "Show Log")
+
+    def append_vrd_log(self, message: str) -> None:
+        self.append_translated_log(self.vrd_log, message, self.update_vrd_progress_from_log)
+
+    def update_vrd_progress_from_log(self, message: str) -> None:
+        checks = [
+            ("Starting Blender VRD analysis", 4, "Starting Analysis", "#58a6ff"),
+            ("Starting Blender VRD export", 4, "Starting Export", "#58a6ff"),
+            ("Starting Blender VRD preview", 4, "Starting Preview", "#58a6ff"),
+            ("Opening a clean Blender scene", 8, "Preparing Scene", "#58a6ff"),
+            ("Importing base VRD source SMD", 18, "Importing Body SMD", "#58a6ff"),
+            ("Importing additional VRD source SMD", 30, "Importing Bodygroups", "#58a6ff"),
+            ("Generating standard VRD action", 42, "Generating VRD Pose", "#d29922"),
+            ("Applying procedural VRD cloth rotations", 58, "Applying Cloth Motion", "#d29922"),
+            ("Keying every pose bone", 68, "Keying Bones", "#58a6ff"),
+            ("Saving VRD analysis workspace blend", 76, "Saving Workspace", "#d29922"),
+            ("Saving VRD workspace blend", 76, "Saving Workspace", "#d29922"),
+            ("Exporting StudioMDL VRD", 86, "Exporting VRD", "#58a6ff"),
+            ("Wrote VRD analysis", 92, "Writing Analysis", "#2ea043"),
+            ("Wrote VRD preview", 92, "Writing Preview", "#2ea043"),
+            ("Wrote VRD file", 94, "Writing VRD", "#2ea043"),
+            ("Wrote VRD report", 96, "Writing Report", "#2ea043"),
+            ("Blender VRD analysis finished", 100, "Analysis Complete", "#2ea043"),
+            ("Blender VRD preview finished", 100, "Preview Complete", "#2ea043"),
+            ("Blender VRD export finished", 100, "Step 11 Complete", "#2ea043"),
+        ]
+        for needle, value, title, color in checks:
+            if needle in message:
+                self.set_vrd_progress(max(self.vrd_progress_bar.value(), value), title, message, color)
+                break
+
+    def set_vrd_progress(self, value: int, title: str, detail: str, color: str = "#58a6ff") -> None:
+        value = max(0, min(100, int(value)))
+        self.vrd_progress_bar.setValue(value)
+        self.vrd_progress_label.setText(
+            f'<span style="color:{color};">{html.escape(title)}</span> - {value}%'
+            f'<br><span style="color:#8f98a3;">{html.escape(detail)}</span>'
+        )
+
+    def on_vrd_input_changed(self, value: str) -> None:
+        self.vrd_output_dir = ""
+        self.current_vrd_analysis = None
+        self.current_vrd_plan = None
+        self.current_vrd_preview = None
+        self.sync_vrd_intensity_controls_from_plan()
+        self.vrd_table.setRowCount(0)
+        self.vrd_apply_button.setEnabled(False)
+        self.vrd_regenerate_button.setEnabled(False)
+        if self.vrd_preview is not None:
+            self.vrd_preview.clear()
+        if value.strip():
+            self.update_vrd_output_preview(Path(value.strip()))
+        else:
+            self.vrd_output_edit.clear()
+            self.open_vrd_folder_button.setEnabled(False)
+        self.save_settings()
+
+    def update_vrd_output_preview(self, input_dir: Path) -> None:
+        try:
+            final_dir, vrd_dir, workspace_blend, analysis_json, plan_json, preview_json, report_json, vrd_path = core.vrd_paths_for_proportion_export(input_dir)
+            self.vrd_output_edit.setText(str(vrd_dir))
+            self.vrd_workspace_blend_label.setText(str(workspace_blend))
+            self.vrd_analysis_label.setText(str(analysis_json))
+            self.vrd_plan_label.setText(str(plan_json))
+            self.vrd_preview_label.setText(str(preview_json))
+            self.vrd_report_label.setText(str(report_json))
+            self.vrd_file_label.setText(str(vrd_path))
+            self.vrd_log_label.setText(str(vrd_dir / "blender_sort_vrd.log"))
+            self.open_vrd_folder_button.setEnabled(vrd_dir.exists())
+            if plan_json.exists():
+                try:
+                    self.current_vrd_plan = json.loads(plan_json.read_text(encoding="utf-8"))
+                    self.sync_vrd_intensity_controls_from_plan()
+                    self.populate_vrd_table(self.current_vrd_plan)
+                    self.vrd_apply_button.setEnabled(True)
+                    self.vrd_regenerate_button.setEnabled(True)
+                except Exception:
+                    pass
+            if analysis_json.exists():
+                try:
+                    self.current_vrd_analysis = json.loads(analysis_json.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            if preview_json.exists():
+                try:
+                    self.current_vrd_preview = json.loads(preview_json.read_text(encoding="utf-8"))
+                    self.refresh_vrd_preview()
+                except Exception:
+                    pass
+        except Exception:
+            self.vrd_output_edit.clear()
+
+    def start_vrd_analyze(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        if not self.ensure_step_can_run(11):
+            return
+        input_raw = self.vrd_input_row.value()
+        if not input_raw:
+            self.show_error("Analyze VRD failed", "Select the Step 9 export folder first.")
+            return
+        input_dir = Path(input_raw)
+        if not input_dir.exists():
+            self.show_error("Analyze VRD failed", f"Step 9 export folder not found:\n{input_dir}")
+            return
+        self.vrd_log.clear()
+        self.vrd_table.setRowCount(0)
+        if self.vrd_preview is not None:
+            self.vrd_preview.clear()
+        self.set_step_working(11, "Preparing Step 11 VRD analysis")
+        self.set_vrd_progress(0, "Queued", "Preparing VRD analysis", "#58a6ff")
+        self.vrd_analyze_button.setEnabled(False)
+        self.vrd_apply_button.setEnabled(False)
+        self.vrd_regenerate_button.setEnabled(False)
+        self.detect_vrd_step9_button.setEnabled(False)
+        self.vrd_cancel_button.setEnabled(True)
+        self.worker = VrdAnalyzeWorker(str(input_dir))
+        self.worker.log.connect(self.append_vrd_log)
+        self.worker.done.connect(self.vrd_analyze_done)
+        self.worker.failed.connect(self.vrd_failed)
+        self.worker.start()
+
+    def vrd_analyze_done(self, result: dict) -> None:
+        self.vrd_analyze_button.setEnabled(True)
+        self.detect_vrd_step9_button.setEnabled(True)
+        self.vrd_cancel_button.setEnabled(False)
+        self.vrd_apply_button.setEnabled(True)
+        self.vrd_regenerate_button.setEnabled(True)
+        self.vrd_output_dir = str(result.get("vrd_dir", ""))
+        self.vrd_output_edit.setText(self.vrd_output_dir)
+        self.vrd_workspace_blend_label.setText(str(result.get("workspace_blend", "")))
+        self.vrd_analysis_label.setText(str(result.get("analysis", "")))
+        self.vrd_plan_label.setText(str(result.get("plan", "")))
+        self.vrd_preview_label.setText(str(result.get("preview", "")))
+        self.vrd_log_label.setText(str(result.get("log", "")))
+        self.vrd_file_label.setText(str(Path(self.vrd_output_dir) / "vrd.vrd") if self.vrd_output_dir else "")
+        self.open_vrd_folder_button.setEnabled(bool(self.vrd_output_dir))
+        self.current_vrd_analysis = result.get("analysis_data") if isinstance(result.get("analysis_data"), dict) else {}
+        self.current_vrd_plan = result.get("plan_data") if isinstance(result.get("plan_data"), dict) else {}
+        self.current_vrd_preview = result.get("preview_data") if isinstance(result.get("preview_data"), dict) else {}
+        self.sync_vrd_intensity_controls_from_plan()
+        self.populate_vrd_table(self.current_vrd_plan or {})
+        self.refresh_vrd_preview()
+        rows = self.vrd_entries()
+        enabled = sum(1 for row in rows if row.get("enabled", True))
+        self.vrd_summary_label.setText(f"VRD analysis complete. Candidate rows: {len(rows):,}; enabled: {enabled:,}.")
+        self.set_vrd_progress(100, "Analysis Complete", self.vrd_output_dir, "#2ea043")
+        self.clear_step_state(11, "Step 11 analysis complete")
+
+    def start_vrd_apply(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        if not self.ensure_step_can_run(11):
+            return
+        input_raw = self.vrd_input_row.value()
+        if not input_raw:
+            self.show_error("Apply VRD failed", "Select the Step 9 export folder first.")
+            return
+        if not self.current_vrd_plan:
+            self.show_error("Apply VRD failed", "Analyze VRD first or load an existing VRD plan.")
+            return
+        self.update_vrd_plan_intensity_from_controls()
+        errors = self.validate_vrd_plan_for_gui()
+        if errors:
+            self.show_error("Apply VRD failed", "\n".join(errors))
+            return
+        self.set_step_working(11, "Preparing Step 11 VRD export")
+        self.vrd_log.clear()
+        self.set_vrd_progress(0, "Queued", "Preparing VRD export", "#58a6ff")
+        self.vrd_analyze_button.setEnabled(False)
+        self.vrd_apply_button.setEnabled(False)
+        self.vrd_regenerate_button.setEnabled(False)
+        self.detect_vrd_step9_button.setEnabled(False)
+        self.vrd_cancel_button.setEnabled(True)
+        self.worker = VrdApplyWorker(input_raw, self.current_vrd_plan)
+        self.worker.log.connect(self.append_vrd_log)
+        self.worker.done.connect(self.vrd_apply_done)
+        self.worker.failed.connect(self.vrd_failed)
+        self.worker.start()
+
+    def vrd_apply_done(self, result: dict) -> None:
+        self.vrd_analyze_button.setEnabled(True)
+        self.vrd_apply_button.setEnabled(True)
+        self.vrd_regenerate_button.setEnabled(True)
+        self.detect_vrd_step9_button.setEnabled(True)
+        self.vrd_cancel_button.setEnabled(False)
+        self.vrd_output_dir = str(result.get("vrd_dir", ""))
+        self.vrd_output_edit.setText(self.vrd_output_dir)
+        self.vrd_workspace_blend_label.setText(str(result.get("workspace_blend", "")))
+        self.vrd_analysis_label.setText(str(result.get("analysis", "")))
+        self.vrd_plan_label.setText(str(result.get("plan", "")))
+        self.vrd_preview_label.setText(str(result.get("preview", "")))
+        self.vrd_report_label.setText(str(result.get("report", "")))
+        self.vrd_file_label.setText(str(result.get("vrd", "")))
+        self.vrd_log_label.setText(str(result.get("log", "")))
+        self.open_vrd_folder_button.setEnabled(bool(self.vrd_output_dir))
+        report = result.get("report_data") if isinstance(result.get("report_data"), dict) else {}
+        if isinstance(result.get("plan_data"), dict):
+            self.current_vrd_plan = result.get("plan_data")
+            self.populate_vrd_table(self.current_vrd_plan or {})
+        if isinstance(result.get("preview_data"), dict):
+            self.current_vrd_preview = result.get("preview_data")
+        else:
+            try:
+                preview_path = Path(str(result.get("preview", "")))
+                if preview_path.exists():
+                    self.current_vrd_preview = json.loads(preview_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        self.refresh_vrd_preview()
+        helpers = int(report.get("helper_count", 0) or 0)
+        self.vrd_summary_label.setText(f"Step 11 complete. Exported VRD helper rows: {helpers:,}.")
+        self.set_vrd_progress(100, "Step 11 Complete", str(result.get("vrd", "")), "#2ea043")
+        self.complete_step_from_result(
+            11,
+            result,
+            "vrd_dir",
+            ["vrd", "workspace_blend"],
+            report_key="report",
+            validation={"ok": True, "helper_count": helpers},
+        )
+        QtWidgets.QMessageBox.information(self, "Step 11 complete", "VRD export completed.")
+
+    def vrd_failed(self, message: str) -> None:
+        self.vrd_analyze_button.setEnabled(True)
+        self.vrd_apply_button.setEnabled(bool(self.current_vrd_plan))
+        self.vrd_regenerate_button.setEnabled(bool(self.current_vrd_plan))
+        self.detect_vrd_step9_button.setEnabled(True)
+        self.vrd_cancel_button.setEnabled(False)
+        self.set_vrd_progress(self.vrd_progress_bar.value(), "Step 11 Failed", "See the log for details.", "#f85149")
+        self.set_step_failed(11, "Step 11 VRD step failed")
+        self.show_error("Step 11 failed", message)
+
+    def cancel_vrd(self) -> None:
+        if self.worker and self.worker.isRunning() and hasattr(self.worker, "cancel"):
+            self.worker.cancel()  # type: ignore[attr-defined]
+            self.append_vrd_log("Cancel requested.")
+
+    def normalized_vrd_intensity_multipliers(self, raw: object = None) -> dict[str, float]:
+        source = raw if isinstance(raw, dict) else {}
+        out: dict[str, float] = {}
+        for frame, default in VRD_INTENSITY_DEFAULTS.items():
+            try:
+                value = float(source.get(str(frame), default))  # type: ignore[union-attr]
+            except Exception:
+                value = default
+            out[str(frame)] = max(0.0, min(2.0, value))
+        return out
+
+    def current_vrd_intensity_multipliers(self) -> dict[str, float]:
+        if self.current_vrd_plan and isinstance(self.current_vrd_plan.get("intensity_multipliers"), dict):
+            return self.normalized_vrd_intensity_multipliers(self.current_vrd_plan.get("intensity_multipliers"))
+        return self.normalized_vrd_intensity_multipliers({})
+
+    def sync_vrd_intensity_controls_from_plan(self) -> None:
+        if not hasattr(self, "vrd_intensity_sliders"):
+            return
+        multipliers = self.current_vrd_intensity_multipliers()
+        self._updating_vrd_intensity_controls = True
+        try:
+            for frame, slider in self.vrd_intensity_sliders.items():
+                value = multipliers.get(str(frame), VRD_INTENSITY_DEFAULTS.get(frame, 1.0))
+                slider.setValue(int(round(value * 100.0)))
+                label = self.vrd_intensity_value_labels.get(frame)
+                if label:
+                    label.setText(f"{value:.2f}x")
+        finally:
+            self._updating_vrd_intensity_controls = False
+
+    def update_vrd_plan_intensity_from_controls(self) -> None:
+        if self.current_vrd_plan is None:
+            self.current_vrd_plan = {"version": 1, "kind": "sort_vrd", "rows": []}
+        multipliers: dict[str, float] = {}
+        for frame, default in VRD_INTENSITY_DEFAULTS.items():
+            slider = getattr(self, "vrd_intensity_sliders", {}).get(frame)
+            value = (slider.value() / 100.0) if slider is not None else default
+            multipliers[str(frame)] = max(0.0, min(2.0, float(value)))
+        self.current_vrd_plan["intensity_multipliers"] = multipliers
+
+    def on_vrd_intensity_changed(self, frame: int, value: int) -> None:
+        label = getattr(self, "vrd_intensity_value_labels", {}).get(frame)
+        if label:
+            label.setText(f"{max(0.0, min(2.0, value / 100.0)):.2f}x")
+        if self._updating_vrd_intensity_controls:
+            return
+        self.update_vrd_plan_intensity_from_controls()
+        self.refresh_vrd_preview()
+
+    def vrd_entries(self) -> list[dict[str, object]]:
+        if not self.current_vrd_plan:
+            return []
+        rows = self.current_vrd_plan.get("rows", [])
+        return [entry for entry in rows if isinstance(entry, dict)] if isinstance(rows, list) else []
+
+    def normalized_vrd_frame_weight_overrides(self, raw: object) -> dict[str, float | None]:
+        source = raw if isinstance(raw, dict) else {}
+        out: dict[str, float | None] = {}
+        for frame in VRD_WEIGHT_FRAMES:
+            key = str(frame)
+            value = source.get(key)  # type: ignore[union-attr]
+            if value is None or str(value).strip() == "":
+                out[key] = None
+                continue
+            try:
+                out[key] = max(0.0, min(1.0, float(value)))
+            except Exception:
+                out[key] = None
+        return out
+
+    def normalized_vrd_auto_frame_weights(self, raw: object) -> dict[str, float | None]:
+        source = raw if isinstance(raw, dict) else {}
+        out: dict[str, float | None] = {}
+        for frame in VRD_WEIGHT_FRAMES:
+            key = str(frame)
+            try:
+                out[key] = max(0.0, min(1.0, float(source.get(key))))  # type: ignore[union-attr]
+            except Exception:
+                out[key] = None
+        return out
+
+    def format_vrd_frame_weight_cell(self, entry: dict[str, object], frame: int) -> str:
+        overrides = self.normalized_vrd_frame_weight_overrides(entry.get("frame_weight_overrides"))
+        override = overrides.get(str(frame))
+        if override is not None:
+            return f"{override:.2f}"
+        auto_weights = self.normalized_vrd_auto_frame_weights(entry.get("auto_frame_weights"))
+        auto = auto_weights.get(str(frame))
+        return f"{auto:.2f}" if auto is not None else "0.00"
+
+    def set_vrd_weight_item_text(self, item: QtWidgets.QTableWidgetItem, text: str) -> None:
+        self._updating_vrd_table = True
+        try:
+            item.setText(text)
+        finally:
+            self._updating_vrd_table = False
+
+    def populate_vrd_table(self, plan: dict[str, object]) -> None:
+        rows = [entry for entry in plan.get("rows", []) if isinstance(entry, dict)] if isinstance(plan.get("rows"), list) else []
+        self._updating_vrd_table = True
+        self.vrd_table.setRowCount(len(rows))
+        for row_index, entry in enumerate(rows):
+            uid = str(entry.get("uid") or f"vrd_{row_index + 1:03d}")
+            entry["uid"] = uid
+            entry["frame_weight_overrides"] = self.normalized_vrd_frame_weight_overrides(entry.get("frame_weight_overrides"))
+            use_item = QtWidgets.QTableWidgetItem("")
+            use_item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsUserCheckable | QtCore.Qt.ItemFlag.ItemIsSelectable)
+            use_item.setCheckState(QtCore.Qt.CheckState.Checked if entry.get("enabled", True) else QtCore.Qt.CheckState.Unchecked)
+            use_item.setData(QtCore.Qt.ItemDataRole.UserRole, uid)
+            self.vrd_table.setItem(row_index, 0, use_item)
+            values = [
+                str(entry.get("procedural_bone") or ""),
+                str(entry.get("driver_bone") or "ValveBiped.Bip01_L_Thigh"),
+                f"{float(entry.get('angle', 90.0) or 90.0):.1f}",
+                self.format_vrd_frame_weight_cell(entry, 10),
+                self.format_vrd_frame_weight_cell(entry, 20),
+                self.format_vrd_frame_weight_cell(entry, 30),
+                str(entry.get("side") or ""),
+                f"{float(entry.get('confidence', 0.0) or 0.0):.3f}",
+                f"{int(entry.get('weighted_vertices', 0) or 0):,}",
+                ", ".join(str(item) for item in entry.get("source_objects", []) if item) if isinstance(entry.get("source_objects"), list) else "",
+                "; ".join(str(item) for item in entry.get("warnings", []) if item) if isinstance(entry.get("warnings"), list) else "",
+            ]
+            for offset, value in enumerate(values, start=1):
+                item = QtWidgets.QTableWidgetItem(value)
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, uid)
+                if value:
+                    item.setToolTip(value)
+                if offset in (1, 2, 3, 4, 5, 6):
+                    item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsEditable)
+                else:
+                    item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                self.vrd_table.setItem(row_index, offset, item)
+        self._updating_vrd_table = False
+        self.vrd_table.resizeRowsToContents()
+
+    def vrd_entry_for_uid(self, uid: str) -> dict[str, object] | None:
+        for entry in self.vrd_entries():
+            if str(entry.get("uid") or "") == uid:
+                return entry
+        return None
+
+    def on_vrd_table_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
+        if self._updating_vrd_table or not self.current_vrd_plan:
+            return
+        uid = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+        entry = self.vrd_entry_for_uid(uid)
+        if not entry:
+            return
+        if item.column() == 0:
+            entry["enabled"] = item.checkState() == QtCore.Qt.CheckState.Checked
+        elif item.column() == 1:
+            entry["procedural_bone"] = item.text().strip()
+        elif item.column() == 2:
+            text = item.text().strip()
+            if text not in {"ValveBiped.Bip01_L_Thigh", "ValveBiped.Bip01_R_Thigh"}:
+                text = "ValveBiped.Bip01_L_Thigh" if "_L_" in text else "ValveBiped.Bip01_R_Thigh"
+                self._updating_vrd_table = True
+                item.setText(text)
+                self._updating_vrd_table = False
+            entry["driver_bone"] = text
+        elif item.column() == 3:
+            try:
+                entry["angle"] = float(item.text())
+            except Exception:
+                entry["angle"] = 90.0
+                self._updating_vrd_table = True
+                item.setText("90.0")
+                self._updating_vrd_table = False
+        elif item.column() in set(VRD_WEIGHT_COLUMNS.values()):
+            frame = next((frame for frame, column in VRD_WEIGHT_COLUMNS.items() if column == item.column()), 10)
+            overrides = self.normalized_vrd_frame_weight_overrides(entry.get("frame_weight_overrides"))
+            text = item.text().strip().lower()
+            if not text or text == "auto" or text.startswith("auto "):
+                overrides[str(frame)] = None
+                entry["frame_weight_overrides"] = overrides
+                self.set_vrd_weight_item_text(item, self.format_vrd_frame_weight_cell(entry, frame))
+            else:
+                try:
+                    value = max(0.0, min(1.0, float(text)))
+                except Exception:
+                    overrides[str(frame)] = None
+                    entry["frame_weight_overrides"] = overrides
+                    self.set_vrd_weight_item_text(item, self.format_vrd_frame_weight_cell(entry, frame))
+                else:
+                    overrides[str(frame)] = value
+                    entry["frame_weight_overrides"] = overrides
+                    self.set_vrd_weight_item_text(item, f"{value:.2f}")
+        self.refresh_vrd_preview_state()
+
+    def selected_vrd_uids(self) -> set[str]:
+        rows = sorted({index.row() for index in self.vrd_table.selectionModel().selectedRows()})
+        out: set[str] = set()
+        for row in rows:
+            item = self.vrd_table.item(row, 0)
+            if item:
+                uid = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+                if uid:
+                    out.add(uid)
+        return out
+
+    def vrd_procedural_bones_for_uids(self, uids: Iterable[str]) -> set[str]:
+        selected = {str(uid) for uid in uids if str(uid)}
+        out: set[str] = set()
+        if not selected:
+            return out
+        for entry in self.vrd_entries():
+            uid = str(entry.get("uid") or "")
+            bone = str(entry.get("procedural_bone") or "").strip()
+            if uid in selected and bone:
+                out.add(bone)
+        return out
+
+    def vrd_procedural_bone_for_uid(self, uid: str) -> str:
+        if not uid:
+            return ""
+        entry = self.vrd_entry_for_uid(uid)
+        return str(entry.get("procedural_bone") or "").strip() if entry else ""
+
+    def update_vrd_hover_for_row(self, row: int) -> None:
+        if row < 0 or row >= self.vrd_table.rowCount():
+            self.clear_vrd_hover()
+            return
+        item = self.vrd_table.item(row, 0)
+        uid = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "") if item else ""
+        if uid == self._hover_vrd_uid:
+            return
+        self._hover_vrd_uid = uid
+        self.refresh_vrd_preview_state()
+
+    def clear_vrd_hover(self) -> None:
+        self._hover_vrd_uid = ""
+        self.refresh_vrd_preview_state()
+
+    def on_vrd_table_selection_changed(self) -> None:
+        self.refresh_vrd_preview_state()
+
+    def on_vrd_frame_changed(self, index: int) -> None:
+        frame = [0, 10, 20, 30][max(0, min(3, int(index)))]
+        self.vrd_frame_label.setText(str(frame))
+        self.refresh_vrd_preview()
+
+    def vrd_preview_frame_payload(self, key: str, frame: int) -> dict[str, object]:
+        if not self.current_vrd_preview:
+            return {}
+        previews = self.current_vrd_preview.get(key, {})
+        if not isinstance(previews, dict):
+            return {}
+        payload = previews.get(str(frame), {})
+        return payload if isinstance(payload, dict) else {}
+
+    def blend_vrd_points(self, driver_points: object, full_points: object, multiplier: float) -> list[list[float]] | None:
+        if not isinstance(driver_points, list) or not isinstance(full_points, list) or len(driver_points) < 3 or len(full_points) < 3:
+            return None
+        out: list[list[float]] = []
+        for driver_raw, full_raw in zip(driver_points[:3], full_points[:3]):
+            if not isinstance(driver_raw, list) or not isinstance(full_raw, list) or len(driver_raw) < 3 or len(full_raw) < 3:
+                return None
+            driver = [float(driver_raw[0]), float(driver_raw[1]), float(driver_raw[2])]
+            full = [float(full_raw[0]), float(full_raw[1]), float(full_raw[2])]
+            out.append([driver[index] + (full[index] - driver[index]) * multiplier for index in range(3)])
+        return out
+
+    def vrd_preview_display_multiplier(self, frame: int) -> float:
+        if frame == 0:
+            return 1.0
+        current = self.current_vrd_intensity_multipliers().get(str(frame), VRD_INTENSITY_DEFAULTS.get(frame, 1.0))
+        baked = VRD_INTENSITY_DEFAULTS.get(frame, 1.0)
+        if self.current_vrd_preview and isinstance(self.current_vrd_preview.get("intensity_multipliers"), dict):
+            try:
+                baked = float(self.current_vrd_preview["intensity_multipliers"].get(str(frame), baked))  # type: ignore[index, union-attr]
+            except Exception:
+                baked = VRD_INTENSITY_DEFAULTS.get(frame, 1.0)
+        if abs(baked) <= 1e-6:
+            return 1.0 if abs(current) <= 1e-6 else current
+        return current / baked
+
+    def blended_vrd_model_preview(self, frame: int) -> dict[str, object]:
+        full_payload = self.vrd_preview_frame_payload("frame_previews", frame)
+        full_model = full_payload.get("model_preview") if isinstance(full_payload, dict) else None
+        if not isinstance(full_model, dict):
+            full_model = self.current_vrd_preview.get("model_preview", {}) if self.current_vrd_preview else {}
+        if frame == 0:
+            return full_model if isinstance(full_model, dict) else {}
+        multiplier = self.vrd_preview_display_multiplier(frame)
+        if abs(multiplier - 1.0) <= 1e-6:
+            return full_model if isinstance(full_model, dict) else {}
+        driver_payload = self.vrd_preview_frame_payload("driver_frame_previews", frame)
+        driver_model = driver_payload.get("model_preview") if isinstance(driver_payload, dict) else None
+        if not isinstance(driver_model, dict):
+            return full_model if isinstance(full_model, dict) else {}
+        full_triangles = full_model.get("triangles")
+        driver_triangles = driver_model.get("triangles")
+        if not isinstance(full_triangles, list) or not isinstance(driver_triangles, list):
+            return full_model if isinstance(full_model, dict) else {}
+        count = min(len(full_triangles), len(driver_triangles))
+        blended_triangles: list[dict[str, object]] = []
+        for index in range(count):
+            full_triangle = full_triangles[index]
+            driver_triangle = driver_triangles[index]
+            if not isinstance(full_triangle, dict) or not isinstance(driver_triangle, dict):
+                continue
+            blended = dict(full_triangle)
+            points = self.blend_vrd_points(driver_triangle.get("points"), full_triangle.get("points"), multiplier)
+            if points is not None:
+                blended["points"] = points
+            blended_triangles.append(blended)
+        if len(full_triangles) > count:
+            blended_triangles.extend(entry for entry in full_triangles[count:] if isinstance(entry, dict))
+        model = dict(full_model)
+        model["triangles"] = blended_triangles
+        return model
+
+    def blended_vrd_overlay(self, frame: int) -> dict[str, object]:
+        if not self.current_vrd_preview:
+            return {}
+        frames = self.current_vrd_preview.get("frames", {})
+        full_overlay = frames.get(str(frame), {}) if isinstance(frames, dict) else {}
+        if frame == 0 or not isinstance(full_overlay, dict):
+            return full_overlay if isinstance(full_overlay, dict) else {}
+        multiplier = self.vrd_preview_display_multiplier(frame)
+        if abs(multiplier - 1.0) <= 1e-6:
+            return full_overlay
+        driver_frames = self.current_vrd_preview.get("driver_frames", {})
+        driver_overlay = driver_frames.get(str(frame), {}) if isinstance(driver_frames, dict) else {}
+        if not isinstance(driver_overlay, dict):
+            return full_overlay
+        full_triangles = full_overlay.get("triangles")
+        driver_triangles = driver_overlay.get("triangles")
+        if not isinstance(full_triangles, list) or not isinstance(driver_triangles, list):
+            return full_overlay
+        driver_by_uid = {str(entry.get("uid") or ""): entry for entry in driver_triangles if isinstance(entry, dict)}
+        blended_triangles: list[dict[str, object]] = []
+        for full_triangle in full_triangles:
+            if not isinstance(full_triangle, dict):
+                continue
+            uid = str(full_triangle.get("uid") or "")
+            driver_triangle = driver_by_uid.get(uid)
+            blended = dict(full_triangle)
+            if isinstance(driver_triangle, dict):
+                points = self.blend_vrd_points(driver_triangle.get("points"), full_triangle.get("points"), multiplier)
+                if points is not None:
+                    blended["points"] = points
+            blended_triangles.append(blended)
+        return {"triangles": blended_triangles}
+
+    def refresh_vrd_preview(self) -> None:
+        if self.vrd_preview is None:
+            return
+        if not self.current_vrd_preview:
+            self.vrd_preview.clear()
+            return
+        frame = [0, 10, 20, 30][max(0, min(3, self.vrd_frame_slider.value()))] if hasattr(self, "vrd_frame_slider") else 0
+        model_preview = self.blended_vrd_model_preview(frame)
+        scan = {
+            "materials": self.current_vrd_preview.get("materials", []),
+            "material_count": self.current_vrd_preview.get("material_count", 0),
+            "model_preview": model_preview,
+        }
+        if getattr(self.vrd_preview, "scan", None):
+            self.vrd_preview.set_model_preview_data(model_preview)
+        else:
+            self.vrd_preview.set_material_data(scan, {})
+        if hasattr(self.vrd_preview, "set_bone_overlay"):
+            bone_preview = self.current_vrd_preview.get("bone_preview", {})
+            self.vrd_preview.set_bone_overlay(bone_preview if isinstance(bone_preview, dict) else {})
+        self.refresh_vrd_preview_overlay()
+        self.refresh_vrd_preview_state()
+
+    def refresh_vrd_preview_overlay(self) -> None:
+        if self.vrd_preview is None or not self.current_vrd_preview:
+            return
+        frame = [0, 10, 20, 30][max(0, min(3, self.vrd_frame_slider.value()))] if hasattr(self, "vrd_frame_slider") else 0
+        self.vrd_preview.set_collision_overlay(self.blended_vrd_overlay(frame))
+        self.refresh_vrd_preview_state()
+
+    def refresh_vrd_preview_state(self) -> None:
+        if self.vrd_preview is None:
+            return
+        uid = self._hover_vrd_uid
+        selected = self.selected_vrd_uids()
+        if not uid and selected:
+            uid = sorted(selected)[0]
+        self.vrd_preview.set_hovered_collision(uid)
+        self.vrd_preview.set_highlighted_collisions(selected)
+        if hasattr(self.vrd_preview, "set_hovered_bone_overlay"):
+            self.vrd_preview.set_hovered_bone_overlay(self.vrd_procedural_bone_for_uid(uid))
+        if hasattr(self.vrd_preview, "set_highlighted_bone_overlay"):
+            self.vrd_preview.set_highlighted_bone_overlay(self.vrd_procedural_bones_for_uids(selected))
+
+    def add_vrd_row(self) -> None:
+        if self.current_vrd_plan is None:
+            self.current_vrd_plan = {"version": 1, "kind": "sort_vrd", "rows": []}
+        rows = self.current_vrd_plan.setdefault("rows", [])
+        if not isinstance(rows, list):
+            rows = []
+            self.current_vrd_plan["rows"] = rows
+        row = {
+            "uid": f"manual_vrd_{len(rows) + 1:03d}",
+            "enabled": True,
+            "procedural_bone": "",
+            "driver_bone": "ValveBiped.Bip01_L_Thigh",
+            "angle": 90.0,
+            "side": "manual",
+            "confidence": 1.0,
+            "weighted_vertices": 0,
+            "source_objects": [],
+            "auto_frame_weights": {},
+            "frame_weight_overrides": {"10": None, "20": None, "30": None},
+            "warnings": ["Manual row; verify procedural bone name."],
+        }
+        rows.append(row)
+        self.populate_vrd_table(self.current_vrd_plan)
+        self.vrd_apply_button.setEnabled(True)
+        self.vrd_regenerate_button.setEnabled(True)
+        if self.vrd_table.rowCount() > 0:
+            self.vrd_table.selectRow(self.vrd_table.rowCount() - 1)
+        self.refresh_vrd_preview_state()
+
+    def remove_selected_vrd_rows(self) -> None:
+        if not self.current_vrd_plan:
+            return
+        selected = self.selected_vrd_uids()
+        if not selected:
+            return
+        rows = self.vrd_entries()
+        self.current_vrd_plan["rows"] = [entry for entry in rows if str(entry.get("uid") or "") not in selected]
+        self.populate_vrd_table(self.current_vrd_plan)
+        self.refresh_vrd_preview_state()
+
+    def validate_vrd_plan_for_gui(self) -> list[str]:
+        errors: list[str] = []
+        rows = self.vrd_entries()
+        enabled = [row for row in rows if row.get("enabled", True)]
+        for row in enabled:
+            if not str(row.get("procedural_bone") or "").strip():
+                errors.append("Enabled VRD row has no procedural bone.")
+            driver = str(row.get("driver_bone") or "")
+            if driver not in {"ValveBiped.Bip01_L_Thigh", "ValveBiped.Bip01_R_Thigh"}:
+                errors.append(f"Driver bone must be left or right thigh: {driver}")
+            try:
+                angle = float(row.get("angle", 90.0) or 90.0)
+                if abs(angle) <= 0.001:
+                    errors.append("Enabled VRD row has zero angle.")
+            except Exception:
+                errors.append("Enabled VRD row has an invalid angle.")
+        return errors
+
+    def regenerate_vrd_preview(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        input_raw = self.vrd_input_row.value()
+        if not input_raw:
+            self.show_error("Regenerate VRD preview failed", "Select the Step 9 export folder first.")
+            return
+        if not self.current_vrd_plan:
+            self.show_error("Regenerate VRD preview failed", "Analyze VRD first or load an existing VRD plan.")
+            return
+        self.update_vrd_plan_intensity_from_controls()
+        errors = self.validate_vrd_plan_for_gui()
+        if errors:
+            self.show_error("Regenerate VRD preview failed", "\n".join(errors))
+            return
+        self.refresh_vrd_preview_state()
+        self.set_step_working(11, "Regenerating Step 11 VRD preview")
+        self.vrd_log.clear()
+        self.set_vrd_progress(0, "Queued", "Preparing VRD preview", "#58a6ff")
+        self.vrd_analyze_button.setEnabled(False)
+        self.vrd_apply_button.setEnabled(False)
+        self.vrd_regenerate_button.setEnabled(False)
+        self.detect_vrd_step9_button.setEnabled(False)
+        self.vrd_cancel_button.setEnabled(True)
+        self.worker = VrdPreviewWorker(input_raw, self.current_vrd_plan)
+        self.worker.log.connect(self.append_vrd_log)
+        self.worker.done.connect(self.vrd_preview_done)
+        self.worker.failed.connect(self.vrd_preview_failed)
+        self.worker.start()
+
+    def vrd_preview_done(self, result: dict) -> None:
+        self.vrd_analyze_button.setEnabled(True)
+        self.vrd_apply_button.setEnabled(True)
+        self.vrd_regenerate_button.setEnabled(True)
+        self.detect_vrd_step9_button.setEnabled(True)
+        self.vrd_cancel_button.setEnabled(False)
+        self.vrd_output_dir = str(result.get("vrd_dir", ""))
+        self.vrd_output_edit.setText(self.vrd_output_dir)
+        self.vrd_workspace_blend_label.setText(str(result.get("workspace_blend", "")))
+        self.vrd_analysis_label.setText(str(result.get("analysis", "")))
+        self.vrd_plan_label.setText(str(result.get("plan", "")))
+        self.vrd_preview_label.setText(str(result.get("preview", "")))
+        self.vrd_log_label.setText(str(result.get("log", "")))
+        self.open_vrd_folder_button.setEnabled(bool(self.vrd_output_dir))
+        self.current_vrd_plan = result.get("plan_data") if isinstance(result.get("plan_data"), dict) else self.current_vrd_plan
+        self.current_vrd_preview = result.get("preview_data") if isinstance(result.get("preview_data"), dict) else self.current_vrd_preview
+        self.populate_vrd_table(self.current_vrd_plan or {})
+        self.sync_vrd_intensity_controls_from_plan()
+        self.refresh_vrd_preview()
+        rows = self.vrd_entries()
+        enabled = sum(1 for row in rows if row.get("enabled", True))
+        self.vrd_summary_label.setText(f"VRD preview regenerated. Candidate rows: {len(rows):,}; enabled: {enabled:,}.")
+        self.set_vrd_progress(100, "Preview Complete", str(result.get("preview", "")), "#2ea043")
+        self.clear_step_state(11, "Step 11 preview regenerated")
+
+    def vrd_preview_failed(self, message: str) -> None:
+        self.vrd_analyze_button.setEnabled(True)
+        self.vrd_apply_button.setEnabled(bool(self.current_vrd_plan))
+        self.vrd_regenerate_button.setEnabled(bool(self.current_vrd_plan))
+        self.detect_vrd_step9_button.setEnabled(True)
+        self.vrd_cancel_button.setEnabled(False)
+        self.set_vrd_progress(self.vrd_progress_bar.value(), "Preview Failed", "See the log for details.", "#f85149")
+        self.clear_step_state(11, "Step 11 preview failed")
+        self.show_error("VRD preview failed", message)
+
+    def set_vrd_outputs_visible(self, visible: bool) -> None:
+        self.vrd_output_group.setVisible(bool(visible))
+        self.vrd_outputs_toggle.setText("Hide Outputs" if visible else "Show Outputs")
+
+    def set_vrd_log_visible(self, visible: bool) -> None:
+        self.vrd_log_group.setVisible(bool(visible))
+        self.vrd_log_toggle.setText("Hide Log" if visible else "Show Log")
+
+    def set_texture_progress(self, value: int, title: str, detail: str, color: str = "#58a6ff") -> None:
+        value = max(0, min(100, int(value)))
+        self.texture_progress_bar.setValue(value)
+        self.texture_progress_label.setText(
+            f'<span style="color:{color};">{html.escape(title)}</span> - {value}%'
+            f'<br><span style="color:#8f98a3;">{html.escape(detail)}</span>'
+        )
+
+    def append_texture_log(self, message: str) -> None:
+        display = self.translate_runtime_text(str(message))
+        self.texture_log.appendPlainText(display)
+        self.statusBar().showMessage(display[:160])
+        match = re.search(r"\[(\d+)\s*/\s*(\d+)\]", message)
+        if match:
+            current = int(match.group(1))
+            total = max(1, int(match.group(2)))
+            self.set_texture_progress(int(current * 90 / total), "Processing Textures", message)
+        elif "Wrote manifest" in message or "finished" in message:
+            self.set_texture_progress(96, "Finalizing", message)
+
+    def on_texture_input_changed(self, value: str) -> None:
+        self.texture_output_dir = ""
+        self.current_texture_analysis = None
+        self.current_texture_plan = None
+        self.texture_table.setRowCount(0)
+        self.texture_process_button.setEnabled(False)
+        self.clear_texture_preview()
+        if value.strip():
+            self.update_texture_output_preview(Path(value.strip()))
+        else:
+            self.texture_output_edit.clear()
+            self.open_texture_folder_button.setEnabled(False)
+        self.save_settings()
+
+    def update_texture_output_preview(self, input_path: Path) -> None:
+        try:
+            texture_dir, analysis_json, plan_json, report_json, manifest_json, log_path = core.texture_paths_for_material_input(input_path)
+            self.texture_output_dir = str(texture_dir)
+            self.texture_output_edit.setText(str(texture_dir))
+            self.texture_analysis_label.setText(str(analysis_json))
+            self.texture_plan_label.setText(str(plan_json))
+            self.texture_report_label.setText(str(report_json))
+            self.texture_manifest_label.setText(str(manifest_json))
+            self.texture_png_dir_label.setText(str(texture_dir / "png"))
+            self.texture_normals_dir_label.setText(str(texture_dir / "png_normals"))
+            self.texture_log_label.setText(str(log_path))
+            self.open_texture_folder_button.setEnabled(texture_dir.exists())
+            if plan_json.exists():
+                try:
+                    self.current_texture_plan = json.loads(plan_json.read_text(encoding="utf-8"))
+                    self.populate_texture_table(self.current_texture_plan)
+                    self.texture_process_button.setEnabled(True)
+                except Exception:
+                    pass
+            if analysis_json.exists():
+                try:
+                    self.current_texture_analysis = json.loads(analysis_json.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+        except Exception:
+            self.texture_output_edit.clear()
+
+    def detect_material_mapping(self) -> None:
+        candidates: list[Path] = []
+
+        def add_candidate(raw: object) -> None:
+            if raw is None:
+                return
+            text = str(raw).strip()
+            if not text:
+                return
+            path = Path(text)
+            if path.is_dir():
+                for child in (path / "materials.npy", path / "materials.json", path / "5_sort_materials" / "materials.npy", path / "5_sort_materials" / "materials.json"):
+                    candidates.append(child)
+            else:
+                candidates.append(path)
+
+        for raw in (
+            self.texture_input_row.value() if hasattr(self, "texture_input_row") else "",
+            self.material_mapping_label.text() if hasattr(self, "material_mapping_label") else "",
+            self.material_output_edit.text() if hasattr(self, "material_output_edit") else "",
+            self.settings_store.value("texture_input_mapping", "", str),
+        ):
+            add_candidate(raw)
+        try:
+            matches = sorted(core.workspaces_root().glob("*/5_sort_materials/materials.npy"), key=lambda item: item.stat().st_mtime, reverse=True)
+            candidates.extend(matches)
+        except Exception:
+            pass
+        seen: set[Path] = set()
+        for candidate in candidates:
+            try:
+                candidate = candidate.resolve()
+            except Exception:
+                candidate = candidate.absolute()
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if candidate.exists() and candidate.name.lower() in {"materials.npy", "materials.json"}:
+                self.texture_input_row.set_value(str(candidate))
+                if hasattr(self, "texture_tab"):
+                    self.tabs.setCurrentWidget(self.texture_tab)
+                return
+        self.show_error("Detect Material Mapping", "No Step 5 materials.npy/materials.json was found. Run Step 5 or browse to the material mapping.")
+
+    def start_texture_analyze(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        if not self.ensure_step_can_run(12):
+            return
+        input_raw = self.texture_input_row.value()
+        if not input_raw:
+            self.show_error("Analyze Textures failed", "Select materials.npy/materials.json or a workspace folder first.")
+            return
+        input_path = Path(input_raw)
+        if not input_path.exists():
+            self.show_error("Analyze Textures failed", f"Material mapping input not found:\n{input_path}")
+            return
+        self.texture_log.clear()
+        self.texture_table.setRowCount(0)
+        self.clear_texture_preview()
+        self.set_step_working(12, "Preparing Step 12 texture analysis")
+        self.set_texture_progress(0, "Queued", "Preparing texture analysis", "#58a6ff")
+        self.texture_analyze_button.setEnabled(False)
+        self.texture_process_button.setEnabled(False)
+        self.detect_texture_mapping_button.setEnabled(False)
+        self.texture_cancel_button.setEnabled(True)
+        self.worker = TextureAnalyzeWorker(str(input_path))
+        self.worker.log.connect(self.append_texture_log)
+        self.worker.done.connect(self.texture_analyze_done)
+        self.worker.failed.connect(self.texture_failed)
+        self.worker.start()
+
+    def texture_analyze_done(self, result: dict) -> None:
+        self.texture_analyze_button.setEnabled(True)
+        self.texture_process_button.setEnabled(True)
+        self.detect_texture_mapping_button.setEnabled(True)
+        self.texture_cancel_button.setEnabled(False)
+        self.texture_output_dir = str(result.get("texture_dir", ""))
+        self.texture_output_edit.setText(self.texture_output_dir)
+        self.texture_analysis_label.setText(str(result.get("analysis", "")))
+        self.texture_plan_label.setText(str(result.get("plan", "")))
+        self.texture_report_label.setText(str(result.get("report", "")))
+        self.texture_manifest_label.setText(str(result.get("manifest", "")))
+        self.texture_png_dir_label.setText(str(Path(self.texture_output_dir) / "png") if self.texture_output_dir else "")
+        self.texture_normals_dir_label.setText(str(Path(self.texture_output_dir) / "png_normals") if self.texture_output_dir else "")
+        self.texture_log_label.setText(str(result.get("log", "")))
+        self.open_texture_folder_button.setEnabled(bool(self.texture_output_dir))
+        self.current_texture_analysis = result.get("analysis_data") if isinstance(result.get("analysis_data"), dict) else {}
+        self.current_texture_plan = result.get("plan_data") if isinstance(result.get("plan_data"), dict) else {}
+        self.populate_texture_table(self.current_texture_plan or {})
+        rows = self.texture_entries()
+        generated = sum(
+            1
+            for row in rows
+            if row.get("force_generate_normal")
+            or str(row.get("normal_action") or "") in {"generated", "generated_override", "regenerated_for_tone"}
+            or (row.get("use_normal") and str(row.get("normal_action_default") or row.get("normal_action")) in {"generate", "skip_generate"})
+        )
+        enabled_normals = sum(1 for row in rows if row.get("use_normal") or row.get("generate_normal"))
+        found = sum(1 for row in rows if row.get("normal_source_path"))
+        self.texture_summary_label.setText(
+            f"Texture analysis complete. Materials: {len(rows):,}; found normals: {found:,}; normals enabled: {enabled_normals:,}; generated normals enabled: {generated:,}."
+        )
+        self.set_texture_progress(100, "Analysis Complete", self.texture_output_dir, "#2ea043")
+        self.clear_step_state(12, "Step 12 analysis complete")
+
+    def start_texture_process(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        if not self.ensure_step_can_run(12):
+            return
+        input_raw = self.texture_input_row.value()
+        if not input_raw:
+            self.show_error("Process Textures failed", "Select materials.npy/materials.json or a workspace folder first.")
+            return
+        if not self.current_texture_plan:
+            self.show_error("Process Textures failed", "Analyze textures first or load an existing texture plan.")
+            return
+        self.set_step_working(12, "Preparing Step 12 texture processing")
+        self.texture_log.clear()
+        self.set_texture_progress(0, "Queued", "Preparing texture processing", "#58a6ff")
+        self.texture_analyze_button.setEnabled(False)
+        self.texture_process_button.setEnabled(False)
+        self.detect_texture_mapping_button.setEnabled(False)
+        self.texture_cancel_button.setEnabled(True)
+        self.worker = TextureProcessWorker(input_raw, self.current_texture_plan)
+        self.worker.log.connect(self.append_texture_log)
+        self.worker.done.connect(self.texture_process_done)
+        self.worker.failed.connect(self.texture_failed)
+        self.worker.start()
+
+    def texture_process_done(self, result: dict) -> None:
+        self.texture_analyze_button.setEnabled(True)
+        self.texture_process_button.setEnabled(True)
+        self.detect_texture_mapping_button.setEnabled(True)
+        self.texture_cancel_button.setEnabled(False)
+        self.texture_output_dir = str(result.get("texture_dir", ""))
+        self.texture_output_edit.setText(self.texture_output_dir)
+        self.texture_analysis_label.setText(str(result.get("analysis", "")))
+        self.texture_plan_label.setText(str(result.get("plan", "")))
+        self.texture_report_label.setText(str(result.get("report", "")))
+        self.texture_manifest_label.setText(str(result.get("manifest", "")))
+        self.texture_png_dir_label.setText(str(Path(self.texture_output_dir) / "png") if self.texture_output_dir else "")
+        self.texture_normals_dir_label.setText(str(Path(self.texture_output_dir) / "png_normals") if self.texture_output_dir else "")
+        self.texture_log_label.setText(str(result.get("log", "")))
+        self.open_texture_folder_button.setEnabled(bool(self.texture_output_dir))
+        report = result.get("report_data") if isinstance(result.get("report_data"), dict) else {}
+        processed = int(report.get("processed_count", 0) or 0)
+        errors = int(report.get("error_count", 0) or 0)
+        self.texture_summary_label.setText(f"Step 12 complete. Processed textures: {processed:,}; errors: {errors:,}.")
+        try:
+            plan_path = Path(str(result.get("plan", "")))
+            if plan_path.exists():
+                self.current_texture_plan = json.loads(plan_path.read_text(encoding="utf-8"))
+                manifest = result.get("manifest_data") if isinstance(result.get("manifest_data"), dict) else {}
+                self.current_texture_plan = self.merge_texture_manifest_into_plan(self.current_texture_plan, manifest)
+                self.populate_texture_table(self.current_texture_plan)
+        except Exception:
+            pass
+        self.set_texture_progress(100, "Step 12 Complete", self.texture_output_dir, "#2ea043")
+        if errors <= 0:
+            self.complete_step_from_result(
+                12,
+                result,
+                "texture_dir",
+                ["manifest", "plan"],
+                report_key="report",
+                validation={"ok": True, "processed_count": processed, "error_count": errors},
+            )
+        else:
+            self.set_step_failed(12, "Step 12 texture processing completed with errors")
+        QtWidgets.QMessageBox.information(self, "Step 12 complete", "Texture PNG processing completed.")
+
+    def texture_failed(self, message: str) -> None:
+        self.texture_analyze_button.setEnabled(True)
+        self.texture_process_button.setEnabled(bool(self.current_texture_plan))
+        self.detect_texture_mapping_button.setEnabled(True)
+        self.texture_cancel_button.setEnabled(False)
+        self.set_texture_progress(self.texture_progress_bar.value(), "Step 12 Failed", "See the log for details.", "#f85149")
+        self.set_step_failed(12, "Step 12 texture step failed")
+        self.show_error("Step 12 failed", message)
+
+    def cancel_texture(self) -> None:
+        if self.worker and self.worker.isRunning() and hasattr(self.worker, "cancel"):
+            self.worker.cancel()  # type: ignore[attr-defined]
+            self.append_texture_log("Cancel requested.")
+
+    def texture_entries(self) -> list[dict[str, object]]:
+        if not self.current_texture_plan:
+            return []
+        rows = self.current_texture_plan.get("rows", [])
+        return [entry for entry in rows if isinstance(entry, dict)] if isinstance(rows, list) else []
+
+    def merge_texture_manifest_into_plan(self, plan: dict[str, object], manifest: dict[str, object]) -> dict[str, object]:
+        rows = [entry for entry in plan.get("rows", []) if isinstance(entry, dict)] if isinstance(plan.get("rows"), list) else []
+        processed_rows = manifest.get("textures", [])
+        if not isinstance(processed_rows, list):
+            return plan
+        by_uid = {str(row.get("uid") or ""): row for row in processed_rows if isinstance(row, dict) and row.get("uid")}
+        by_name = {
+            str(row.get("material_name") or row.get("output_name") or ""): row
+            for row in processed_rows
+            if isinstance(row, dict) and (row.get("material_name") or row.get("output_name"))
+        }
+        for entry in rows:
+            uid = str(entry.get("uid") or "")
+            key = str(entry.get("material_name") or entry.get("output_name") or "")
+            report_row = by_uid.get(uid) or by_name.get(key)
+            if not isinstance(report_row, dict):
+                continue
+            normal_status = str(report_row.get("normal_status") or entry.get("normal_action") or "")
+            if normal_status:
+                entry["normal_action"] = normal_status
+            if report_row.get("normal_output_path"):
+                entry["normal_output_path"] = str(report_row.get("normal_output_path") or "")
+            if report_row.get("base_output_path"):
+                entry["base_output_path"] = str(report_row.get("base_output_path") or "")
+            if isinstance(report_row.get("base_output_size"), list):
+                entry["output_size"] = report_row.get("base_output_size")
+            for bool_key in ("use_normal", "generate_normal", "force_generate_normal"):
+                if bool_key in report_row:
+                    entry[bool_key] = bool(report_row.get(bool_key))
+            if "normal_intensity" in report_row:
+                entry["normal_intensity"] = report_row.get("normal_intensity")
+                entry["normal_bias"] = report_row.get("normal_intensity")
+            if isinstance(report_row.get("warnings"), list):
+                entry["warnings"] = report_row.get("warnings")
+            if "normal_tone_ok" in report_row:
+                entry["normal_tone_ok"] = bool(report_row.get("normal_tone_ok"))
+            if isinstance(report_row.get("normal_tone_stats"), dict):
+                entry["normal_tone_stats"] = report_row.get("normal_tone_stats")
+        return plan
+
+    def resolve_texture_base_path_for_display(self, entry: dict[str, object], plan: dict[str, object]) -> str:
+        raw_path = str(entry.get("base_source_path") or "")
+        if not raw_path:
+            return ""
+        path = Path(raw_path)
+        if path.exists():
+            return raw_path
+        workspace_raw = str(plan.get("workspace_root") or "")
+        workspace_root = Path(workspace_raw) if workspace_raw else None
+        stems = {path.stem.casefold()}
+        base_file = str(entry.get("base_color_file") or "")
+        if base_file:
+            stems.add(Path(base_file).stem.casefold())
+        search_dirs = [
+            path.parent,
+            workspace_root / "0_source_mmd_assets" / "tex" if workspace_root else None,
+            workspace_root / "0_source_mmd_assets" / "textures" if workspace_root else None,
+            workspace_root / "0_source_mmd_assets" if workspace_root else None,
+        ]
+        candidates: list[Path] = []
+        for folder in search_dirs:
+            if not folder or not folder.exists() or not folder.is_dir():
+                continue
+            iterator = folder.rglob("*") if folder.name == "0_source_mmd_assets" else folder.glob("*")
+            for candidate in iterator:
+                if not candidate.is_file() or candidate.suffix.lower() not in {".png", ".tga", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}:
+                    continue
+                if candidate.stem.casefold() in stems:
+                    candidates.append(candidate.resolve())
+        if not candidates:
+            return raw_path
+        priority = {".png": 0, ".tga": 1, ".jpg": 2, ".jpeg": 3, ".bmp": 4, ".tif": 5, ".tiff": 6}
+        chosen = sorted(candidates, key=lambda item: (0 if item.parent == path.parent else 1, priority.get(item.suffix.lower(), 99), str(item).casefold()))[0]
+        entry.setdefault("base_source_path_original", raw_path)
+        entry["base_source_path"] = str(chosen)
+        warnings = entry.setdefault("warnings", [])
+        if isinstance(warnings, list):
+            notice = f"Texture path {path.name} was missing; resolved to {chosen.name}."
+            if notice not in warnings:
+                warnings.append(notice)
+        return str(chosen)
+
+    def populate_texture_table(self, plan: dict[str, object]) -> None:
+        rows = [entry for entry in plan.get("rows", []) if isinstance(entry, dict)] if isinstance(plan.get("rows"), list) else []
+        self._updating_texture_table = True
+        self.texture_table.setRowCount(len(rows))
+        for row_index, entry in enumerate(rows):
+            uid = str(entry.get("uid") or f"texture_{row_index + 1:03d}")
+            entry["uid"] = uid
+            base_source_path = self.resolve_texture_base_path_for_display(entry, plan)
+            material_item = QtWidgets.QTableWidgetItem(str(entry.get("material_name") or entry.get("output_name") or ""))
+            material_item.setData(QtCore.Qt.ItemDataRole.UserRole, uid)
+            self.texture_table.setItem(row_index, 0, material_item)
+            base_item = QtWidgets.QTableWidgetItem("")
+            self.set_texture_item_icon(base_item, str(base_source_path or entry.get("base_output_path") or ""))
+            self.texture_table.setItem(row_index, 1, base_item)
+            values = [
+                str(base_source_path or ""),
+                str(entry.get("base_output_path") or ""),
+                str(entry.get("normal_action") or entry.get("normal_type") or ""),
+            ]
+            for col, value in zip((2, 3, 4), values):
+                item = QtWidgets.QTableWidgetItem(value)
+                item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                self.texture_table.setItem(row_index, col, item)
+            generate_item = QtWidgets.QTableWidgetItem("")
+            generate_item.setFlags(
+                QtCore.Qt.ItemFlag.ItemIsUserCheckable
+                | QtCore.Qt.ItemFlag.ItemIsEnabled
+                | QtCore.Qt.ItemFlag.ItemIsSelectable
+            )
+            generate_item.setCheckState(
+                QtCore.Qt.CheckState.Checked
+                if bool(entry.get("use_normal", entry.get("generate_normal", False)))
+                else QtCore.Qt.CheckState.Unchecked
+            )
+            generate_item.setToolTip("Copy/convert a found normal map, or generate one when generation is available. Disabled by default to reduce addon size.")
+            self.texture_table.setItem(row_index, 5, generate_item)
+
+            force_item = QtWidgets.QTableWidgetItem("")
+            force_item.setFlags(
+                QtCore.Qt.ItemFlag.ItemIsUserCheckable
+                | QtCore.Qt.ItemFlag.ItemIsEnabled
+                | QtCore.Qt.ItemFlag.ItemIsSelectable
+            )
+            force_item.setCheckState(
+                QtCore.Qt.CheckState.Checked
+                if bool(entry.get("force_generate_normal", False))
+                else QtCore.Qt.CheckState.Unchecked
+            )
+            force_item.setToolTip("Ignore any found normal map and generate a new blue/purple normal from the base texture.")
+            self.texture_table.setItem(row_index, 6, force_item)
+
+            intensity_item = QtWidgets.QTableWidgetItem(str(int(entry.get("normal_intensity") or entry.get("normal_bias") or 85)))
+            intensity_item.setToolTip("SmartNormal-style generation intensity. Used when Generate New is checked or when no source normal is used.")
+            self.texture_table.setItem(row_index, 7, intensity_item)
+
+            normal_item = QtWidgets.QTableWidgetItem("")
+            use_normal = bool(entry.get("use_normal", entry.get("generate_normal", False)))
+            force_generate = bool(entry.get("force_generate_normal", False))
+            normal_output_path = str(entry.get("normal_output_path") or "")
+            normal_source_path = str(entry.get("normal_source_path") or "")
+            if use_normal and normal_output_path and Path(normal_output_path).exists():
+                normal_preview_path = normal_output_path
+            elif force_generate:
+                normal_preview_path = normal_output_path
+            elif use_normal:
+                normal_preview_path = normal_source_path or normal_output_path
+            else:
+                normal_preview_path = ""
+            self.set_texture_item_icon(normal_item, normal_preview_path)
+            self.texture_table.setItem(row_index, 8, normal_item)
+            if use_normal and normal_output_path and Path(normal_output_path).exists():
+                normal_path = normal_output_path
+            elif use_normal and force_generate:
+                normal_path = normal_output_path
+            elif use_normal and normal_source_path:
+                normal_path = normal_source_path
+            elif use_normal:
+                normal_path = normal_output_path
+            else:
+                normal_path = ""
+            size = entry.get("output_size") or entry.get("base_size") or [0, 0]
+            size_text = f"{int(size[0]):,} x {int(size[1]):,}" if isinstance(size, list) and len(size) >= 2 else ""
+            warnings = "; ".join(str(item) for item in entry.get("warnings", []) if item) if isinstance(entry.get("warnings"), list) else ""
+            for col, value in ((9, normal_path), (10, size_text), (11, warnings)):
+                item = QtWidgets.QTableWidgetItem(value)
+                item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                self.texture_table.setItem(row_index, col, item)
+        self.texture_table.resizeRowsToContents()
+        self._updating_texture_table = False
+        if rows:
+            self.update_texture_hover(0)
+
+    def on_texture_table_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
+        if self._updating_texture_table:
+            return
+        row = item.row()
+        col = item.column()
+        rows = self.texture_entries()
+        if row < 0 or row >= len(rows):
+            return
+        entry = rows[row]
+        if col == 5:
+            use_normal = item.checkState() == QtCore.Qt.CheckState.Checked
+            entry["use_normal"] = use_normal
+            force_generate = bool(entry.get("force_generate_normal", False))
+            entry["generate_normal"] = use_normal and (force_generate or not bool(entry.get("normal_source_path")))
+            entry.setdefault("normal_action_default", entry.get("normal_action") or "skip_missing")
+            default_action = str(entry.get("normal_action_default") or "")
+            entry["normal_action"] = (
+                "generate"
+                if (use_normal and (force_generate or default_action in {"generate", "skip_generate"}))
+                else (default_action if use_normal else "disabled")
+            )
+            status_item = self.texture_table.item(row, 4)
+            if status_item:
+                status_item.setText(str(entry.get("normal_action") or entry.get("normal_type") or ""))
+            path_item = self.texture_table.item(row, 9)
+            if path_item:
+                if use_normal and force_generate:
+                    path_item.setText(str(entry.get("normal_output_path") or ""))
+                elif use_normal and entry.get("normal_source_path"):
+                    path_item.setText(str(entry.get("normal_source_path") or ""))
+                elif use_normal:
+                    path_item.setText(str(entry.get("normal_output_path") or ""))
+                else:
+                    path_item.setText("")
+        elif col == 6:
+            force_generate = item.checkState() == QtCore.Qt.CheckState.Checked
+            entry["force_generate_normal"] = force_generate
+            if force_generate:
+                entry["use_normal"] = True
+                entry["generate_normal"] = True
+                entry["normal_action"] = "generate"
+                use_item = self.texture_table.item(row, 5)
+                if use_item:
+                    self._updating_texture_table = True
+                    use_item.setCheckState(QtCore.Qt.CheckState.Checked)
+                    self._updating_texture_table = False
+            else:
+                use_normal = bool(entry.get("use_normal", False))
+                default_action = str(entry.get("normal_action_default") or entry.get("normal_action") or "skip_missing")
+                entry["generate_normal"] = use_normal and not bool(entry.get("normal_source_path"))
+                entry["normal_action"] = (
+                    "generate"
+                    if (use_normal and default_action in {"generate", "skip_generate"})
+                    else (default_action if use_normal else "disabled")
+                )
+            status_item = self.texture_table.item(row, 4)
+            if status_item:
+                status_item.setText(str(entry.get("normal_action") or entry.get("normal_type") or ""))
+            path_item = self.texture_table.item(row, 9)
+            if path_item:
+                if entry.get("use_normal") and entry.get("force_generate_normal"):
+                    path_item.setText(str(entry.get("normal_output_path") or ""))
+                elif entry.get("use_normal") and entry.get("normal_source_path"):
+                    path_item.setText(str(entry.get("normal_source_path") or ""))
+                elif entry.get("use_normal"):
+                    path_item.setText(str(entry.get("normal_output_path") or ""))
+                else:
+                    path_item.setText("")
+        elif col == 7:
+            try:
+                value = int(float(item.text().strip()))
+            except Exception:
+                value = 85
+            value = max(0, min(255, value))
+            entry["normal_intensity"] = value
+            entry["normal_bias"] = value
+            if item.text() != str(value):
+                self._updating_texture_table = True
+                item.setText(str(value))
+                self._updating_texture_table = False
+        else:
+            return
+        self.update_texture_summary()
+        if self._hover_texture_uid == str(entry.get("uid") or ""):
+            self.show_texture_preview(entry)
+
+    def update_texture_summary(self) -> None:
+        rows = self.texture_entries()
+        if not rows:
+            return
+        generated = sum(
+            1
+            for row in rows
+            if row.get("force_generate_normal")
+            or str(row.get("normal_action") or "") in {"generated", "generated_override", "regenerated_for_tone"}
+            or (row.get("use_normal") and str(row.get("normal_action_default") or row.get("normal_action")) in {"generate", "skip_generate"})
+        )
+        enabled_normals = sum(1 for row in rows if row.get("use_normal") or row.get("generate_normal"))
+        found = sum(1 for row in rows if row.get("normal_source_path"))
+        self.texture_summary_label.setText(
+            f"Texture plan ready. Materials: {len(rows):,}; found normals: {found:,}; normals enabled: {enabled_normals:,}; generated normals enabled: {generated:,}."
+        )
+
+    def set_texture_item_icon(self, item: QtWidgets.QTableWidgetItem, raw_path: str) -> None:
+        path = Path(raw_path) if raw_path else None
+        if not path or not path.exists():
+            return
+        pixmap = QtGui.QPixmap(str(path))
+        if pixmap.isNull():
+            return
+        item.setIcon(QtGui.QIcon(pixmap.scaled(44, 44, QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation)))
+
+    def update_texture_hover(self, row: int) -> None:
+        rows = self.texture_entries()
+        if row < 0 or row >= len(rows):
+            return
+        entry = rows[row]
+        self._hover_texture_uid = str(entry.get("uid") or "")
+        self.show_texture_preview(entry)
+
+    def on_texture_selection_changed(self) -> None:
+        indexes = self.texture_table.selectionModel().selectedRows() if self.texture_table.selectionModel() else []
+        if not indexes:
+            return
+        self.update_texture_hover(indexes[0].row())
+
+    def clear_texture_preview(self) -> None:
+        if hasattr(self, "texture_base_preview_label"):
+            self.texture_base_preview_label.clear()
+            self.texture_base_preview_label.setText("Base texture")
+        if hasattr(self, "texture_normal_preview_label"):
+            self.texture_normal_preview_label.clear()
+            self.texture_normal_preview_label.setText("Normal map")
+        if hasattr(self, "texture_info_label"):
+            self.texture_info_label.setText("Hover or select a material row to preview base and normal textures.")
+
+    def show_texture_preview(self, entry: dict[str, object]) -> None:
+        base_path = str(entry.get("base_output_path") or "")
+        if not base_path or not Path(base_path).exists():
+            base_path = str(entry.get("base_source_path") or "")
+        use_normal = bool(entry.get("use_normal", entry.get("generate_normal", False)))
+        force_generate = bool(entry.get("force_generate_normal", False))
+        normal_path = ""
+        if use_normal:
+            normal_output_path = str(entry.get("normal_output_path") or "")
+            normal_source_path = str(entry.get("normal_source_path") or "")
+            if normal_output_path and Path(normal_output_path).exists():
+                normal_path = normal_output_path
+            elif force_generate:
+                normal_path = normal_output_path
+            else:
+                normal_path = normal_source_path or normal_output_path
+        self.set_preview_pixmap(self.texture_base_preview_label, base_path, "Base texture")
+        self.set_preview_pixmap(self.texture_normal_preview_label, normal_path, "Normal map")
+        size = entry.get("output_size") or entry.get("base_size") or [0, 0]
+        size_text = f"{int(size[0]):,} x {int(size[1]):,}" if isinstance(size, list) and len(size) >= 2 else ""
+        warnings = "; ".join(str(item) for item in entry.get("warnings", []) if item) if isinstance(entry.get("warnings"), list) else ""
+        generate_text = "yes" if use_normal else "no"
+        force_text = "yes" if force_generate else "no"
+        intensity = int(entry.get("normal_intensity") or entry.get("normal_bias") or 85)
+        available_action = entry.get("normal_action_default") or entry.get("normal_type") or "missing"
+        self.texture_info_label.setText(
+            f"{entry.get('material_name') or entry.get('output_name') or ''}\n"
+            f"Base: {base_path or 'missing'}\n"
+            f"Normal: {entry.get('normal_action') or entry.get('normal_type') or 'missing'}; available: {available_action} - {normal_path or 'none'}\n"
+            f"Use normal: {generate_text}; force generated normal: {force_text}; generation intensity: {intensity}\n"
+            f"Size: {size_text}\n"
+            f"{warnings}"
+        )
+
+    def set_preview_pixmap(self, label: QtWidgets.QLabel, raw_path: str, placeholder: str) -> None:
+        path = Path(raw_path) if raw_path else None
+        if not path or not path.exists():
+            label.clear()
+            label.setText(placeholder)
+            return
+        pixmap = QtGui.QPixmap(str(path))
+        if pixmap.isNull():
+            label.clear()
+            label.setText("Preview unavailable")
+            return
+        label.setPixmap(pixmap.scaled(label.size(), QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation))
+
+    def on_icon_input_changed(self, value: str) -> None:
+        self.current_icon_analysis = None
+        self.current_icon_plan = None
+        self.current_icon_files = None
+        self.icon_files_table.setRowCount(0)
+        self.clear_icon_previews()
+        if value.strip():
+            self.update_icon_output_preview(Path(value.strip()))
+        else:
+            self.icon_output_dir = ""
+            self.icon_output_edit.clear()
+            self.open_icon_folder_button.setEnabled(False)
+        self.save_settings()
+
+    def icon_face_vmd_paths(self) -> list[str]:
+        if not hasattr(self, "icon_face_vmd_row"):
+            return []
+        raw = self.icon_face_vmd_row.value().strip()
+        if not raw:
+            return []
+        return [part.strip().strip('"') for part in re.split(r";|\n", raw) if part.strip()]
+
+    def icon_render_frame(self) -> int:
+        return int(self.icon_frame_spin.value()) if hasattr(self, "icon_frame_spin") else 334
+
+    def on_icon_frame_spin_changed(self, value: int) -> None:
+        if hasattr(self, "icon_preview_frame_slider"):
+            self.icon_preview_frame_slider.blockSignals(True)
+            self.icon_preview_frame_slider.setValue(int(value))
+            self.icon_preview_frame_slider.blockSignals(False)
+        self.save_settings()
+        preview = getattr(self, "icon_animation_preview", None)
+        if preview is not None and getattr(preview, "scene_data", None):
+            scene = preview.scene_data
+            start = int(getattr(scene, "frame_start", 0))
+            end = int(getattr(scene, "frame_end", max(start + 1, value)))
+            preview.scrub_to_fraction((int(value) - start) / max(1, end - start))
+
+    def on_icon_preview_slider_changed(self, value: int) -> None:
+        if hasattr(self, "icon_frame_spin"):
+            self.icon_frame_spin.blockSignals(True)
+            self.icon_frame_spin.setValue(int(value))
+            self.icon_frame_spin.blockSignals(False)
+        preview = getattr(self, "icon_animation_preview", None)
+        if preview is not None and getattr(preview, "scene_data", None):
+            scene = preview.scene_data
+            start = int(getattr(scene, "frame_start", 0))
+            end = int(getattr(scene, "frame_end", max(start + 1, value)))
+            preview.scrub_to_fraction((int(value) - start) / max(1, end - start))
+        self.save_settings()
+
+    def on_icon_animation_preview_frame_changed(self, frame: int, _seconds: float) -> None:
+        if hasattr(self, "icon_frame_spin"):
+            self.icon_frame_spin.blockSignals(True)
+            self.icon_frame_spin.setValue(int(frame))
+            self.icon_frame_spin.blockSignals(False)
+        if hasattr(self, "icon_preview_frame_slider"):
+            self.icon_preview_frame_slider.blockSignals(True)
+            self.icon_preview_frame_slider.setValue(int(frame))
+            self.icon_preview_frame_slider.blockSignals(False)
+        if hasattr(self, "icon_preview_status_label"):
+            self.icon_preview_status_label.setText(f"Preview frame {int(frame)}. Final render will use this frame.")
+        self.save_settings()
+
+    def resolve_icon_preview_pmx(self) -> Path | None:
+        candidates: list[Path] = []
+        raw = self.icon_input_row.value().strip() if hasattr(self, "icon_input_row") else ""
+        if raw:
+            candidates.append(Path(raw))
+        if self.current_icon_plan:
+            pmx_raw = str(self.current_icon_plan.get("pmx_path") or "")
+            if pmx_raw:
+                candidates.append(Path(pmx_raw))
+        for candidate in candidates:
+            try:
+                if candidate.is_file() and candidate.suffix.lower() == ".pmx":
+                    return candidate
+                workspace = core.workspace_root_for_step1_input(candidate)
+                source_assets = workspace / "0_source_mmd_assets"
+                if source_assets.exists():
+                    pmx_files = sorted(source_assets.rglob("*.pmx"), key=lambda item: (-item.stat().st_size, str(item).lower()))
+                    if pmx_files:
+                        return pmx_files[0]
+            except Exception:
+                continue
+        return None
+
+    def load_icon_animation_preview(self) -> None:
+        preview = getattr(self, "icon_animation_preview", None)
+        if preview is None:
+            self.icon_preview_status_label.setText("Animation preview module is unavailable; generation still works.")
+            return
+        pmx_path = self.resolve_icon_preview_pmx()
+        if not pmx_path or not pmx_path.exists():
+            self.show_error("Animation Preview", "Select or detect a Step 1 PMX workspace first.")
+            return
+        body_vmd = Path(self.icon_body_vmd_row.value().strip()) if hasattr(self, "icon_body_vmd_row") and self.icon_body_vmd_row.value().strip() else core.DEFAULT_ICON_VMD
+        if not body_vmd.exists():
+            self.show_error("Animation Preview", f"Body VMD not found:\n{body_vmd}")
+            return
+        face_vmds = [Path(path) for path in self.icon_face_vmd_paths()]
+        missing = [path for path in face_vmds if not path.exists()]
+        if missing:
+            self.show_error("Animation Preview", f"Facial/flex VMD not found:\n{missing[0]}")
+            return
+        try:
+            scene = preview.load_scene(pmx_path, body_vmd, face_vmds, None)
+            try:
+                preview.frameChanged.disconnect(self.on_icon_animation_preview_frame_changed)
+            except Exception:
+                pass
+            preview.frameChanged.connect(self.on_icon_animation_preview_frame_changed)
+            start = int(getattr(scene, "frame_start", 0))
+            end = max(start + 1, int(getattr(scene, "frame_end", 1000)))
+            self.icon_preview_frame_slider.setRange(start, end)
+            self.icon_frame_spin.setRange(start, max(end, 999999))
+            target = max(start, min(end, self.icon_render_frame()))
+            self.icon_frame_spin.setValue(target)
+            preview.scrub_to_fraction((target - start) / max(1, end - start))
+            self.icon_preview_status_label.setText(f"Preview loaded: {pmx_path.name}, {body_vmd.name}, frames {start}-{end}.")
+        except Exception as exc:
+            self.show_error("Animation Preview failed", str(exc))
+
+    def update_icon_output_preview(self, input_path: Path) -> None:
+        try:
+            icon_dir, analysis_json, plan_json, report_json, files_json, render_report_json, log_path = core.icon_paths_for_step1_input(input_path)
+            self.icon_output_dir = str(icon_dir)
+            self.icon_output_edit.setText(str(icon_dir))
+            self.icon_analysis_label.setText(str(analysis_json))
+            self.icon_plan_label.setText(str(plan_json))
+            self.icon_report_label.setText(str(report_json))
+            self.icon_files_label.setText(str(files_json))
+            self.icon_render_report_label.setText(str(render_report_json))
+            self.icon_log_label.setText(str(log_path))
+            self.open_icon_folder_button.setEnabled(icon_dir.exists())
+            if plan_json.exists():
+                try:
+                    self.current_icon_plan = json.loads(plan_json.read_text(encoding="utf-8"))
+                    if not self.icon_basename_edit.text().strip():
+                        self.icon_basename_edit.setText(str(self.current_icon_plan.get("icon_basename") or ""))
+                    if hasattr(self, "icon_body_vmd_row") and self.current_icon_plan.get("body_vmd_path"):
+                        self.icon_body_vmd_row.set_value(str(self.current_icon_plan.get("body_vmd_path") or ""))
+                    if hasattr(self, "icon_face_vmd_row") and isinstance(self.current_icon_plan.get("face_vmd_paths"), list):
+                        self.icon_face_vmd_row.set_value("; ".join(str(path) for path in self.current_icon_plan.get("face_vmd_paths", []) if path))
+                    if hasattr(self, "icon_frame_spin") and self.current_icon_plan.get("frame") is not None:
+                        self.icon_frame_spin.setValue(int(self.current_icon_plan.get("frame") or 334))
+                except Exception:
+                    pass
+            if analysis_json.exists():
+                try:
+                    self.current_icon_analysis = json.loads(analysis_json.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            if files_json.exists() or report_json.exists():
+                self.load_existing_icon_outputs(icon_dir, report_json, files_json)
+        except Exception:
+            self.icon_output_dir = ""
+            self.icon_output_edit.clear()
+
+    def detect_step1_output_for_icons(self) -> None:
+        candidates: list[Path] = []
+
+        def add(raw: object) -> None:
+            text = str(raw or "").strip()
+            if text:
+                candidates.append(Path(text))
+
+        add(self.icon_input_row.value() if hasattr(self, "icon_input_row") else "")
+        add(self.workspace_edit.text() if hasattr(self, "workspace_edit") else "")
+        add(self.output_blend_label.text() if hasattr(self, "output_blend_label") else "")
+        if self.current_workspace:
+            candidates.extend([self.current_workspace.root, self.current_workspace.copied_pmx, self.current_workspace.blend_path])
+        try:
+            workspaces = sorted(core.workspaces_root().glob("*"), key=lambda item: item.stat().st_mtime, reverse=True)
+            for workspace in workspaces:
+                if (workspace / "0_source_mmd_assets").exists():
+                    candidates.append(workspace)
+                import_blends = sorted((workspace / "1_import_mmd_model").glob("*_import.blend"), key=lambda item: item.stat().st_mtime, reverse=True)
+                candidates.extend(import_blends[:1])
+        except Exception:
+            pass
+
+        seen: set[Path] = set()
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve()
+            except Exception:
+                resolved = candidate.absolute()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            try:
+                workspace = core.workspace_root_for_step1_input(resolved)
+                pmx_files = []
+                if resolved.is_file() and resolved.suffix.lower() == ".pmx":
+                    pmx_files.append(resolved)
+                source_assets = workspace / "0_source_mmd_assets"
+                if source_assets.exists():
+                    pmx_files.extend(source_assets.rglob("*.pmx"))
+                if pmx_files:
+                    self.icon_input_row.set_value(str(workspace if workspace.exists() else resolved))
+                    if hasattr(self, "icons_tab"):
+                        self.tabs.setCurrentWidget(self.icons_tab)
+                    return
+            except Exception:
+                continue
+        self.show_error("Detect Step 1 Output", "No Step 1 workspace or copied PMX was found. Run Step 1 or browse to a PMX/import blend.")
+
+    def start_icon_generate(self, use_custom: bool = False) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        if not self.ensure_step_can_run(13):
+            return
+        input_raw = self.icon_input_row.value().strip()
+        if not input_raw:
+            self.show_error("Generate Icons failed", "Select a Step 1 workspace, PMX, or import blend first.")
+            return
+        input_path = Path(input_raw)
+        if not input_path.exists():
+            self.show_error("Generate Icons failed", f"Step 1 input not found:\n{input_path}")
+            return
+        custom_raw = self.icon_custom_image_row.value().strip() if use_custom else ""
+        if use_custom:
+            if not custom_raw:
+                self.show_error("Use Custom Image failed", "Select a custom PNG/JPG image first.")
+                return
+            if not Path(custom_raw).exists():
+                self.show_error("Use Custom Image failed", f"Custom image not found:\n{custom_raw}")
+                return
+        body_vmd_raw = self.icon_body_vmd_row.value().strip() if hasattr(self, "icon_body_vmd_row") else ""
+        if not use_custom:
+            if not body_vmd_raw:
+                body_vmd_raw = str(core.DEFAULT_ICON_VMD)
+            if not Path(body_vmd_raw).exists():
+                self.show_error("Generate Icons failed", f"Body VMD not found:\n{body_vmd_raw}")
+                return
+            for face_vmd in self.icon_face_vmd_paths():
+                if not Path(face_vmd).exists():
+                    self.show_error("Generate Icons failed", f"Facial/flex VMD not found:\n{face_vmd}")
+                    return
+        self.set_step_working(13, "Preparing Step 13 icon generation")
+        self.icon_log.clear()
+        self.icon_files_table.setRowCount(0)
+        self.set_icon_progress(0, "Queued", "Preparing Step 13 icon generation", "#58a6ff")
+        self.icon_generate_button.setEnabled(False)
+        self.icon_custom_button.setEnabled(False)
+        self.detect_icon_step1_button.setEnabled(False)
+        self.icon_cancel_button.setEnabled(True)
+        self.worker = IconRunWorker(
+            input_raw,
+            custom_raw,
+            self.icon_basename_edit.text().strip(),
+            body_vmd_raw,
+            self.icon_face_vmd_paths(),
+            self.icon_render_frame(),
+        )
+        self.worker.log.connect(self.append_icon_log)
+        self.worker.done.connect(self.icon_generate_done)
+        self.worker.failed.connect(self.icon_failed)
+        self.worker.start()
+
+    def icon_generate_done(self, result: dict) -> None:
+        self.icon_generate_button.setEnabled(True)
+        self.icon_custom_button.setEnabled(True)
+        self.detect_icon_step1_button.setEnabled(True)
+        self.icon_cancel_button.setEnabled(False)
+        self.icon_output_dir = str(result.get("icon_dir", ""))
+        self.icon_output_edit.setText(self.icon_output_dir)
+        self.icon_analysis_label.setText(str(result.get("analysis", "")))
+        self.icon_plan_label.setText(str(result.get("plan", "")))
+        self.icon_report_label.setText(str(result.get("report", "")))
+        self.icon_files_label.setText(str(result.get("files", "")))
+        self.icon_render_report_label.setText(str(result.get("render_report", "")))
+        self.icon_log_label.setText(str(result.get("log", "")))
+        self.open_icon_folder_button.setEnabled(bool(self.icon_output_dir))
+        report = result.get("report_data") if isinstance(result.get("report_data"), dict) else {}
+        files = result.get("files_data") if isinstance(result.get("files_data"), dict) else {}
+        self.current_icon_files = files
+        self.populate_icon_files_table(files)
+        self.load_icon_previews(Path(self.icon_output_dir) if self.icon_output_dir else None)
+        basename = str(report.get("icon_basename") or "")
+        if basename:
+            self.icon_basename_edit.setText(basename)
+        errors = [str(item) for item in report.get("validation_errors", []) if item] if isinstance(report.get("validation_errors"), list) else []
+        warnings = [str(item) for item in report.get("warnings", []) if item] if isinstance(report.get("warnings"), list) else []
+        status = str(report.get("status") or "complete")
+        if errors:
+            self.icon_summary_label.setText(f"Step 13 generated image assets but is incomplete: {'; '.join(errors)}")
+            self.set_icon_progress(100, "Complete With Missing VTF", self.icon_output_dir, "#d29922")
+            self.set_step_failed(13, "Step 13 icon generation incomplete")
+        else:
+            self.icon_summary_label.setText(f"Step 13 complete. Output folder: {self.icon_output_dir}")
+            self.set_icon_progress(100, "Step 13 Complete", self.icon_output_dir, "#2ea043")
+            self.complete_step_from_result(
+                13,
+                result,
+                "icon_dir",
+                ["files", "report"],
+                report_key="report",
+                validation={"ok": True, "status": status},
+            )
+        if warnings:
+            self.icon_info_label.setText(self.icon_info_label.text() + "\nWarnings: " + "; ".join(warnings))
+        if status != "complete" and errors:
+            QtWidgets.QMessageBox.warning(self, "Step 13 incomplete", "Image assets were generated, but VTF conversion is incomplete.\n\n" + "\n".join(errors))
+
+    def icon_failed(self, message: str) -> None:
+        self.icon_generate_button.setEnabled(True)
+        self.icon_custom_button.setEnabled(True)
+        self.detect_icon_step1_button.setEnabled(True)
+        self.icon_cancel_button.setEnabled(False)
+        self.set_icon_progress(self.icon_progress_bar.value(), "Step 13 Failed", "See the log for details.", "#f85149")
+        self.set_step_failed(13, "Step 13 icon generation failed")
+        self.show_error("Step 13 failed", message)
+
+    def cancel_icon_generation(self) -> None:
+        if self.worker and self.worker.isRunning() and hasattr(self.worker, "cancel"):
+            self.worker.cancel()  # type: ignore[attr-defined]
+            self.append_icon_log("Cancel requested.")
+
+    def clear_icon_previews(self) -> None:
+        for label, placeholder in (
+            (self.release_icon_preview_label, "release_icon.png"),
+            (self.friendly_icon_preview_label, "F.jpg"),
+            (self.enemy_icon_preview_label, "E.jpg"),
+        ):
+            label.clear()
+            label.setText(placeholder)
+        self.icon_info_label.setText("Generated icon information appears here.")
+
+    def load_existing_icon_outputs(self, icon_dir: Path, report_json: Path, files_json: Path) -> None:
+        try:
+            if report_json.exists():
+                report = json.loads(report_json.read_text(encoding="utf-8"))
+                basename = str(report.get("icon_basename") or "")
+                if basename and not self.icon_basename_edit.text().strip():
+                    self.icon_basename_edit.setText(basename)
+                errors = report.get("validation_errors", [])
+                if isinstance(errors, list) and errors:
+                    self.icon_summary_label.setText("Existing Step 13 output is incomplete: " + "; ".join(str(item) for item in errors))
+                else:
+                    self.icon_summary_label.setText(f"Existing Step 13 output found: {icon_dir}")
+        except Exception:
+            pass
+        try:
+            if files_json.exists():
+                files = json.loads(files_json.read_text(encoding="utf-8"))
+                self.current_icon_files = files
+                self.populate_icon_files_table(files)
+        except Exception:
+            pass
+        self.load_icon_previews(icon_dir)
+
+    def load_icon_previews(self, icon_dir: Path | None) -> None:
+        if not icon_dir:
+            self.clear_icon_previews()
+            return
+        self.set_preview_pixmap(self.release_icon_preview_label, str(icon_dir / "release_icon.png"), "release_icon.png")
+        self.set_preview_pixmap(self.friendly_icon_preview_label, str(icon_dir / "F.jpg"), "F.jpg")
+        self.set_preview_pixmap(self.enemy_icon_preview_label, str(icon_dir / "E.jpg"), "E.jpg")
+        self.icon_info_label.setText(
+            f"Release icon: {icon_dir / 'release_icon.png'}\n"
+            f"Spawn source: {icon_dir / 'spawn_source.png'}\n"
+            f"Friendly icon: {icon_dir / 'F.jpg'}\n"
+            f"Enemy icon: {icon_dir / 'E.jpg'}"
+        )
+
+    def populate_icon_files_table(self, files_data: dict[str, object]) -> None:
+        rows = files_data.get("files", []) if isinstance(files_data, dict) else []
+        rows = [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+        self.icon_files_table.setRowCount(len(rows))
+        for row_index, entry in enumerate(rows):
+            size = int(entry.get("size", 0) or 0)
+            warnings = "; ".join(str(item) for item in entry.get("warnings", []) if item) if isinstance(entry.get("warnings"), list) else ""
+            values = [
+                str(entry.get("name") or ""),
+                str(entry.get("type") or ""),
+                f"{size:,}",
+                str(entry.get("stage") or ""),
+                str(entry.get("path") or ""),
+                warnings,
+            ]
+            for col, value in enumerate(values):
+                item = QtWidgets.QTableWidgetItem(value)
+                item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                self.icon_files_table.setItem(row_index, col, item)
+        self.icon_files_table.resizeRowsToContents()
+
+    def append_icon_log(self, message: str) -> None:
+        self.append_translated_log(self.icon_log, message, self.update_icon_progress_from_log)
+
+    def set_icon_progress(self, value: int, title: str, detail: str, color: str = "#58a6ff") -> None:
+        value = max(0, min(100, int(value)))
+        self.icon_progress_bar.setValue(value)
+        self.icon_progress_label.setText(
+            f'<span style="color:{color};">{html.escape(title)}</span> - {value}%'
+            f'<br><span style="color:#8f98a3;">{html.escape(detail)}</span>'
+        )
+
+    def update_icon_progress_from_log(self, message: str) -> None:
+        checks = [
+            ("Starting Step 13 icon analysis", 8, "Analyzing Input", "#58a6ff"),
+            ("Verifying bundled Blender add-ons", 14, "Verifying Blender", "#58a6ff"),
+            ("Starting Blender release icon render", 20, "Rendering Icon", "#d29922"),
+            ("Importing PMX", 35, "Importing PMX", "#d29922"),
+            ("Importing VMD motion", 52, "Applying VMD", "#d29922"),
+            ("Importing body VMD motion", 52, "Applying Body VMD", "#d29922"),
+            ("Importing facial/flex VMD", 58, "Applying Facial VMD", "#d29922"),
+            ("Scene set to frame", 62, "Framing Pose", "#58a6ff"),
+            ("Trying OpenGL", 70, "Rendering", "#d29922"),
+            ("Wrote release icon", 78, "Release Icon Ready", "#2ea043"),
+            ("Rendering head-centered spawn icon source", 80, "Rendering Spawn Source", "#d29922"),
+            ("Generating Step 13 spawn icon assets", 84, "Generating Spawn Icons", "#58a6ff"),
+            ("Wrote report", 94, "Writing Reports", "#2ea043"),
+            ("Icon generation complete", 100, "Step 13 Complete", "#2ea043"),
+        ]
+        for needle, value, title, color in checks:
+            if needle in message:
+                self.set_icon_progress(value, title, message, color)
+                return
+
+    def append_qc_log(self, message: str) -> None:
+        self.append_translated_log(self.qc_log, message, self.update_qc_progress_from_log)
+
+    def set_qc_progress(self, value: int, title: str, detail: str, color: str = "#58a6ff") -> None:
+        value = max(0, min(100, int(value)))
+        self.qc_progress_bar.setValue(value)
+        self.qc_progress_label.setText(
+            f'<span style="color:{color};">{html.escape(title)}</span> - {value}%'
+            f'<br><span style="color:#8f98a3;">{html.escape(detail)}</span>'
+        )
+
+    def update_qc_progress_from_log(self, message: str) -> None:
+        checks = [
+            ("Starting Step 14 QC analysis", 8, "Analyzing QC Inputs", "#58a6ff"),
+            ("Wrote QC analysis", 25, "Analysis Written", "#2ea043"),
+            ("Wrote QC plan", 30, "Plan Written", "#2ea043"),
+            ("Preparing QC source folder", 34, "Preparing QC Source", "#58a6ff"),
+            ("Wrote bone_list", 40, "Writing Jiggle Lists", "#2ea043"),
+            ("Running studiomdl -definebones", 45, "StudioMDL Definebones", "#d29922"),
+            ("Running studiomdl -h", 52, "StudioMDL Hitboxes", "#d29922"),
+            ("Compiling main model", 62, "Compiling Main Model", "#d29922"),
+            ("Compiling player model", 72, "Compiling Player Model", "#d29922"),
+            ("Compiling c_arms", 80, "Compiling C Arms", "#d29922"),
+            ("Composing final addon folder", 86, "Composing Addon", "#58a6ff"),
+            ("Copying final addon package", 90, "Copying Addon Package", "#58a6ff"),
+            ("Packaging final addon GMA", 93, "Packaging GMA", "#d29922"),
+            ("Installing composed addon folder", 95, "Installing To GMod", "#58a6ff"),
+            ("Wrote QC report", 96, "Writing Report", "#2ea043"),
+            ("Step 14 complete", 100, "Step 14 Complete", "#2ea043"),
+        ]
+        for needle, value, title, color in checks:
+            if needle in message:
+                self.set_qc_progress(value, title, message, color)
+                return
+
+    def qc_safe_text(self, text: str, fallback: str = "") -> str:
+        text = re.sub(r"[^A-Za-z_]+", "_", text.strip())
+        text = re.sub(r"_+", "_", text).strip("_")
+        return text or fallback
+
+    def qc_display_from_internal(self, text: str, fallback: str = "") -> str:
+        words = [part for part in str(text or "").replace("_", " ").split() if part]
+        display = " ".join(part[:1].upper() + part[1:] for part in words)
+        return sanitize_display_name_text(display or fallback)
+
+    def update_qc_display_placeholders(self) -> None:
+        if hasattr(self, "qc_category_display_edit"):
+            category = self.qc_category_edit.text().strip() if hasattr(self, "qc_category_edit") else "SheepyLord"
+            known_display = self.known_category_display_for_internal(category)
+            self.qc_category_display_edit.setPlaceholderText(f"Auto: {known_display or self.qc_display_from_internal(category, 'Sheepy Lord')}")
+        if hasattr(self, "qc_model_display_edit"):
+            model = self.qc_model_name_edit.text().strip() if hasattr(self, "qc_model_name_edit") else ""
+            fallback = self.qc_display_from_internal(model, "auto-derived model name")
+            self.qc_model_display_edit.setPlaceholderText(f"Auto: {fallback}")
+
+    def split_gmod_input_for_qc(self) -> tuple[str, str]:
+        raw = self.qc_gmod_row.value().strip() if hasattr(self, "qc_gmod_row") else ""
+        if not raw:
+            return "", ""
+        path = Path(raw)
+        if path.is_file() or path.name.lower() == "studiomdl.exe":
+            return "", raw
+        return raw, ""
+
+    def on_qc_input_changed(self, value: str) -> None:
+        self.current_qc_analysis = None
+        self.current_qc_plan = None
+        self.current_qc_files = None
+        self.qc_output_dir = ""
+        self.qc_compile_button.setEnabled(False)
+        self.qc_bone_table.setRowCount(0)
+        self.qc_files_table.setRowCount(0)
+        if self.qc_preview is not None:
+            self.qc_preview.clear()
+        if value.strip():
+            self.update_qc_output_preview(Path(value.strip()))
+        else:
+            self.qc_output_edit.clear()
+            self.open_qc_folder_button.setEnabled(False)
+        self.save_settings()
+
+    def update_qc_output_preview(self, input_path: Path) -> None:
+        try:
+            final_dir, qc_dir, analysis_json, plan_json, report_json, files_json, log_path = core.qc_paths_for_step9_input(input_path)
+            self.qc_output_edit.setText(str(qc_dir))
+            self.qc_analysis_label.setText(str(analysis_json) if analysis_json.exists() else str(analysis_json))
+            self.qc_plan_label.setText(str(plan_json) if plan_json.exists() else str(plan_json))
+            self.qc_report_label.setText(str(report_json) if report_json.exists() else str(report_json))
+            self.qc_files_label.setText(str(files_json) if files_json.exists() else str(files_json))
+            self.qc_log_label.setText(str(log_path))
+            self.open_qc_folder_button.setEnabled(qc_dir.exists())
+            if files_json.exists():
+                try:
+                    self.current_qc_files = json.loads(files_json.read_text(encoding="utf-8"))
+                    self.populate_qc_files_table(self.current_qc_files.get("files", []))
+                except Exception:
+                    pass
+            if plan_json.exists():
+                try:
+                    self.current_qc_plan = json.loads(plan_json.read_text(encoding="utf-8"))
+                    self.sync_qc_invert_check_from_plan()
+                    self.sync_qc_fields_from_plan(self.current_qc_plan)
+                    self.populate_qc_bone_table()
+                    self.qc_compile_button.setEnabled(True)
+                except Exception:
+                    pass
+            if analysis_json.exists():
+                try:
+                    self.current_qc_analysis = json.loads(analysis_json.read_text(encoding="utf-8"))
+                    self.refresh_qc_preview()
+                except Exception:
+                    pass
+        except Exception:
+            self.qc_output_edit.clear()
+
+    def detect_qc_step_outputs(self) -> None:
+        candidates: list[Path] = []
+
+        def add_candidate(raw: object) -> None:
+            if raw is None:
+                return
+            text = str(raw).strip()
+            if text:
+                path = Path(text)
+                if path.name == "9_export_proportion_trick":
+                    path = path / "2_proportion_export"
+                candidates.append(path)
+
+        def add_sorted_glob(root: Path, pattern: str) -> None:
+            try:
+                matches = sorted(root.glob(pattern), key=lambda item: item.stat().st_mtime, reverse=True)
+            except Exception:
+                return
+            candidates.extend(matches)
+
+        for raw in (
+            self.qc_input_row.value() if hasattr(self, "qc_input_row") else "",
+            self.proportion_export_dir,
+            self.proportion_final_label.text() if hasattr(self, "proportion_final_label") else "",
+            self.settings_store.value("proportion_input_blend", "", str),
+            self.settings_store.value("qc_input_dir", "", str),
+        ):
+            add_candidate(raw)
+        workspace_text = self.workspace_edit.text().strip() if hasattr(self, "workspace_edit") else ""
+        if workspace_text:
+            add_sorted_glob(Path(workspace_text), "9_export_proportion_trick/2_proportion_export")
+        add_sorted_glob(core.workspaces_root(), "*/9_export_proportion_trick/2_proportion_export")
+        seen: set[Path] = set()
+        for candidate in candidates:
+            try:
+                candidate = candidate.resolve()
+            except Exception:
+                candidate = candidate.absolute()
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if candidate.exists() and (candidate / "Body.smd").exists():
+                self.qc_input_row.set_value(str(candidate))
+                self.tabs.setCurrentWidget(self.qc_tab)
+                return
+        self.show_error("Detect Step Outputs", "No Step 9 proportion export folder was found. Run Step 9 or browse to 2_proportion_export.")
+
+    def detect_gmod_for_qc(self) -> None:
+        candidates: list[Path] = []
+        for key in ("STUDIOMDL", "GMOD_PATH"):
+            raw = os.environ.get(key, "")
+            if raw:
+                path = Path(raw)
+                candidates.append(path)
+                if path.is_dir():
+                    candidates.append(path / "bin" / "studiomdl.exe")
+        for root in (
+            Path("H:/SteamLibrary/steamapps/common/GarrysMod_RTX_c"),
+            Path("H:/SteamLibrary/steamapps/common/GarrysMod"),
+            Path("C:/Program Files (x86)/Steam/steamapps/common/GarrysMod"),
+        ):
+            candidates.append(root / "bin" / "studiomdl.exe")
+        vdf = Path("C:/Program Files (x86)/Steam/steamapps/libraryfolders.vdf")
+        if vdf.exists():
+            try:
+                for match in re.finditer(r'"path"\s+"([^"]+)"', vdf.read_text(encoding="utf-8", errors="ignore")):
+                    lib = Path(match.group(1).replace("\\\\", "\\"))
+                    for name in ("GarrysMod_RTX_c", "GarrysMod"):
+                        candidates.append(lib / "steamapps" / "common" / name / "bin" / "studiomdl.exe")
+            except Exception:
+                pass
+        seen: set[Path] = set()
+        for candidate in candidates:
+            try:
+                candidate = candidate.resolve()
+            except Exception:
+                candidate = candidate.absolute()
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if candidate.name.lower() == "studiomdl.exe" and candidate.exists():
+                self.qc_gmod_row.set_value(str(candidate))
+                self.append_qc_log(f"Detected StudioMDL: {candidate}")
+                return
+            if candidate.is_dir() and (candidate / "bin" / "studiomdl.exe").exists():
+                self.qc_gmod_row.set_value(str(candidate))
+                self.append_qc_log(f"Detected GMod install: {candidate}")
+                return
+        self.show_error("Detect GMod", "Could not find Garry's Mod StudioMDL. Browse to garrysmod/bin/studiomdl.exe or set STUDIOMDL.")
+
+    def start_qc_analyze(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        if not self.ensure_step_can_run(14):
+            return
+        input_raw = self.qc_input_row.value()
+        if not input_raw:
+            self.show_error("Analyze QC failed", "Select a workspace or Step 9 export folder first.")
+            return
+        input_path = Path(input_raw)
+        if not input_path.exists():
+            self.show_error("Analyze QC failed", f"Input path not found:\n{input_path}")
+            return
+        internal_errors = self.validate_qc_internal_fields(allow_blank_model=True)
+        if internal_errors:
+            self.show_error("QC validation", "Blocking errors:\n" + "\n".join(f"- {error}" for error in internal_errors))
+            return
+        self.current_qc_analysis = None
+        self.current_qc_plan = None
+        self.current_qc_files = None
+        self.qc_log.clear()
+        self.qc_bone_table.setRowCount(0)
+        self.qc_files_table.setRowCount(0)
+        if self.qc_preview is not None:
+            self.qc_preview.clear()
+        self.set_step_working(14, "Preparing Step 14 QC analysis")
+        self.set_qc_progress(0, "Queued", "Preparing QC analysis", "#58a6ff")
+        self.qc_analyze_button.setEnabled(False)
+        self.qc_compile_button.setEnabled(False)
+        self.detect_qc_outputs_button.setEnabled(False)
+        self.detect_qc_gmod_button.setEnabled(False)
+        self.qc_cancel_button.setEnabled(True)
+        gmod_root, studiomdl = self.split_gmod_input_for_qc()
+        self.worker = QcAnalyzeWorker(
+            str(input_path),
+            "sheepylord",
+            self.qc_category_edit.text().strip(),
+            self.qc_model_name_edit.text().strip(),
+            gmod_root,
+            studiomdl,
+        )
+        self.worker.log.connect(self.append_qc_log)
+        self.worker.done.connect(self.qc_analyze_done)
+        self.worker.failed.connect(self.qc_failed)
+        self.worker.start()
+
+    def qc_analyze_done(self, result: dict) -> None:
+        self.qc_analyze_button.setEnabled(True)
+        self.detect_qc_outputs_button.setEnabled(True)
+        self.detect_qc_gmod_button.setEnabled(True)
+        self.qc_cancel_button.setEnabled(False)
+        self.qc_compile_button.setEnabled(True)
+        self.current_qc_analysis = result.get("analysis_data") if isinstance(result.get("analysis_data"), dict) else None
+        self.current_qc_plan = result.get("plan_data") if isinstance(result.get("plan_data"), dict) else None
+        self.qc_output_dir = str(result.get("qc_dir", ""))
+        self.qc_output_edit.setText(self.qc_output_dir)
+        self.qc_analysis_label.setText(str(result.get("analysis", "")))
+        self.qc_plan_label.setText(str(result.get("plan", "")))
+        self.qc_report_label.setText(str(result.get("report", "")))
+        self.qc_files_label.setText(str(result.get("files", "")))
+        self.qc_log_label.setText(str(result.get("log", "")))
+        self.open_qc_folder_button.setEnabled(bool(self.qc_output_dir))
+        if self.current_qc_plan:
+            self.current_qc_plan["invert_jiggle_direction"] = self.qc_invert_jiggle_check.isChecked()
+            self.current_qc_plan["include_mci_metadata_json"] = (
+                bool(self.qc_include_mci_metadata_check.isChecked()) if hasattr(self, "qc_include_mci_metadata_check") else True
+            )
+            self.sync_qc_fields_from_plan(self.current_qc_plan)
+            self.populate_qc_bone_table()
+        self.refresh_qc_preview()
+        self.update_qc_summary()
+        self.set_qc_progress(100, "QC Analysis Complete", str(result.get("analysis", "")), "#2ea043")
+        self.clear_step_state(14, "Step 14 analysis complete")
+
+    def qc_failed(self, message: str) -> None:
+        self.qc_analyze_button.setEnabled(True)
+        self.detect_qc_outputs_button.setEnabled(True)
+        self.detect_qc_gmod_button.setEnabled(True)
+        self.qc_cancel_button.setEnabled(False)
+        self.qc_compile_button.setEnabled(self.current_qc_plan is not None)
+        self.set_qc_progress(self.qc_progress_bar.value(), "Step 14 Failed", "See the log for details.", "#f85149")
+        self.set_step_failed(14, "Step 14 QC step failed")
+        self.show_error("Step 14 failed", message)
+
+    def cancel_qc(self) -> None:
+        if self.worker and self.worker.isRunning() and hasattr(self.worker, "cancel"):
+            self.worker.cancel()  # type: ignore[attr-defined]
+            self.append_qc_log("Cancel requested.")
+
+    def qc_entries(self) -> list[dict[str, object]]:
+        if not self.current_qc_plan:
+            return []
+        rows = self.current_qc_plan.get("rows", [])
+        return [entry for entry in rows if isinstance(entry, dict)] if isinstance(rows, list) else []
+
+    def qc_entry_for_uid(self, uid: str) -> dict[str, object] | None:
+        for entry in self.qc_entries():
+            if str(entry.get("uid") or "") == uid:
+                return entry
+        return None
+
+    def sync_qc_invert_check_from_plan(self) -> None:
+        if not self.current_qc_plan or not hasattr(self, "qc_invert_jiggle_check"):
+            return
+        invert = bool(self.current_qc_plan.get("invert_jiggle_direction", False))
+        blocker = QtCore.QSignalBlocker(self.qc_invert_jiggle_check)
+        try:
+            self.qc_invert_jiggle_check.setChecked(invert)
+        finally:
+            del blocker
+
+    def sync_qc_fields_from_plan(self, plan: dict[str, object]) -> None:
+        if hasattr(self, "qc_author_edit"):
+            self.qc_author_edit.setText("sheepylord")
+        if hasattr(self, "qc_category_edit"):
+            self.qc_category_edit.setText(str(plan.get("character_category") or self.qc_category_edit.text() or "SheepyLord"))
+        if hasattr(self, "qc_model_name_edit") and not self.qc_model_name_edit.text().strip():
+            self.qc_model_name_edit.setText(str(plan.get("model_name") or "mmd_model"))
+        if hasattr(self, "qc_category_display_edit") and not self.qc_category_display_edit.text().strip():
+            self.qc_category_display_edit.setPlaceholderText(
+                f"Auto: {str(plan.get('category_readable') or self.qc_display_from_internal(self.qc_category_edit.text(), 'Sheepy Lord'))}"
+            )
+        if hasattr(self, "qc_model_display_edit") and not self.qc_model_display_edit.text().strip():
+            self.qc_model_display_edit.setPlaceholderText(
+                f"Auto: {str(plan.get('display_name') or self.qc_display_from_internal(self.qc_model_name_edit.text(), 'Mmd Model'))}"
+            )
+        if hasattr(self, "qc_include_mci_metadata_check") and "include_mci_metadata_json" in plan:
+            blocker = QtCore.QSignalBlocker(self.qc_include_mci_metadata_check)
+            try:
+                self.qc_include_mci_metadata_check.setChecked(bool(plan.get("include_mci_metadata_json", True)))
+            finally:
+                del blocker
+
+    def on_qc_invert_jiggle_toggled(self, checked: bool) -> None:
+        if self.current_qc_plan is not None:
+            self.current_qc_plan["invert_jiggle_direction"] = bool(checked)
+        self.update_qc_summary()
+        self.save_settings()
+
+    def on_qc_include_mci_metadata_toggled(self, checked: bool) -> None:
+        if self.current_qc_plan is not None:
+            self.current_qc_plan["include_mci_metadata_json"] = bool(checked)
+        self.update_qc_summary()
+        self.save_settings()
+
+    def populate_qc_bone_table(self) -> None:
+        rows = self.qc_entries()
+        self._updating_qc_table = True
+        self.qc_bone_table.setRowCount(len(rows))
+        options = ["Not Jiggle", "Directional Jiggle", "Omni Jiggle", "Spring Jiggle"]
+        for row_index, entry in enumerate(rows):
+            uid = str(entry.get("uid") or f"bone_{row_index + 1:03d}")
+            entry["uid"] = uid
+            combo = QtWidgets.QComboBox()
+            combo.addItems(options)
+            current = str(entry.get("jiggle_type") or "Not Jiggle")
+            combo.setCurrentText(current if current in options else "Not Jiggle")
+            combo.setProperty("uid", uid)
+            if bool(entry.get("essential", False)):
+                combo.setEnabled(False)
+            combo.currentTextChanged.connect(self.on_qc_type_changed)
+            self.qc_bone_table.setCellWidget(row_index, 0, combo)
+            values = [
+                str(entry.get("bone") or ""),
+                str(entry.get("parent") or ""),
+                f"{int(entry.get('weighted_vertices', 0) or 0):,}",
+                str(entry.get("region") or ""),
+                f"{float(entry.get('confidence', 0.0) or 0.0):.3f}",
+                str(entry.get("reason") or ""),
+                "; ".join(str(item) for item in entry.get("warnings", []) if item) if isinstance(entry.get("warnings"), list) else "",
+            ]
+            for column, value in enumerate(values, start=1):
+                item = QtWidgets.QTableWidgetItem(value)
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, uid)
+                item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                if value:
+                    item.setToolTip(value)
+                self.qc_bone_table.setItem(row_index, column, item)
+        self._updating_qc_table = False
+        self.qc_bone_table.resizeRowsToContents()
+
+    def on_qc_type_changed(self, text: str) -> None:
+        if self._updating_qc_table or not self.current_qc_plan:
+            return
+        combo = self.sender()
+        uid = str(combo.property("uid") or "") if isinstance(combo, QtWidgets.QComboBox) else ""
+        entry = self.qc_entry_for_uid(uid)
+        if not entry:
+            return
+        if bool(entry.get("essential", False)):
+            entry["jiggle_type"] = "Not Jiggle"
+            return
+        entry["jiggle_type"] = text
+        self.update_qc_summary()
+
+    def selected_qc_bone_uids(self) -> set[str]:
+        rows = sorted({index.row() for index in self.qc_bone_table.selectionModel().selectedRows()})
+        out: set[str] = set()
+        for row in rows:
+            item = self.qc_bone_table.item(row, 1)
+            if item:
+                uid = item.text().strip()
+                if uid:
+                    out.add(uid)
+        return out
+
+    def update_qc_bone_hover_for_row(self, row: int) -> None:
+        if row < 0 or row >= self.qc_bone_table.rowCount():
+            self.clear_qc_bone_hover()
+            return
+        item = self.qc_bone_table.item(row, 1)
+        uid = item.text().strip() if item else ""
+        if uid == self._hover_qc_bone_uid:
+            return
+        self._hover_qc_bone_uid = uid
+        self.refresh_qc_preview_state()
+
+    def clear_qc_bone_hover(self) -> None:
+        self._hover_qc_bone_uid = ""
+        self.refresh_qc_preview_state()
+
+    def on_qc_bone_selection_changed(self) -> None:
+        self.refresh_qc_preview_state()
+
+    def refresh_qc_preview(self) -> None:
+        if self.qc_preview is None:
+            return
+        if not self.current_qc_analysis:
+            self.qc_preview.clear()
+            return
+        scan = {
+            "materials": self.current_qc_analysis.get("materials", []),
+            "material_count": self.current_qc_analysis.get("material_count", 0),
+            "model_preview": self.current_qc_analysis.get("model_preview", {}),
+        }
+        self.qc_preview.set_material_data(scan, {})
+        bone_overlay = self.current_qc_analysis.get("bone_preview", {})
+        self.qc_preview.set_bone_overlay(bone_overlay if isinstance(bone_overlay, dict) else {})
+        self.refresh_qc_preview_state()
+
+    def refresh_qc_preview_state(self) -> None:
+        if self.qc_preview is None:
+            return
+        selected = self.selected_qc_bone_uids() if hasattr(self, "qc_bone_table") else set()
+        self.qc_preview.set_highlighted_bone_overlay(selected)
+        self.qc_preview.set_hovered_bone_overlay(self._hover_qc_bone_uid)
+
+    def update_qc_summary(self) -> None:
+        if not self.current_qc_plan:
+            self.qc_summary_label.setText("Detect workflow outputs, then analyze QC inputs and jigglebone classification.")
+            return
+        rows = self.qc_entries()
+        jiggles = [row for row in rows if str(row.get("jiggle_type") or "Not Jiggle") != "Not Jiggle" and not row.get("essential", False)]
+        omni = [row for row in jiggles if str(row.get("jiggle_type") or "") == "Omni Jiggle"]
+        warnings = len(self.current_qc_plan.get("warnings", [])) if isinstance(self.current_qc_plan.get("warnings"), list) else 0
+        errors = self.validate_qc_plan()
+        invert = bool(self.current_qc_plan.get("invert_jiggle_direction", False))
+        include_metadata = bool(
+            self.qc_include_mci_metadata_check.isChecked()
+            if hasattr(self, "qc_include_mci_metadata_check")
+            else self.current_qc_plan.get("include_mci_metadata_json", True)
+        )
+        self.qc_summary_label.setText(
+            f"Bones: {len(rows):,} | Jigglebones: {len(jiggles):,} | Omni ignore: {len(omni):,} | "
+            f"Jiggle direction: {'inverted' if invert else 'normal'} | "
+            f"MCI metadata: {'included' if include_metadata else 'skipped'} | "
+            f"Warnings: {warnings:,} | Validation: {'OK' if not errors else f'{len(errors)} issue(s)'}"
+        )
+
+    def validate_qc_internal_fields(self, allow_blank_model: bool = False) -> list[str]:
+        errors: list[str] = []
+        values = [
+            ("Author", "sheepylord", False),
+            ("Character category internal", self.qc_category_edit.text().strip(), False),
+            ("Model internal name", self.qc_model_name_edit.text().strip(), allow_blank_model),
+        ]
+        for label, value, allow_blank in values:
+            if allow_blank and not value:
+                continue
+            if not INTERNAL_IDENTIFIER_REQUIRED_RE.fullmatch(value or ""):
+                errors.append(f"{label} must contain only English letters and underscores.")
+        category_display = self.qc_category_display_edit.text().strip()
+        if category_display and not is_valid_category_display_name_text(category_display, allow_blank=False):
+            errors.append("Character category display name must contain only printable ASCII characters.")
+        model_display = self.qc_model_display_edit.text().strip()
+        if model_display and not is_valid_display_name_text(model_display, allow_blank=False):
+            errors.append("Model display name must contain only English letters, spaces, and underscores.")
+        return errors
+
+    def validate_qc_plan(self) -> list[str]:
+        if not self.current_qc_plan:
+            return ["Run Analyze QC first."]
+        model_value = self.qc_model_name_edit.text().strip() or str(self.current_qc_plan.get("model_name") or "")
+        errors = []
+        for label, value in (
+            ("Author", "sheepylord"),
+            ("Character category internal", self.qc_category_edit.text().strip()),
+            ("Model internal name", model_value),
+        ):
+            if not INTERNAL_IDENTIFIER_REQUIRED_RE.fullmatch(value or ""):
+                errors.append(f"{label} must contain only English letters and underscores.")
+        category = self.qc_category_edit.text().strip() or str(self.current_qc_plan.get("character_category") or "SheepyLord")
+        category_display = (
+            self.qc_category_display_edit.text().strip()
+            or self.known_category_display_for_internal(category)
+            or self.qc_display_from_internal(category, "Sheepy Lord")
+        )
+        if not is_valid_category_display_name_text(category_display, allow_blank=False):
+            errors.append("Character category display name must contain only printable ASCII characters.")
+        model_display = self.qc_model_display_edit.text().strip() or self.qc_display_from_internal(model_value, "Mmd Model")
+        if not is_valid_display_name_text(model_display, allow_blank=False):
+            errors.append("Model display name must contain only English letters, spaces, and underscores.")
+        jiggle_names = {str(row.get("bone") or "") for row in self.qc_entries() if str(row.get("jiggle_type") or "") != "Not Jiggle"}
+        ignore_names = {str(row.get("bone") or "") for row in self.qc_entries() if str(row.get("jiggle_type") or "") == "Omni Jiggle"}
+        if not ignore_names.issubset(jiggle_names):
+            errors.append("bone_list_ignore contains a bone not present in bone_list.")
+        for row in self.qc_entries():
+            if row.get("essential", False) and str(row.get("jiggle_type") or "") != "Not Jiggle":
+                errors.append(f"Essential bone cannot be jigglebone: {row.get('bone')}")
+        return errors
+
+    def update_qc_plan_from_gui(self) -> dict[str, object] | None:
+        if not self.current_qc_plan:
+            return None
+        plan = self.current_qc_plan
+        author = "sheepylord"
+        category = self.qc_category_edit.text().strip() or "SheepyLord"
+        model = self.qc_model_name_edit.text().strip() or str(plan.get("model_name") or "") or "mmd_model"
+        plan["author"] = author
+        plan["character_category"] = category
+        plan["model_name"] = model
+        plan["display_name"] = sanitize_display_name_text(
+            self.qc_model_display_edit.text().strip() or self.qc_display_from_internal(model, "Mmd Model")
+        )
+        plan["category_readable"] = (
+            sanitize_category_display_name_text(self.qc_category_display_edit.text().strip())
+            or self.known_category_display_for_internal(category)
+            or self.qc_display_from_internal(category, "Sheepy Lord")
+        )
+        plan["invert_jiggle_direction"] = bool(self.qc_invert_jiggle_check.isChecked()) if hasattr(self, "qc_invert_jiggle_check") else False
+        plan["copy_to_gmod_addons"] = (
+            bool(self.qc_copy_to_gmod_addons_check.isChecked()) if hasattr(self, "qc_copy_to_gmod_addons_check") else False
+        )
+        plan["include_mci_metadata_json"] = (
+            bool(self.qc_include_mci_metadata_check.isChecked()) if hasattr(self, "qc_include_mci_metadata_check") else True
+        )
+        qc_dir = Path(str(plan.get("qc_dir") or self.qc_output_edit.text().strip() or ""))
+        if qc_dir:
+            plan["addon_dir"] = str(qc_dir / model)
+        gmod_root, studiomdl = self.split_gmod_input_for_qc()
+        gmod = plan.setdefault("gmod", {})
+        if isinstance(gmod, dict):
+            if gmod_root:
+                gmod["install_root"] = gmod_root
+            if studiomdl:
+                gmod["studiomdl_path"] = studiomdl
+        return plan
+
+    def start_qc_compile(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        if not self.ensure_step_can_run(14):
+            return
+        input_raw = self.qc_input_row.value()
+        if not input_raw:
+            self.show_error("Compile failed", "Select a workspace or Step 9 export folder first.")
+            return
+        if not self.current_qc_plan:
+            self.show_error("Compile failed", "Run Analyze QC first.")
+            return
+        plan = self.update_qc_plan_from_gui()
+        errors = self.validate_qc_plan()
+        if errors:
+            self.show_error("QC validation", "Blocking errors:\n" + "\n".join(f"- {error}" for error in errors))
+            return
+        previous_output = str(self.settings_store.value("qc_gma_output_dir", "", str) or "")
+        if previous_output and Path(previous_output).exists():
+            start_dir = previous_output
+        else:
+            desktop = Path.home() / "Desktop"
+            start_dir = str(desktop if desktop.exists() else Path.home())
+        selected_output = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Select folder for the Step 14 .gma and composed addon folder",
+            start_dir,
+        )
+        if not selected_output:
+            return
+        self.settings_store.setValue("qc_gma_output_dir", selected_output)
+        if plan is not None:
+            plan["distribution_output_dir"] = selected_output
+            plan["copy_to_gmod_addons"] = (
+                bool(self.qc_copy_to_gmod_addons_check.isChecked()) if hasattr(self, "qc_copy_to_gmod_addons_check") else False
+            )
+            plan["include_mci_metadata_json"] = (
+                bool(self.qc_include_mci_metadata_check.isChecked()) if hasattr(self, "qc_include_mci_metadata_check") else True
+            )
+        self.set_step_working(14, "Preparing Step 14 QC compile")
+        self.qc_log.clear()
+        self.qc_files_table.setRowCount(0)
+        self.set_qc_progress(0, "Queued", "Preparing QC compile and addon composition", "#58a6ff")
+        self.qc_analyze_button.setEnabled(False)
+        self.qc_compile_button.setEnabled(False)
+        self.detect_qc_outputs_button.setEnabled(False)
+        self.detect_qc_gmod_button.setEnabled(False)
+        self.qc_cancel_button.setEnabled(True)
+        self.worker = QcCompileWorker(input_raw, plan or {})
+        self.worker.log.connect(self.append_qc_log)
+        self.worker.done.connect(self.qc_compile_done)
+        self.worker.failed.connect(self.qc_failed)
+        self.worker.start()
+
+    def qc_compile_done(self, result: dict) -> None:
+        self.qc_analyze_button.setEnabled(True)
+        self.qc_compile_button.setEnabled(True)
+        self.detect_qc_outputs_button.setEnabled(True)
+        self.detect_qc_gmod_button.setEnabled(True)
+        self.qc_cancel_button.setEnabled(False)
+        self.qc_output_dir = str(result.get("qc_dir", ""))
+        self.qc_output_edit.setText(self.qc_output_dir)
+        self.qc_analysis_label.setText(str(result.get("analysis", "")))
+        self.qc_plan_label.setText(str(result.get("plan", "")))
+        self.qc_report_label.setText(str(result.get("report", "")))
+        self.qc_files_label.setText(str(result.get("files", "")))
+        self.qc_log_label.setText(str(result.get("log", "")))
+        self.open_qc_folder_button.setEnabled(bool(self.qc_output_dir))
+        self.current_qc_files = result.get("files_data") if isinstance(result.get("files_data"), dict) else {}
+        self.populate_qc_files_table(self.current_qc_files.get("files", []) if self.current_qc_files else [])
+        report = result.get("report_data") if isinstance(result.get("report_data"), dict) else {}
+        validation = report.get("validation") if isinstance(report.get("validation"), dict) else {}
+        distribution_dir = str(report.get("distribution_output_dir") or "")
+        if validation.get("ok"):
+            self.set_qc_progress(100, "Step 14 Complete", str(report.get("addon_dir", "")), "#2ea043")
+            self.complete_step_from_result(
+                14,
+                result,
+                "qc_dir",
+                ["files", "report"],
+                report_key="report",
+                validation=validation,
+            )
+            detail = "QC compile, GMA packaging, and addon folder composition completed."
+            if distribution_dir:
+                detail += f"\n\nOutput folder:\n{distribution_dir}"
+            QtWidgets.QMessageBox.information(self, "Step 14 complete", detail)
+        else:
+            errors = validation.get("errors", []) if isinstance(validation.get("errors"), list) else []
+            self.set_qc_progress(100, "Step 14 Complete With Issues", f"{len(errors):,} validation issue(s)", "#d29922")
+            self.set_step_failed(14, "Step 14 QC compile completed with issues")
+            if errors:
+                preview = "\n".join(f"- {error}" for error in errors[:8])
+                if len(errors) > 8:
+                    preview += f"\n- ... {len(errors) - 8} more"
+                QtWidgets.QMessageBox.warning(self, "Step 14 completed with issues", preview)
+        if distribution_dir and Path(distribution_dir).exists():
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(distribution_dir))
+
+    def populate_qc_files_table(self, files: object) -> None:
+        rows = [entry for entry in files if isinstance(entry, dict)] if isinstance(files, list) else []
+        self.qc_files_table.setRowCount(len(rows))
+        for row_index, entry in enumerate(rows):
+            values = [
+                str(entry.get("name") or ""),
+                str(entry.get("type") or ""),
+                f"{int(entry.get('size', 0) or 0):,}",
+                str(entry.get("stage") or ""),
+                str(entry.get("path") or ""),
+                "; ".join(str(item) for item in entry.get("warnings", []) if item) if isinstance(entry.get("warnings"), list) else "",
+            ]
+            for column, value in enumerate(values):
+                item = QtWidgets.QTableWidgetItem(value)
+                item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                if value:
+                    item.setToolTip(value)
+                self.qc_files_table.setItem(row_index, column, item)
+        self.qc_files_table.resizeRowsToContents()
+
+    def set_qc_outputs_visible(self, visible: bool) -> None:
+        self.qc_output_group.setVisible(bool(visible))
+        self.qc_outputs_toggle.setText("Hide Outputs" if visible else "Show Outputs")
+
+    def set_qc_log_visible(self, visible: bool) -> None:
+        self.qc_log_group.setVisible(bool(visible))
+        self.qc_log_toggle.setText("Hide Log" if visible else "Show Log")
+
+    def release_fields_from_ui(self) -> dict[str, str]:
+        return {
+            "character_name": self.release_character_edit.text().strip(),
+            "work_title": self.release_work_edit.text().strip(),
+            "author": self.release_author_edit.text().strip(),
+            "model_creator": self.release_creator_edit.text().strip(),
+            "quote_text": self.release_quote_edit.toPlainText().strip(),
+            "quote_original_text": self.release_quote_original_edit.toPlainText().strip(),
+            "quote_language": self.release_quote_language_edit.text().strip(),
+            "quote_author": self.release_quote_author_edit.text().strip(),
+            "image_url": self.release_image_url_edit.text().strip(),
+            "rtx_link": self.release_rtx_link_edit.text().strip(),
+            "openai_model": self.release_openai_model_edit.currentText().strip(),
+        }
+
+    def append_release_log(self, message: str) -> None:
+        self.append_translated_log(self.release_log, message, self.update_release_progress_from_log)
+
+    def set_release_progress(self, value: int, title: str, detail: str, color: str = "#58a6ff") -> None:
+        value = max(0, min(100, int(value)))
+        self.release_progress_bar.setValue(value)
+        self.release_progress_label.setText(
+            f'<span style="color:{color};">{html.escape(title)}</span> - {value}%'
+            f'<br><span style="color:#8f98a3;">{html.escape(detail)}</span>'
+        )
+
+    def update_release_progress_from_log(self, message: str) -> None:
+        checks = [
+            ("Starting Step 15 release description analysis", 10, "Analyzing Release Inputs", "#58a6ff"),
+            ("Wrote Step 15 analysis", 30, "Plan Ready", "#2ea043"),
+            ("Requesting English description", 40, "Calling ChatGPT", "#d29922"),
+            ("Translating description", 58, "Calling DeepL", "#d29922"),
+            ("Wrote release description template", 92, "Writing Template", "#2ea043"),
+            ("Step 15 release description generation finished", 100, "Step 15 Complete", "#2ea043"),
+        ]
+        for needle, value, title, color in checks:
+            if needle in message:
+                self.set_release_progress(value, title, message, color)
+                return
+
+    def on_release_input_changed(self, value: str) -> None:
+        self.current_release_analysis = None
+        self.current_release_plan = None
+        self.current_release_files = None
+        self.release_files_table.setRowCount(0)
+        self.release_preview_edit.clear()
+        if value.strip():
+            self.update_release_output_preview(Path(value.strip()))
+        else:
+            self.release_output_edit.clear()
+            self.open_release_folder_button.setEnabled(False)
+        self.save_settings()
+
+    def update_release_output_preview(self, input_path: Path) -> None:
+        try:
+            release_dir, analysis_json, plan_json, report_json, files_json, translations_json, template_path, log_path = core.release_paths_for_step14_input(input_path)
+            self.release_output_dir = str(release_dir)
+            self.release_output_edit.setText(str(release_dir))
+            self.release_analysis_label.setText(str(analysis_json))
+            self.release_plan_label.setText(str(plan_json))
+            self.release_report_label.setText(str(report_json))
+            self.release_files_label.setText(str(files_json))
+            self.release_template_label.setText(str(template_path))
+            self.release_log_label.setText(str(log_path))
+            self.open_release_folder_button.setEnabled(release_dir.exists())
+            if plan_json.exists():
+                try:
+                    self.current_release_plan = json.loads(plan_json.read_text(encoding="utf-8"))
+                    self.populate_release_from_plan(self.current_release_plan)
+                except Exception:
+                    pass
+            if analysis_json.exists():
+                try:
+                    self.current_release_analysis = json.loads(analysis_json.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            if files_json.exists():
+                try:
+                    self.current_release_files = json.loads(files_json.read_text(encoding="utf-8"))
+                    self.populate_release_files_table(self.current_release_files.get("files", []))
+                except Exception:
+                    pass
+            if template_path.exists():
+                try:
+                    self.release_preview_edit.setPlainText(template_path.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+        except Exception:
+            self.release_output_edit.clear()
+
+    def detect_release_step14_output(self) -> None:
+        candidates: list[Path] = []
+
+        def add(raw: object) -> None:
+            text = str(raw or "").strip()
+            if text:
+                candidates.append(Path(text))
+
+        add(self.release_input_row.value())
+        add(self.qc_output_dir)
+        add(self.qc_input_row.value() if hasattr(self, "qc_input_row") else "")
+        workspace_text = self.workspace_edit.text().strip() if hasattr(self, "workspace_edit") else ""
+        add(workspace_text)
+        try:
+            candidates.extend(sorted(core.workspaces_root().glob("*/14_sort_qc_compile"), key=lambda item: item.stat().st_mtime, reverse=True))
+        except Exception:
+            pass
+        seen: set[Path] = set()
+        for candidate in candidates:
+            try:
+                candidate = candidate.resolve()
+            except Exception:
+                candidate = candidate.absolute()
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            step14 = candidate if candidate.name == "14_sort_qc_compile" else candidate / "14_sort_qc_compile"
+            if step14.exists() and (step14 / "qc_plan.json").exists():
+                self.release_input_row.set_value(str(step14.parent))
+                self.tabs.setCurrentWidget(self.release_tab)
+                self.start_release_analyze()
+                return
+        self.show_error("Detect Step 14 Output", "No Step 14 QC folder with qc_plan.json was found.")
+
+    def start_release_analyze(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        if not self.ensure_step_can_run(15):
+            return
+        input_raw = self.release_input_row.value()
+        if not input_raw:
+            self.show_error("Analyze release description failed", "Select a workspace or Step 14 folder first.")
+            return
+        input_path = Path(input_raw)
+        if not input_path.exists():
+            self.show_error("Analyze release description failed", f"Input path not found:\n{input_path}")
+            return
+        self.set_step_working(15, "Preparing Step 15 release analysis")
+        self.release_log.clear()
+        self.set_release_progress(0, "Queued", "Preparing release description analysis", "#58a6ff")
+        self.set_release_buttons_enabled(False)
+        self.release_cancel_button.setEnabled(True)
+        self.worker = ReleaseAnalyzeWorker(str(input_path), self.release_fields_from_ui())
+        self.worker.log.connect(self.append_release_log)
+        self.worker.done.connect(self.release_analyze_done)
+        self.worker.failed.connect(self.release_failed)
+        self.worker.start()
+
+    def release_analyze_done(self, result: dict) -> None:
+        self.set_release_buttons_enabled(True)
+        self.release_cancel_button.setEnabled(False)
+        self.release_output_dir = str(result.get("release_dir", ""))
+        self.release_output_edit.setText(self.release_output_dir)
+        self.release_analysis_label.setText(str(result.get("analysis", "")))
+        self.release_plan_label.setText(str(result.get("plan", "")))
+        self.release_report_label.setText(str(result.get("report", "")))
+        self.release_files_label.setText(str(result.get("files", "")))
+        self.release_template_label.setText(str(result.get("template", "")))
+        self.release_log_label.setText(str(result.get("log", "")))
+        self.open_release_folder_button.setEnabled(bool(self.release_output_dir))
+        self.current_release_analysis = result.get("analysis_data") if isinstance(result.get("analysis_data"), dict) else {}
+        self.current_release_plan = result.get("plan_data") if isinstance(result.get("plan_data"), dict) else {}
+        self.populate_release_from_plan(self.current_release_plan)
+        self.set_release_progress(100, "Analysis Complete", "Release description plan is ready.", "#2ea043")
+        self.clear_step_state(15, "Step 15 analysis complete")
+
+    def populate_release_from_plan(self, plan: dict[str, object]) -> None:
+        if not isinstance(plan, dict):
+            return
+        fields = {
+            self.release_character_edit: plan.get("character_name_readable", ""),
+            self.release_work_edit: plan.get("character_work_readable", ""),
+            self.release_author_edit: plan.get("author", ""),
+            self.release_creator_edit: plan.get("model_creator", ""),
+            self.release_openai_model_edit: plan.get("openai_model", ""),
+            self.release_image_url_edit: plan.get("image_url", ""),
+            self.release_rtx_link_edit: plan.get("rtx_link", ""),
+            self.release_quote_language_edit: plan.get("quote_language", ""),
+            self.release_quote_author_edit: plan.get("quote_author", ""),
+        }
+        for widget, value in fields.items():
+            if not value:
+                continue
+            if isinstance(widget, QtWidgets.QComboBox):
+                if not widget.currentText().strip():
+                    widget.setCurrentText(str(value))
+            elif not widget.text().strip():
+                widget.setText(str(value))
+        if plan.get("quote_text") and not self.release_quote_edit.toPlainText().strip():
+            self.release_quote_edit.setPlainText(str(plan.get("quote_text") or ""))
+        if plan.get("quote_original_text") and not self.release_quote_original_edit.toPlainText().strip():
+            self.release_quote_original_edit.setPlainText(str(plan.get("quote_original_text") or ""))
+        if plan.get("description_en") and not self.release_description_edit.toPlainText().strip():
+            self.release_description_edit.setPlainText(str(plan.get("description_en") or ""))
+        self.populate_release_translation_table(plan)
+        self.update_release_preview_from_plan()
+
+    def release_language_rows(self) -> list[tuple[str, str]]:
+        return [
+            ("zh_hans", "Chinese Simplified"),
+            ("zh_hant", "Chinese Traditional"),
+            ("ja", "Japanese"),
+            ("ko", "Korean"),
+            ("de", "German"),
+            ("es", "Spanish"),
+            ("fr", "French"),
+            ("pl", "Polish"),
+            ("pt", "Portuguese"),
+            ("ru", "Russian"),
+            ("tr", "Turkish"),
+        ]
+
+    def populate_release_translation_table(self, plan: dict[str, object]) -> None:
+        translations = plan.get("translations") if isinstance(plan.get("translations"), dict) else {}
+        self._updating_release_table = True
+        rows = self.release_language_rows()
+        self.release_translation_table.setRowCount(len(rows))
+        for row_index, (code, label) in enumerate(rows):
+            entry = translations.get(code, {}) if isinstance(translations, dict) else {}
+            entry = entry if isinstance(entry, dict) else {}
+            lang_item = QtWidgets.QTableWidgetItem(label)
+            lang_item.setData(QtCore.Qt.ItemDataRole.UserRole, code)
+            lang_item.setFlags(lang_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+            self.release_translation_table.setItem(row_index, 0, lang_item)
+            self.release_translation_table.setItem(row_index, 1, QtWidgets.QTableWidgetItem(str(entry.get("description") or "")))
+            status_item = QtWidgets.QTableWidgetItem(str(entry.get("status") or "manual"))
+            status_detail = str(entry.get("translation_error") or entry.get("quote_source") or entry.get("deepl_target_lang") or "").strip()
+            if status_detail:
+                status_item.setToolTip(status_detail)
+            status_item.setFlags(status_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+            self.release_translation_table.setItem(row_index, 2, status_item)
+        self._updating_release_table = False
+        self.release_translation_table.resizeRowsToContents()
+
+    def on_release_translation_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
+        if self._updating_release_table or item.column() != 1:
+            return
+        self.commit_release_plan_from_ui(update_preview=True)
+
+    def commit_release_plan_from_ui(self, update_preview: bool = False) -> dict[str, object]:
+        plan = self.current_release_plan or {}
+        plan.update(
+            {
+                "character_name_readable": self.release_character_edit.text().strip(),
+                "character_work_readable": self.release_work_edit.text().strip(),
+                "author": self.release_author_edit.text().strip() or "sheepylord",
+                "model_creator": self.release_creator_edit.text().strip(),
+                "quote_text": self.release_quote_edit.toPlainText().strip(),
+                "quote_original_text": self.release_quote_original_edit.toPlainText().strip(),
+                "quote_language": self.release_quote_language_edit.text().strip(),
+                "quote_author": self.release_quote_author_edit.text().strip(),
+                "image_url": self.release_image_url_edit.text().strip(),
+                "rtx_link": self.release_rtx_link_edit.text().strip(),
+                "openai_model": self.release_openai_model_edit.currentText().strip(),
+                "description_en": self.release_description_edit.toPlainText().strip(),
+            }
+        )
+        translations = plan.setdefault("translations", {})
+        if not isinstance(translations, dict):
+            translations = {}
+            plan["translations"] = translations
+        for row_index in range(self.release_translation_table.rowCount()):
+            lang_item = self.release_translation_table.item(row_index, 0)
+            if not lang_item:
+                continue
+            code = str(lang_item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+            if not code:
+                continue
+            entry = translations.setdefault(code, {})
+            if not isinstance(entry, dict):
+                entry = {}
+                translations[code] = entry
+            entry["description"] = self.release_translation_table.item(row_index, 1).text() if self.release_translation_table.item(row_index, 1) else ""
+            if not entry.get("status"):
+                entry["status"] = "manual"
+        self.current_release_plan = plan
+        if update_preview:
+            self.update_release_preview_from_plan()
+        return plan
+
+    def update_release_preview_from_plan(self) -> None:
+        plan = self.current_release_plan or {}
+        title = " - ".join(part for part in (str(plan.get("character_work_readable") or "").strip(), str(plan.get("character_name_readable") or "").strip()) if part)
+        description = str(plan.get("description_en") or "").strip()
+        quote = str(plan.get("quote_text") or "").strip()
+        quote_original = str(plan.get("quote_original_text") or "").strip()
+        preview = [
+            "//English",
+            f"{title or '[Title pending]'} (PM & NPCs)",
+            "",
+            description or "[Description pending.]",
+        ]
+        if quote:
+            preview.extend(["", f"[b]{quote}[/b]"])
+        if quote_original and quote_original != quote:
+            preview.append(f"[b]{quote_original}[/b]")
+        preview.extend(["", "[Translation preview will be refreshed after Write Template.]"])
+        self.release_preview_edit.setPlainText("\n".join(preview))
+
+    def start_release_generate(self, operation: str) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        if not self.ensure_step_can_run(15):
+            return
+        input_raw = self.release_input_row.value()
+        if not input_raw:
+            self.show_error("Step 15 failed", "Select a workspace or Step 14 folder first.")
+            return
+        if not self.current_release_plan:
+            self.start_release_analyze()
+            return
+        plan = self.commit_release_plan_from_ui(update_preview=False)
+        plan["operation"] = operation
+        if operation in {"write", "translate"} and not str(plan.get("description_en") or "").strip():
+            self.show_error("Step 15 validation", "Enter or generate the English description before writing/translating.")
+            return
+        if not str(plan.get("character_name_readable") or "").strip() or not str(plan.get("character_work_readable") or "").strip():
+            self.show_error("Step 15 validation", "Character name and source work are required.")
+            return
+        self.set_step_working(15, f"Preparing Step 15 operation: {operation}")
+        self.release_log.clear()
+        self.set_release_progress(0, "Queued", f"Preparing Step 15 operation: {operation}", "#58a6ff")
+        self.set_release_buttons_enabled(False)
+        self.release_cancel_button.setEnabled(True)
+        openai_key = self.release_openai_key_edit.text().strip() if operation in {"generate_english", "all"} else ""
+        deepl_key = self.release_deepl_key_edit.text().strip() if operation in {"translate", "all"} else ""
+        self.worker = ReleaseGenerateWorker(input_raw, plan, openai_key=openai_key, deepl_key=deepl_key)
+        self.worker.log.connect(self.append_release_log)
+        self.worker.done.connect(self.release_generate_done)
+        self.worker.failed.connect(self.release_failed)
+        self.worker.start()
+
+    def release_generate_done(self, result: dict) -> None:
+        self.set_release_buttons_enabled(True)
+        self.release_cancel_button.setEnabled(False)
+        self.release_output_dir = str(result.get("release_dir", ""))
+        self.release_output_edit.setText(self.release_output_dir)
+        self.release_analysis_label.setText(str(result.get("analysis", "")))
+        self.release_plan_label.setText(str(result.get("plan", "")))
+        self.release_report_label.setText(str(result.get("report", "")))
+        self.release_files_label.setText(str(result.get("files", "")))
+        self.release_template_label.setText(str(result.get("template", "")))
+        self.release_log_label.setText(str(result.get("log", "")))
+        self.open_release_folder_button.setEnabled(bool(self.release_output_dir))
+        self.current_release_plan = result.get("plan_data") if isinstance(result.get("plan_data"), dict) else self.current_release_plan
+        self.current_release_files = result.get("files_data") if isinstance(result.get("files_data"), dict) else {}
+        if self.current_release_plan:
+            self.release_description_edit.blockSignals(True)
+            self.release_description_edit.setPlainText(str(self.current_release_plan.get("description_en") or ""))
+            self.release_description_edit.blockSignals(False)
+            self.release_quote_edit.blockSignals(True)
+            self.release_quote_edit.setPlainText(str(self.current_release_plan.get("quote_text") or ""))
+            self.release_quote_edit.blockSignals(False)
+            self.release_quote_original_edit.blockSignals(True)
+            self.release_quote_original_edit.setPlainText(str(self.current_release_plan.get("quote_original_text") or ""))
+            self.release_quote_original_edit.blockSignals(False)
+            self.release_quote_author_edit.blockSignals(True)
+            self.release_quote_author_edit.setText(str(self.current_release_plan.get("quote_author") or ""))
+            self.release_quote_author_edit.blockSignals(False)
+            self.populate_release_translation_table(self.current_release_plan)
+        self.populate_release_files_table(self.current_release_files.get("files", []) if self.current_release_files else [])
+        template_path = Path(str(result.get("template", "")))
+        if template_path.exists():
+            try:
+                self.release_preview_edit.setPlainText(template_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        report = result.get("report_data") if isinstance(result.get("report_data"), dict) else {}
+        errors = report.get("validation_errors", []) if isinstance(report.get("validation_errors"), list) else []
+        if errors:
+            self.set_release_progress(100, "Step 15 Complete With Issues", f"{len(errors):,} validation issue(s)", "#d29922")
+            self.set_step_failed(15, "Step 15 release description completed with issues")
+        else:
+            self.set_release_progress(100, "Step 15 Complete", str(template_path), "#2ea043")
+            if template_path.exists():
+                self.complete_step_from_result(
+                    15,
+                    result,
+                    "release_dir",
+                    ["template", "files"],
+                    report_key="report",
+                    validation={"ok": True},
+                )
+            else:
+                self.clear_step_state(15, "Step 15 operation complete")
+
+    def release_failed(self, message: str) -> None:
+        self.set_release_buttons_enabled(True)
+        self.release_cancel_button.setEnabled(False)
+        self.set_release_progress(self.release_progress_bar.value(), "Step 15 Failed", "See the log for details.", "#f85149")
+        self.set_step_failed(15, "Step 15 release description failed")
+        self.show_error("Step 15 failed", message)
+
+    def set_release_buttons_enabled(self, enabled: bool) -> None:
+        for button in (
+            self.detect_release_step14_button,
+            self.release_chatgpt_button,
+            self.release_translate_button,
+            self.release_template_button,
+            self.open_release_folder_button,
+        ):
+            button.setEnabled(enabled)
+
+    def cancel_release(self) -> None:
+        if self.worker and hasattr(self.worker, "cancel"):
+            self.worker.cancel()  # type: ignore[attr-defined]
+            self.append_release_log("Cancellation requested.")
+
+    def populate_release_files_table(self, files: object) -> None:
+        rows = [entry for entry in files if isinstance(entry, dict)] if isinstance(files, list) else []
+        self.release_files_table.setRowCount(len(rows))
+        for row_index, entry in enumerate(rows):
+            values = [
+                str(entry.get("name") or ""),
+                str(entry.get("type") or ""),
+                f"{int(entry.get('size', 0) or 0):,}",
+                str(entry.get("stage") or ""),
+                str(entry.get("path") or ""),
+                "; ".join(str(item) for item in entry.get("warnings", []) if item) if isinstance(entry.get("warnings"), list) else "",
+            ]
+            for column, value in enumerate(values):
+                item = QtWidgets.QTableWidgetItem(value)
+                item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                if value:
+                    item.setToolTip(value)
+                self.release_files_table.setItem(row_index, column, item)
+        self.release_files_table.resizeRowsToContents()
+
+    def set_collision_outputs_visible(self, visible: bool) -> None:
+        self.collision_output_group.setVisible(bool(visible))
+        self.collision_outputs_toggle.setText("Hide Outputs" if visible else "Show Outputs")
+
+    def set_collision_log_visible(self, visible: bool) -> None:
+        self.collision_log_group.setVisible(bool(visible))
+        self.collision_log_toggle.setText("Hide Log" if visible else "Show Log")
+
+    def open_workspace(self) -> None:
+        raw = self.workspace_edit.text().strip()
+        if not raw:
+            return
+        path = Path(raw)
+        if not path.exists():
+            path.mkdir(parents=True, exist_ok=True)
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
+
+    def open_fix_folder(self) -> None:
+        raw = self.fix_output_edit.text().strip()
+        if not raw:
+            return
+        path = Path(raw)
+        if not path.exists():
+            path.mkdir(parents=True, exist_ok=True)
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
+
+    def open_spine_folder(self) -> None:
+        raw = self.spine_output_edit.text().strip()
+        if not raw:
+            return
+        path = Path(raw)
+        if not path.exists():
+            path.mkdir(parents=True, exist_ok=True)
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
+
+    def open_sort_folder(self) -> None:
+        raw = self.sort_output_edit.text().strip()
+        if not raw:
+            return
+        path = Path(raw)
+        if not path.exists():
+            path.mkdir(parents=True, exist_ok=True)
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
+
+    def open_material_folder(self) -> None:
+        raw = self.material_output_edit.text().strip()
+        if not raw:
+            return
+        path = Path(raw)
+        if not path.exists():
+            path.mkdir(parents=True, exist_ok=True)
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
+
+    def open_bodygroup_folder(self) -> None:
+        raw = self.bodygroup_output_edit.text().strip()
+        if not raw:
+            return
+        path = Path(raw)
+        if not path.exists():
+            path.mkdir(parents=True, exist_ok=True)
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
+
+    def open_flex_folder(self) -> None:
+        raw = self.flex_output_edit.text().strip()
+        if not raw:
+            return
+        path = Path(raw)
+        if not path.exists():
+            path.mkdir(parents=True, exist_ok=True)
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
+
+    def open_collision_folder(self) -> None:
+        raw = self.collision_output_edit.text().strip()
+        if not raw:
+            return
+        path = Path(raw)
+        if not path.exists():
+            path.mkdir(parents=True, exist_ok=True)
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
+
+    def open_proportion_folder(self) -> None:
+        raw = self.proportion_output_edit.text().strip()
+        if not raw:
+            return
+        path = Path(raw)
+        if not path.exists():
+            path.mkdir(parents=True, exist_ok=True)
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
+
+    def open_carms_folder(self) -> None:
+        raw = self.carms_output_edit.text().strip()
+        if not raw:
+            return
+        path = Path(raw)
+        if not path.exists():
+            path.mkdir(parents=True, exist_ok=True)
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
+
+    def open_vrd_folder(self) -> None:
+        raw = self.vrd_output_edit.text().strip()
+        if not raw:
+            return
+        path = Path(raw)
+        if not path.exists():
+            path.mkdir(parents=True, exist_ok=True)
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
+
+    def open_texture_folder(self) -> None:
+        raw = self.texture_output_edit.text().strip()
+        if not raw:
+            return
+        path = Path(raw)
+        if not path.exists():
+            path.mkdir(parents=True, exist_ok=True)
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
+
+    def open_icon_folder(self) -> None:
+        raw = self.icon_output_edit.text().strip()
+        if not raw:
+            return
+        path = Path(raw)
+        if not path.exists():
+            path.mkdir(parents=True, exist_ok=True)
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
+
+    def open_qc_folder(self) -> None:
+        raw = self.qc_output_edit.text().strip()
+        if not raw:
+            return
+        path = Path(raw)
+        if not path.exists():
+            path.mkdir(parents=True, exist_ok=True)
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
+
+    def open_release_folder(self) -> None:
+        raw = self.release_output_edit.text().strip()
+        if not raw:
+            return
+        path = Path(raw)
+        if not path.exists():
+            path.mkdir(parents=True, exist_ok=True)
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
+
+    def show_error(self, title: str, message: str) -> None:
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.resize(820, 540)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        text = QtWidgets.QPlainTextEdit()
+        text.setReadOnly(True)
+        text.setPlainText(message)
+        close_button = QtWidgets.QPushButton("Close")
+        close_button.clicked.connect(dialog.accept)
+        layout.addWidget(text, 1)
+        layout.addWidget(close_button, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+        dialog.exec()
+        if not (self.worker and self.worker.isRunning()):
+            for step, state in list(self.workflow_states.items()):
+                if state == "working":
+                    self.workflow_states.pop(step, None)
+        self.refresh_workflow_statuses()
+
+
+def _system_exit_code_to_int(code: object) -> int:
+    if code is None:
+        return 0
+    if isinstance(code, int):
+        return code
+    return 1
+
+
+def dispatch_bundled_processor_from_argv() -> int | None:
+    """Let the frozen GUI executable run bundled helper scripts as subprocesses.
+
+    Several core steps intentionally launch pure-Python processors with
+    ``sys.executable``. In source runs that is python.exe; in PyInstaller builds
+    it is this GUI executable, so dispatch the script path before QApplication
+    starts.
+    """
+
+    if len(sys.argv) < 2:
+        return None
+    script = Path(sys.argv[1])
+    if script.suffix.lower() != ".py":
+        return None
+    bundled_script = ROOT_DIR / "tools" / script.name
+    if getattr(sys, "frozen", False) and bundled_script.exists():
+        script = bundled_script
+    elif not script.exists():
+        if bundled_script.exists():
+            script = bundled_script
+        else:
+            return None
+    sys.argv = [str(script)] + sys.argv[2:]
+    try:
+        runpy.run_path(str(script), run_name="__main__")
+    except SystemExit as exc:
+        return _system_exit_code_to_int(exc.code)
+    return 0
+
+
+def main() -> int:
+    dispatched_exit_code = dispatch_bundled_processor_from_argv()
+    if dispatched_exit_code is not None:
+        return dispatched_exit_code
+    crash_log_path = enable_crash_logging()
+    app = QtWidgets.QApplication(sys.argv)
+    app.setApplicationName("MMD Character Importer")
+    icon_path = importer_icon_path()
+    if icon_path:
+        app.setWindowIcon(QtGui.QIcon(str(icon_path)))
+    if crash_log_path:
+        app.setProperty("mci_crash_log_path", str(crash_log_path))
+    window = ImporterWindow()
+    window.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
