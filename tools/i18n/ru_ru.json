@@ -365,7 +365,7 @@
       "summary": "Этот шаг делает импортированную модель однопользовательской, при необходимости очищает пользовательские разделенные нормали, дважды запускает CATS Fix Model, переводит имена и преобразует арматуру в имена костей ValveBiped.",
       "title": "Исправить модель",
       "option.clear_custom_normals": "Clear custom split normals",
-      "option.clear_custom_normals_tip": "Default on. Disable to preserve imported mesh custom split normals during Step 2.",
+      "option.clear_custom_normals_tip": "По умолчанию выключено. Включите, чтобы очистить импортированные пользовательские разделенные нормали сетки на шаге 2.",
       "log.skip_clear_normals_before": "Skipping custom split normal cleanup before model fix.",
       "log.skip_clear_normals_after": "Skipping custom split normal cleanup after model fix."
     },
@@ -4039,7 +4039,7 @@
     "workspace": "Рабочая область",
     "clear_custom_normals": "Clear custom split normals in Step 2",
     "clear_custom_normals_label": "Custom normals",
-    "clear_custom_normals_tip": "Default on. Disable to preserve imported custom split normals during the Step 2 model fix.",
+    "clear_custom_normals_tip": "По умолчанию выключено. Включите, чтобы очистить импортированные пользовательские разделенные нормали во время исправления модели на шаге 2.",
     "clear_workspace_cache": "Очистить весь кэш и промежуточные файлы",
     "clear_workspace_cache_tip": "Удаляет все созданные папки и отдельные файлы внутри папки workspaces MMD Character Importer.",
     "workspace_cache_size": "Кэш рабочей области: {size} ({count} папок)",

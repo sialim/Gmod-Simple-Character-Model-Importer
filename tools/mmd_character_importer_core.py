@@ -1947,7 +1947,7 @@ def import_pmx_to_blender(
 def fix_imported_blend(
     input_blend: Path,
     output_blend: Path | None = None,
-    clear_custom_normals: bool = True,
+    clear_custom_normals: bool = False,
     progress: ProgressCallback | None = None,
     cancel_check: CancelCheck | None = None,
 ) -> FixResult:
@@ -4085,10 +4085,10 @@ def main(argv: list[str] | None = None) -> int:
     import_parser.add_argument("pmx", type=Path)
     import_parser.add_argument("--source-dir", type=Path, required=True)
 
-    fix_parser = subparsers.add_parser("fix", help="make single-user, clear custom normals, fix CATS armature, and convert to Valve bones")
+    fix_parser = subparsers.add_parser("fix", help="make single-user, optionally clear custom normals, fix CATS armature, and convert to Valve bones")
     fix_parser.add_argument("input_blend", type=Path)
     fix_parser.add_argument("--output-blend", type=Path)
-    fix_parser.add_argument("--clear-custom-normals", dest="clear_custom_normals", action="store_true", default=True)
+    fix_parser.add_argument("--clear-custom-normals", dest="clear_custom_normals", action="store_true", default=False)
     fix_parser.add_argument("--keep-custom-normals", dest="clear_custom_normals", action="store_false")
 
     spine_analyze_parser = subparsers.add_parser("spine-analyze", help="analyze and propose Source spine bone repair")

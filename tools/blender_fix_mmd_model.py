@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-blend", type=Path, required=True)
     parser.add_argument("--output-blend", type=Path, required=True)
     parser.add_argument("--report-json", type=Path, required=True)
-    parser.add_argument("--clear-custom-normals", dest="clear_custom_normals", action="store_true", default=True)
+    parser.add_argument("--clear-custom-normals", dest="clear_custom_normals", action="store_true", default=False)
     parser.add_argument("--keep-custom-normals", dest="clear_custom_normals", action="store_false")
     return parser.parse_args(argv)
 

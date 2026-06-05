@@ -365,7 +365,7 @@
       "summary": "このステップでは、インポートしたモデルをシングルユーザー化し、必要に応じてカスタム分割法線を消去し、CATS Fix Modelを2回実行し、名前を翻訳して、アーマチュアをValveBipedボーン名に変換します。",
       "title": "モデルを修正する",
       "option.clear_custom_normals": "Clear custom split normals",
-      "option.clear_custom_normals_tip": "Default on. Disable to preserve imported mesh custom split normals during Step 2.",
+      "option.clear_custom_normals_tip": "既定ではオフです。有効にすると、ステップ 2 でインポートされたメッシュのカスタム分割法線をクリアします。",
       "log.skip_clear_normals_before": "Skipping custom split normal cleanup before model fix.",
       "log.skip_clear_normals_after": "Skipping custom split normal cleanup after model fix."
     },
@@ -4039,7 +4039,7 @@
     "workspace": "ワークスペース",
     "clear_custom_normals": "Clear custom split normals in Step 2",
     "clear_custom_normals_label": "Custom normals",
-    "clear_custom_normals_tip": "Default on. Disable to preserve imported custom split normals during the Step 2 model fix.",
+    "clear_custom_normals_tip": "既定ではオフです。有効にすると、ステップ 2 のモデル修正中にインポートされたカスタム分割法線をクリアします。",
     "clear_workspace_cache": "すべてのキャッシュと中間ファイルを削除",
     "clear_workspace_cache_tip": "MMD Character Importer の workspaces フォルダー内にある生成済みフォルダーと単独ファイルをすべて削除します。",
     "workspace_cache_size": "ワークスペースキャッシュ: {size} ({count} フォルダー)",

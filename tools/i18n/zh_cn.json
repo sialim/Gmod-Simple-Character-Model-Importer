@@ -403,7 +403,7 @@
       "summary": "此步骤会将导入模型设为单用户数据，可选地清除自定义拆分法线，运行两次 CATS Fix Model，翻译名称，并将骨架转换为 ValveBiped 骨骼名称。",
       "title": "修复模型",
       "option.clear_custom_normals": "清除自定义拆分法线",
-      "option.clear_custom_normals_tip": "默认开启。关闭后会在步骤 2 期间保留导入网格的自定义拆分法线。",
+      "option.clear_custom_normals_tip": "默认关闭。开启后会在步骤 2 期间清除导入网格的自定义拆分法线。",
       "log.skip_clear_normals_before": "跳过模型修复前的自定义拆分法线清理。",
       "log.skip_clear_normals_after": "跳过模型修复后的自定义拆分法线清理。"
     },
@@ -4170,7 +4170,7 @@
     "workspace": "工作区",
     "clear_custom_normals": "在步骤 2 清除自定义拆分法线",
     "clear_custom_normals_label": "自定义法线",
-    "clear_custom_normals_tip": "默认开启。关闭后会在步骤 2 模型修复期间保留导入的自定义拆分法线。",
+    "clear_custom_normals_tip": "默认关闭。开启后会在步骤 2 模型修复期间清除导入的自定义拆分法线。",
     "clear_workspace_cache": "清理全部缓存和中间文件",
     "clear_workspace_cache_tip": "删除 MMD Character Importer 工作区文件夹内所有生成的文件夹和零散文件。",
     "workspace_cache_size": "工作区缓存：{size}（{count} 个文件夹）",

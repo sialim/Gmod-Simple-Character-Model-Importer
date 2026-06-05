@@ -365,7 +365,7 @@
       "summary": "Este paso convierte el modelo importado en datos de usuario único, borra opcionalmente las normales divididas personalizadas, ejecuta CATS Fix Model dos veces, traduce nombres y convierte la armadura a nombres de huesos ValveBiped.",
       "title": "Arreglar modelo",
       "option.clear_custom_normals": "Clear custom split normals",
-      "option.clear_custom_normals_tip": "Default on. Disable to preserve imported mesh custom split normals during Step 2.",
+      "option.clear_custom_normals_tip": "Desactivado de forma predeterminada. Actívalo para borrar las normales personalizadas importadas de la malla durante el paso 2.",
       "log.skip_clear_normals_before": "Skipping custom split normal cleanup before model fix.",
       "log.skip_clear_normals_after": "Skipping custom split normal cleanup after model fix."
     },
@@ -4039,7 +4039,7 @@
     "workspace": "Espacio de trabajo",
     "clear_custom_normals": "Clear custom split normals in Step 2",
     "clear_custom_normals_label": "Custom normals",
-    "clear_custom_normals_tip": "Default on. Disable to preserve imported custom split normals during the Step 2 model fix.",
+    "clear_custom_normals_tip": "Desactivado de forma predeterminada. Actívalo para borrar las normales personalizadas importadas durante la corrección del modelo en el paso 2.",
     "clear_workspace_cache": "Borrar toda la caché y los archivos intermedios",
     "clear_workspace_cache_tip": "Elimina todas las carpetas generadas y los archivos sueltos dentro de la carpeta workspaces de MMD Character Importer.",
     "workspace_cache_size": "Caché del espacio de trabajo: {size} ({count} carpetas)",

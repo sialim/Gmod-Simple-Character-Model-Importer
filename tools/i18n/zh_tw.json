@@ -403,7 +403,7 @@
       "summary": "此步驟會將匯入模型設為單一使用者資料，可選地清除自訂拆分法線，執行兩次 CATS Fix Model，翻譯名稱，並將骨架轉換為 ValveBiped 骨骼名稱。",
       "title": "修復模型",
       "option.clear_custom_normals": "Clear custom split normals",
-      "option.clear_custom_normals_tip": "Default on. Disable to preserve imported mesh custom split normals during Step 2.",
+      "option.clear_custom_normals_tip": "預設關閉。開啟後會在步驟 2 期間清除匯入網格的自訂拆分法線。",
       "log.skip_clear_normals_before": "Skipping custom split normal cleanup before model fix.",
       "log.skip_clear_normals_after": "Skipping custom split normal cleanup after model fix."
     },
@@ -4170,7 +4170,7 @@
     "workspace": "工作區",
     "clear_custom_normals": "Clear custom split normals in Step 2",
     "clear_custom_normals_label": "Custom normals",
-    "clear_custom_normals_tip": "Default on. Disable to preserve imported custom split normals during the Step 2 model fix.",
+    "clear_custom_normals_tip": "預設關閉。開啟後會在步驟 2 模型修復期間清除匯入的自訂拆分法線。",
     "clear_workspace_cache": "清理全部快取和中間檔案",
     "clear_workspace_cache_tip": "刪除 MMD Character Importer 工作區資料夾內所有產生的資料夾和零散檔案。",
     "workspace_cache_size": "工作區快取：{size}（{count} 個資料夾）",

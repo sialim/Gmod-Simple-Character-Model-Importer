@@ -457,7 +457,7 @@ class FixWorker(QtCore.QThread):
     done = QtCore.Signal(dict)
     failed = QtCore.Signal(str)
 
-    def __init__(self, input_blend: str, clear_custom_normals: bool = True) -> None:
+    def __init__(self, input_blend: str, clear_custom_normals: bool = False) -> None:
         super().__init__()
         self.input_blend = input_blend
         self.clear_custom_normals = bool(clear_custom_normals)
@@ -1945,7 +1945,7 @@ class FullImportWorker(QtCore.QThread):
         model_display_name: str,
         distribution_output_dir: str,
         bodygroup_vertex_limit: int = int(getattr(core, "DEFAULT_BODYGROUP_VERTEX_LIMIT", 65535)),
-        clear_custom_normals: bool = True,
+        clear_custom_normals: bool = False,
     ) -> None:
         super().__init__()
         self.pmx_path = Path(pmx_path)
@@ -3234,7 +3234,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 widget.setText(text)
         if hasattr(self, "main_clear_custom_normals_check"):
             self.main_clear_custom_normals_check.setToolTip(
-                self._t("main.clear_custom_normals_tip", "Default on. Disable to preserve imported custom split normals during the Step 2 model fix.")
+                self._t("main.clear_custom_normals_tip", "Default off. Enable to clear imported custom split normals during the Step 2 model fix.")
             )
         if hasattr(self, "main_clear_workspace_cache_button"):
             self.main_clear_workspace_cache_button.setToolTip(
@@ -4143,8 +4143,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.main_rtx_bodygroup_limit_check = QtWidgets.QCheckBox("Enforce 32,767 vertex bodygroup limit (RTX Remix)")
         self.main_rtx_bodygroup_limit_check.setToolTip("Default GMod builds allow 65,535 vertices per bodygroup. Enable this for RTX Remix builds that require 32,767.")
         self.main_clear_custom_normals_check = QtWidgets.QCheckBox("Clear custom split normals in Step 2")
-        self.main_clear_custom_normals_check.setChecked(True)
-        self.main_clear_custom_normals_check.setToolTip("Default on. Disable to preserve imported custom split normals during the Step 2 model fix.")
+        self.main_clear_custom_normals_check.setChecked(False)
+        self.main_clear_custom_normals_check.setToolTip("Default off. Enable to clear imported custom split normals during the Step 2 model fix.")
         self.main_form_labels = {
             "workspace": QtWidgets.QLabel("Workspace"),
             "category_internal": QtWidgets.QLabel("Category internal name"),
@@ -4562,8 +4562,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.fix_summary_label.setObjectName("fieldHint")
         fix_summary_layout.addWidget(self.fix_summary_label)
         self.fix_clear_custom_normals_check = QtWidgets.QCheckBox("Clear custom split normals")
-        self.fix_clear_custom_normals_check.setChecked(True)
-        self.fix_clear_custom_normals_check.setToolTip("Default on. Disable to preserve imported mesh custom split normals during Step 2.")
+        self.fix_clear_custom_normals_check.setChecked(False)
+        self.fix_clear_custom_normals_check.setToolTip("Default off. Enable to clear imported mesh custom split normals during Step 2.")
         fix_summary_layout.addWidget(self.fix_clear_custom_normals_check)
         layout.addWidget(self.fix_summary_group)
 
@@ -7774,7 +7774,10 @@ class ImporterWindow(QtWidgets.QMainWindow):
             if isinstance(widget, QtWidgets.QCheckBox):
                 widget.setChecked(rtx_limit)
         self.update_bodygroup_limit_hint()
-        raw_clear_normals = self.settings_store.value("fix_clear_custom_normals", True)
+        if not bool(self.settings_store.value("fix_clear_custom_normals_default_off_migrated", False, bool)):
+            self.settings_store.setValue("fix_clear_custom_normals", False)
+            self.settings_store.setValue("fix_clear_custom_normals_default_off_migrated", True)
+        raw_clear_normals = self.settings_store.value("fix_clear_custom_normals", False)
         if isinstance(raw_clear_normals, str):
             clear_normals = raw_clear_normals.strip().lower() not in {"0", "false", "no", "off"}
         else:
@@ -8359,7 +8362,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         widget = getattr(self, "main_clear_custom_normals_check", None)
         if isinstance(widget, QtWidgets.QCheckBox):
             return bool(widget.isChecked())
-        return True
+        return False
 
     def on_clear_custom_normals_changed(self, checked: bool) -> None:
         for attr in ("main_clear_custom_normals_check", "fix_clear_custom_normals_check"):

@@ -393,7 +393,7 @@
     "workspace": "Workspace",
     "clear_custom_normals": "Clear custom split normals in Step 2",
     "clear_custom_normals_label": "Custom normals",
-    "clear_custom_normals_tip": "Default on. Disable to preserve imported custom split normals during the Step 2 model fix.",
+    "clear_custom_normals_tip": "Default off. Enable to clear imported custom split normals during the Step 2 model fix.",
     "clear_workspace_cache": "Clear All Cache and Intermediate Files",
     "clear_workspace_cache_tip": "Delete all generated folders and loose files inside the MMD Character Importer workspaces folder.",
     "workspace_cache_size": "Workspace cache: {size} ({count} folders)",
@@ -455,7 +455,7 @@
       "summary": "This step makes the imported model single-user, optionally clears custom split normals, runs CATS Fix Model twice, translates names, and converts the armature to ValveBiped bone names.",
       "title": "Fix Model",
       "option.clear_custom_normals": "Clear custom split normals",
-      "option.clear_custom_normals_tip": "Default on. Disable to preserve imported mesh custom split normals during Step 2.",
+      "option.clear_custom_normals_tip": "Default off. Enable to clear imported mesh custom split normals during Step 2.",
       "log.skip_clear_normals_before": "Skipping custom split normal cleanup before model fix.",
       "log.skip_clear_normals_after": "Skipping custom split normal cleanup after model fix."
     },

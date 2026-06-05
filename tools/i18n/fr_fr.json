@@ -365,7 +365,7 @@
       "summary": "Cette étape rend le modèle importé mono-utilisateur, efface éventuellement les normales fractionnées personnalisées, exécute CATS Fix Model deux fois, traduit les noms et convertit l’armature en noms d’os ValveBiped.",
       "title": "Corriger le modèle",
       "option.clear_custom_normals": "Clear custom split normals",
-      "option.clear_custom_normals_tip": "Default on. Disable to preserve imported mesh custom split normals during Step 2.",
+      "option.clear_custom_normals_tip": "Désactivé par défaut. Activez cette option pour effacer les normales personnalisées importées du maillage pendant l’étape 2.",
       "log.skip_clear_normals_before": "Skipping custom split normal cleanup before model fix.",
       "log.skip_clear_normals_after": "Skipping custom split normal cleanup after model fix."
     },
@@ -4039,7 +4039,7 @@
     "workspace": "Espace de travail",
     "clear_custom_normals": "Clear custom split normals in Step 2",
     "clear_custom_normals_label": "Custom normals",
-    "clear_custom_normals_tip": "Default on. Disable to preserve imported custom split normals during the Step 2 model fix.",
+    "clear_custom_normals_tip": "Désactivé par défaut. Activez cette option pour effacer les normales personnalisées importées pendant la correction du modèle à l’étape 2.",
     "clear_workspace_cache": "Vider tout le cache et les fichiers intermédiaires",
     "clear_workspace_cache_tip": "Supprime tous les dossiers générés et les fichiers isolés dans le dossier workspaces de MMD Character Importer.",
     "workspace_cache_size": "Cache de l’espace de travail : {size} ({count} dossiers)",
