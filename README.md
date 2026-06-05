@@ -1,5 +1,6 @@
-# MMD Character Importer Build Repo
+<img width="3840" height="2160" alt="PS1c" src="https://github.com/user-attachments/assets/a7eb4ccd-4369-429c-b620-2450fd1cb335" />
 
+# MMD Character Importer Build Repo
 This repository is the GitHub-uploadable source/build package for MMD Character
 Importer. It contains the source files, small vendored tools/plugins, required
 reference subsets, and scripts needed to run from source or build the Windows
