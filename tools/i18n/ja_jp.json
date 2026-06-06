@@ -324,7 +324,13 @@
     "already_the_active_studiomdl_compile_source_fold_08a2fe6d": "すでにアクティブなStudioMDLコンパイル元フォルダーです。",
     "failed_to_copy_qc_compile_source_folder_e1442b7d": "QCコンパイル元フォルダーをコピーできませんでした: ",
     "the_selected_distribution_folder_cannot_be_insid_4a263ee7": "選択した配布フォルダーをQCコンパイル元フォルダー内に置くことはできません。",
-    "already_copied_in_this_folder_e6d00cc1": "このフォルダーにはすでにコピーされています。"
+    "already_copied_in_this_folder_e6d00cc1": "このフォルダーにはすでにコピーされています。",
+    "runtime_diagnostics.environment_issue": "これは通常、モデルのインポートエラーではなく Windows/ランタイム環境の問題です。",
+    "runtime_diagnostics.suggested_fixes": "推奨される対処:",
+    "runtime_diagnostics.vc_redist": "1. Microsoft Visual C++ Redistributable 2015-2022 x64 をインストールまたは再インストールしてください。",
+    "runtime_diagnostics.antivirus": "2. セキュリティソフトで MMD Character Importer と Blender をホワイトリストに追加してください。",
+    "runtime_diagnostics.gpu_driver": "3. GPU ドライバーをメーカー公式サイトから更新してください。",
+    "runtime_diagnostics.resources": "4. システムに少なくとも 1 GiB の空き容量と 2.5 GiB の空きメモリがあることを確認してください。"
   },
   "preview": {
     "collision_overlay": "Physics overlay: {part_count} parts",
@@ -4008,7 +4014,8 @@
     "size": "サイズ",
     "stage": "ステージ",
     "type": "種類",
-    "validate": "検証する"
+    "validate": "検証する",
+    "close": "閉じる"
   },
   "main": {
     "auto_prefix": "自動",
@@ -4211,5 +4218,39 @@
     "term_094_fix_complete": "修正完了",
     "term_095_sort_complete": "ソート完了",
     "term_096_scan_complete": "スキャン完了"
+  },
+  "preflight": {
+    "title": "プリフライト警告",
+    "title_nsfw": "NSFW の可能性があるモデル内容",
+    "generic_import": "この PMX には警告があります。インポートを続行しますか？",
+    "generic_full_import": "この PMX には警告があります。フルインポートを続行しますか？",
+    "nsfw_description": "指定されたモデルに NSFW 要素が検出されました。この種類のモデルのインポートは推奨されず、自動移植機能も最適化されていないため、予期しない結果になる可能性があります。",
+    "nsfw_detected": "{morph_count} 個のシェイプキー/モーフ名で {match_count} 件のキーワード一致が検出されました。",
+    "nsfw_continue_full": "続行する場合は、ワンクリック自動移植ではなく手動のステップ別ワークフローを推奨します。",
+    "nsfw_continue_manual": "続行する場合は、後続の各ステップを慎重に確認し、必要に応じて手動修正を優先してください。",
+    "matched_keyword_hints": "一致したキーワード候補: {keywords}",
+    "matched_keyword_hints_more": "一致したキーワード候補: {keywords}、ほか {more_count} 件",
+    "other_warnings": "その他のプリフライト警告:",
+    "proceed_anyway": "それでも続行",
+    "import_cancelled_before_blender": "Blender 起動前にインポートをキャンセルしました。",
+    "warning_label": "警告:",
+    "no_warnings": "プリフライト警告はありません。",
+    "warning_missing_skeleton_groups": "想定される MMD 人型スケルトングループがありません: {groups}",
+    "warning_no_native_textures": "選択したモデルフォルダーに元のテクスチャファイルが見つかりません。",
+    "warning_unresolved_texture_refs": "{count} 個の PMX テクスチャ参照を解決できませんでした: {refs}",
+    "warning_unresolved_texture_refs_more": "{count} 個の PMX テクスチャ参照を解決できませんでした: {refs}、ほか {more_count} 件",
+    "warning_high_vertex_count": "頂点数が多いです: {count} 頂点。Source/GMod の処理が遅くなる可能性があります。",
+    "warning_high_morph_count": "モーフ/シェイプキー数が多いです: {count}。後続の Flex 処理が遅くなる可能性があります。",
+    "warning_nsfw_summary": "NSFW の可能性があるシェイプキー名を検出しました: {morph_count} 個のモーフで {match_count} 件のキーワード一致。自動移植はこの種類のモデルに最適化されていません。",
+    "warning_high_texture_count": "PMX の元テクスチャ数が多いです: {count}。材質処理が遅くなる可能性があります。"
+  },
+  "runtime_diagnostics": {
+    "dll_init_failed": "Windows エラー 0xC0000142（STATUS_DLL_INIT_FAILED）: {subject} またはその DLL/アプリケーション コンポーネントの初期化に失敗しました。",
+    "environment_issue": "これは通常、モデルのインポートエラーではなく Windows/ランタイム環境の問題です。",
+    "suggested_fixes": "推奨される対処:",
+    "vc_redist": "1. Microsoft Visual C++ Redistributable 2015-2022 x64 をインストールまたは再インストールしてください。",
+    "antivirus": "2. セキュリティソフトで MMD Character Importer と Blender をホワイトリストに追加してください。",
+    "gpu_driver": "3. GPU ドライバーをメーカー公式サイトから更新してください。",
+    "resources": "4. システムに少なくとも 1 GiB の空き容量と 2.5 GiB の空きメモリがあることを確認してください。"
   }
 }

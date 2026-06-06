@@ -82,6 +82,8 @@ BODYGROUP_SCALE_PRESET_TOPS: dict[str, float] = {
 }
 STEP_COMPLETE_MARKER = "step_complete.json"
 STEP_MARKER_SCHEMA_VERSION = 1
+SYSTEM_BLENDER_WARNING_CHECKED = False
+WINDOWS_STATUS_DLL_INIT_FAILED_CODES = {0xC0000142, -1073741502}
 
 
 TEXTURE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tga", ".dds", ".spa", ".sph"}
@@ -880,12 +882,26 @@ def blender_version(blender_exe: Path) -> str:
     return match.group(1)
 
 
+def path_is_under(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def is_managed_blender_path(blender_exe: Path) -> bool:
+    return path_is_under(blender_exe, software_blender_root())
+
+
 def setup_state_is_current(state: dict[str, object]) -> Path | None:
     blender_raw = str(state.get("blender_exe") or "")
     if not blender_raw:
         return None
     blender = Path(blender_raw)
     if not blender.exists():
+        return None
+    if not is_managed_blender_path(blender):
         return None
     if str(state.get("blender_version") or "").split(".")[:2] != ["4", "5"]:
         return None
@@ -973,6 +989,12 @@ def valid_zip(path: Path) -> bool:
 
 
 def blender_zip_path(progress: ProgressCallback | None = None) -> Path:
+    if BUNDLED_BLENDER_ZIP.exists() and valid_zip(BUNDLED_BLENDER_ZIP):
+        emit(progress, f"Using bundled Blender zip: {BUNDLED_BLENDER_ZIP}")
+        return BUNDLED_BLENDER_ZIP
+    if BUNDLED_BLENDER_ZIP.exists():
+        emit(progress, f"WARNING: Bundled Blender zip is invalid and will be ignored: {BUNDLED_BLENDER_ZIP}")
+
     downloads = app_local_dir() / "downloads"
     try:
         url, filename = latest_official_blender_zip_url(progress)
@@ -981,10 +1003,7 @@ def blender_zip_path(progress: ProgressCallback | None = None) -> Path:
             download_file(url, target, progress)
         return target
     except Exception as exc:
-        if not BUNDLED_BLENDER_ZIP.exists():
-            raise RuntimeError(f"could not download Blender and no bundled fallback exists: {exc}") from exc
-        emit(progress, f"Official Blender download failed; using bundled fallback: {exc}")
-        return BUNDLED_BLENDER_ZIP
+        raise RuntimeError(f"could not download Blender and no valid bundled fallback exists: {exc}") from exc
 
 
 def find_blender_exe_in_dir(root: Path) -> Path | None:
@@ -1013,6 +1032,25 @@ def extract_blender(zip_path: Path, progress: ProgressCallback | None = None) ->
         raise RuntimeError(f"Blender extraction completed but blender.exe was not found under {target_root}")
     (blender.parent / "portable").mkdir(parents=True, exist_ok=True)
     return blender
+
+
+def native_process_failure_diagnostic(return_code: int, command: list[str]) -> str:
+    normalized_code = return_code if return_code >= 0 else return_code + (1 << 32)
+    if return_code not in WINDOWS_STATUS_DLL_INIT_FAILED_CODES and normalized_code not in WINDOWS_STATUS_DLL_INIT_FAILED_CODES:
+        return ""
+
+    executable = Path(command[0]).name if command else "The child process"
+    subject = "Blender" if "blender" in executable.lower() else executable
+    return (
+        "Windows error 0xC0000142 (STATUS_DLL_INIT_FAILED): "
+        f"{subject} or one of its DLL/application components failed during initialization.\n"
+        "This is usually a Windows/runtime environment issue, not a model import error.\n"
+        "Suggested fixes:\n"
+        "1. Install/reinstall the Microsoft Visual C++ Redistributable 2015-2022 x64.\n"
+        "2. Whitelist MMD Character Importer and Blender in antivirus/security software.\n"
+        "3. Update your GPU driver from the vendor site.\n"
+        "4. Make sure the system has at least 1 GiB free storage and 2.5 GiB spare memory."
+    )
 
 
 def run_process_streamed(
@@ -1069,7 +1107,9 @@ def run_process_streamed(
     if cancelled:
         raise RuntimeError("operation was cancelled")
     if return_code != 0:
-        raise RuntimeError(f"process failed with exit code {return_code}\n{' '.join(command)}\n{output}")
+        diagnostic = native_process_failure_diagnostic(return_code, command)
+        diagnostic_block = f"\n\n{diagnostic}" if diagnostic else ""
+        raise RuntimeError(f"process failed with exit code {return_code}{diagnostic_block}\n{' '.join(command)}\n{output}")
     return output
 
 
@@ -1134,7 +1174,7 @@ def _find_steam_dir() -> Path | None:
     """Detect the Steam installation directory on Windows."""
     try:
         import winreg
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\\Valve\\Steam") as key:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as key:
             steam_path, _ = winreg.QueryValueEx(key, "SteamPath")
             if steam_path and Path(steam_path).exists():
                 return Path(steam_path)
@@ -1142,7 +1182,7 @@ def _find_steam_dir() -> Path | None:
         pass
     try:
         import winreg
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"Software\\Valve\\Steam") as key:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"Software\Valve\Steam") as key:
             steam_path, _ = winreg.QueryValueEx(key, "InstallPath")
             if steam_path and Path(steam_path).exists():
                 return Path(steam_path)
@@ -1165,7 +1205,7 @@ def _find_steam_library_folders(steam_dir: Path) -> list[Path]:
         return libraries
     try:
         text = vdf.read_text(encoding="utf-8", errors="ignore")
-        for match in re.finditer(r'"path"\\s+"([^"]+)"', text):
+        for match in re.finditer(r'"path"\s+"([^"]+)"', text):
             lib = Path(match.group(1).replace("\\\\", "\\"))
             if lib.exists():
                 libraries.append(lib)
@@ -1174,20 +1214,14 @@ def _find_steam_library_folders(steam_dir: Path) -> list[Path]:
     return libraries
 
 
-def _find_system_blender() -> Path | None:
-    """Search for an existing Blender 4.5.x installation on the system."""
-    # Check PATH
+def _system_blender_candidates() -> list[Path]:
+    candidates: list[Path] = []
+
     for exe_name in ("blender.exe", "blender"):
         path_exe = shutil.which(exe_name)
         if path_exe:
-            candidate = Path(path_exe)
-            try:
-                ver = blender_version(candidate)
-                if parse_version_tuple(ver)[:2] == (4, 5):
-                    return candidate
-            except Exception:
-                pass
-    # Common Windows install locations
+            candidates.append(Path(path_exe))
+
     program_files = os.environ.get("ProgramFiles", "C:\\Program Files")
     program_files_x86 = os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")
     local_appdata = os.environ.get("LOCALAPPDATA", "")
@@ -1200,20 +1234,97 @@ def _find_system_blender() -> Path | None:
     if steam_path:
         for lib in _find_steam_library_folders(steam_path):
             search_roots.append(lib / "steamapps" / "common")
+
     for root in search_roots:
         if not root.exists():
             continue
         for candidate in root.rglob("blender.exe"):
-            try:
-                ver = blender_version(candidate)
-                if parse_version_tuple(ver)[:2] == (4, 5):
-                    return candidate
-            except Exception:
-                pass
+            candidates.append(candidate)
+
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for candidate in candidates:
+        try:
+            key = candidate.resolve()
+        except Exception:
+            key = candidate.absolute()
+        if key in seen or is_managed_blender_path(key):
+            continue
+        seen.add(key)
+        unique.append(key)
+    return unique
+
+
+def _find_system_blender(progress: ProgressCallback | None = None) -> Path | None:
+    """Search for system Blender and warn when it is not Blender 4.5.x.
+
+    This is intentionally warning-only. The importer uses its managed portable
+    Blender by default so user Blender installs are not modified or selected
+    automatically.
+    """
+
+    compatible: Path | None = None
+    incompatible: list[tuple[Path, str]] = []
+    for candidate in _system_blender_candidates():
+        try:
+            ver = blender_version(candidate)
+        except Exception:
+            continue
+        if parse_version_tuple(ver)[:2] == (4, 5):
+            if compatible is None:
+                compatible = candidate
+        else:
+            incompatible.append((candidate, ver))
+
+    for candidate, ver in incompatible[:4]:
+        emit(
+            progress,
+            "WARNING: System Blender "
+            f"{ver} was found at {candidate}. MMD Character Importer expects Blender 4.5.x; "
+            "using the bundled/managed Blender instead to avoid add-on conflicts.",
+        )
+    if len(incompatible) > 4:
+        emit(progress, f"WARNING: {len(incompatible) - 4} additional non-4.5 system Blender install(s) were found.")
+    if compatible:
+        emit(progress, f"Detected system Blender 4.5.x at {compatible}; using bundled/managed Blender by default.")
+    return compatible
+
+
+def warn_about_system_blender(progress: ProgressCallback | None = None) -> None:
+    global SYSTEM_BLENDER_WARNING_CHECKED
+    if SYSTEM_BLENDER_WARNING_CHECKED:
+        return
+    SYSTEM_BLENDER_WARNING_CHECKED = True
+    _find_system_blender(progress)
+
+
+def find_managed_blender(progress: ProgressCallback | None = None) -> Path:
+    zip_path = blender_zip_path(progress)
+    return extract_blender(zip_path, progress)
+
+
+def reusable_managed_blender_from_state(state: dict[str, object], progress: ProgressCallback | None = None) -> Path | None:
+    state_blender_raw = str(state.get("blender_exe") or "")
+    if not state_blender_raw:
+        return None
+    candidate = Path(state_blender_raw)
+    if not candidate.exists():
+        return None
+    if not is_managed_blender_path(candidate):
+        emit(progress, f"Ignoring saved system Blender path; using bundled/managed Blender by default: {candidate}")
+        return None
+    try:
+        candidate_version = blender_version(candidate)
+        if parse_version_tuple(candidate_version)[:2] == (4, 5):
+            emit(progress, f"Reusing existing managed Blender for setup repair: {candidate}")
+            return candidate
+    except Exception:
+        return None
     return None
 
 
 def ensure_portable_blender(progress: ProgressCallback | None = None) -> SetupResult:
+    warn_about_system_blender(progress)
     state = read_setup_state()
     state_blender = setup_state_is_current(state)
     if state_blender:
@@ -1224,28 +1335,9 @@ def ensure_portable_blender(progress: ProgressCallback | None = None) -> SetupRe
             state_path=setup_state_path(),
         )
 
-    reusable_blender: Path | None = None
-    state_blender_raw = str(state.get("blender_exe") or "")
-    if state_blender_raw:
-        candidate = Path(state_blender_raw)
-        if candidate.exists():
-            try:
-                candidate_version = blender_version(candidate)
-                if parse_version_tuple(candidate_version)[:2] == (4, 5):
-                    reusable_blender = candidate
-                    emit(progress, f"Reusing existing Blender for setup repair: {candidate}")
-            except Exception:
-                reusable_blender = None
-    if reusable_blender is None:
-        system_blender = _find_system_blender()
-        if system_blender:
-            reusable_blender = system_blender
-            emit(progress, f"Using system Blender: {system_blender}")
-    if reusable_blender is None:
-        zip_path = blender_zip_path(progress)
-        blender = extract_blender(zip_path, progress)
-    else:
-        blender = reusable_blender
+    blender = reusable_managed_blender_from_state(state, progress)
+    if blender is None:
+        blender = find_managed_blender(progress)
     version = blender_version(blender)
     if parse_version_tuple(version)[:2] != (4, 5):
         raise RuntimeError(f"Blender {version} is not supported; expected Blender 4.5.x for the bundled CATS add-on")
@@ -1601,7 +1693,9 @@ def build_workspace(pmx_path: Path, source_dir: Path, analysis: PmxAnalysis | No
     model_label = analysis.model_name_english or analysis.model_name or pmx_path.stem
     slug = slugify(model_label)
     digest = file_sha1(pmx_path)[:10]
-    root = (workspace_root or workspaces_root()) / f"{slug}_{digest}"
+    workspace_name = f"{slug}_{digest}"
+    workspace_base = workspace_root or workspaces_root()
+    root = workspace_base if workspace_base.name.lower() == workspace_name.lower() else workspace_base / workspace_name
     source_assets_dir = root / "0_source_mmd_assets"
     import_dir = root / "1_import_mmd_model"
     fix_dir = root / "2_fix_model_source_skeleton"

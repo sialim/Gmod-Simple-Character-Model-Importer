@@ -324,7 +324,13 @@
     "already_the_active_studiomdl_compile_source_fold_08a2fe6d": "이미 활성 StudioMDL 컴파일 원본 폴더입니다.",
     "failed_to_copy_qc_compile_source_folder_e1442b7d": "QC 컴파일 원본 폴더를 복사하지 못했습니다: ",
     "the_selected_distribution_folder_cannot_be_insid_4a263ee7": "선택한 배포 폴더는 QC 컴파일 원본 폴더 안에 있을 수 없습니다.",
-    "already_copied_in_this_folder_e6d00cc1": "이미 이 폴더에 복사되어 있습니다."
+    "already_copied_in_this_folder_e6d00cc1": "이미 이 폴더에 복사되어 있습니다.",
+    "runtime_diagnostics.environment_issue": "이는 일반적으로 모델 가져오기 오류가 아니라 Windows/런타임 환경 문제입니다.",
+    "runtime_diagnostics.suggested_fixes": "권장 해결 방법:",
+    "runtime_diagnostics.vc_redist": "1. Microsoft Visual C++ Redistributable 2015-2022 x64를 설치/재설치하세요.",
+    "runtime_diagnostics.antivirus": "2. 백신/보안 소프트웨어에서 MMD Character Importer와 Blender를 허용 목록에 추가하세요.",
+    "runtime_diagnostics.gpu_driver": "3. GPU 드라이버를 제조사 사이트에서 업데이트하세요.",
+    "runtime_diagnostics.resources": "4. 시스템에 최소 1 GiB의 여유 저장 공간과 2.5 GiB의 여유 메모리가 있는지 확인하세요."
   },
   "preview": {
     "collision_overlay": "Physics overlay: {part_count} parts",
@@ -4008,7 +4014,8 @@
     "size": "크기",
     "stage": "무대",
     "type": "유형",
-    "validate": "검증"
+    "validate": "검증",
+    "close": "닫기"
   },
   "main": {
     "auto_prefix": "자동",
@@ -4211,5 +4218,39 @@
     "term_094_fix_complete": "수정 완료",
     "term_095_sort_complete": "정렬 완료",
     "term_096_scan_complete": "스캔 완료"
+  },
+  "preflight": {
+    "title": "사전 검사 경고",
+    "title_nsfw": "NSFW 가능성이 있는 모델 콘텐츠",
+    "generic_import": "이 PMX에 경고가 있습니다. 가져오기를 계속할까요?",
+    "generic_full_import": "이 PMX에 경고가 있습니다. 전체 가져오기를 계속할까요?",
+    "nsfw_description": "제공한 모델에서 NSFW 요소가 감지되었습니다. 이러한 모델은 권장되지 않으며 자동 포팅 기능도 이에 최적화되어 있지 않아 예상치 못한 결과가 발생할 수 있습니다.",
+    "nsfw_detected": "{morph_count}개의 쉐이프키/모프 이름에서 {match_count}개의 키워드 일치가 감지되었습니다.",
+    "nsfw_continue_full": "계속하려면 원클릭 자동 포팅보다 수동 단계별 워크플로를 사용하는 것이 좋습니다.",
+    "nsfw_continue_manual": "계속하려면 이후 각 단계를 신중하게 확인하고 필요한 경우 수동 수정을 우선하세요.",
+    "matched_keyword_hints": "일치한 키워드 힌트: {keywords}",
+    "matched_keyword_hints_more": "일치한 키워드 힌트: {keywords}, 그 외 {more_count}개",
+    "other_warnings": "기타 사전 검사 경고:",
+    "proceed_anyway": "그래도 계속",
+    "import_cancelled_before_blender": "Blender 실행 전에 가져오기가 취소되었습니다.",
+    "warning_label": "경고:",
+    "no_warnings": "사전 검사 경고가 없습니다.",
+    "warning_missing_skeleton_groups": "예상된 MMD 휴머노이드 스켈레톤 그룹이 없습니다: {groups}",
+    "warning_no_native_textures": "선택한 모델 폴더에서 원본 텍스처 파일을 찾을 수 없습니다.",
+    "warning_unresolved_texture_refs": "{count}개의 PMX 텍스처 참조를 확인할 수 없습니다: {refs}",
+    "warning_unresolved_texture_refs_more": "{count}개의 PMX 텍스처 참조를 확인할 수 없습니다: {refs}, 그 외 {more_count}개",
+    "warning_high_vertex_count": "정점 수가 많습니다: {count}개 정점; Source/GMod 작업이 느려질 수 있습니다.",
+    "warning_high_morph_count": "모프/쉐이프키 수가 많습니다: {count}; 이후 Flex 작업이 느려질 수 있습니다.",
+    "warning_nsfw_summary": "NSFW 가능성이 있는 쉐이프키 이름 감지: {morph_count}개 모프에서 {match_count}개 키워드 일치. 자동 포팅은 이러한 모델에 최적화되어 있지 않습니다.",
+    "warning_high_texture_count": "원본 PMX 텍스처 수가 많습니다: {count}; 재질 작업이 느려질 수 있습니다."
+  },
+  "runtime_diagnostics": {
+    "dll_init_failed": "Windows 오류 0xC0000142 (STATUS_DLL_INIT_FAILED): {subject} 또는 해당 DLL/응용 프로그램 구성 요소 초기화에 실패했습니다.",
+    "environment_issue": "이는 일반적으로 모델 가져오기 오류가 아니라 Windows/런타임 환경 문제입니다.",
+    "suggested_fixes": "권장 해결 방법:",
+    "vc_redist": "1. Microsoft Visual C++ Redistributable 2015-2022 x64를 설치/재설치하세요.",
+    "antivirus": "2. 백신/보안 소프트웨어에서 MMD Character Importer와 Blender를 허용 목록에 추가하세요.",
+    "gpu_driver": "3. GPU 드라이버를 제조사 사이트에서 업데이트하세요.",
+    "resources": "4. 시스템에 최소 1 GiB의 여유 저장 공간과 2.5 GiB의 여유 메모리가 있는지 확인하세요."
   }
 }

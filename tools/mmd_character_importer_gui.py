@@ -3076,6 +3076,15 @@ class ImporterWindow(QtWidgets.QMainWindow):
     def translate_runtime_text(self, text: str) -> str:
         if not text or self.language_code == "en_us":
             return text
+        dll_prefix = "Windows error 0xC0000142 (STATUS_DLL_INIT_FAILED): "
+        dll_suffix = " or one of its DLL/application components failed during initialization."
+        if text.startswith(dll_prefix) and text.endswith(dll_suffix):
+            subject = text[len(dll_prefix) : -len(dll_suffix)]
+            return self._t(
+                "runtime_diagnostics.dll_init_failed",
+                "Windows error 0xC0000142 (STATUS_DLL_INIT_FAILED): {subject} or one of its DLL/application components failed during initialization.",
+                subject=subject,
+            )
         exact = self._i18n_exact_map.get(text)
         if exact:
             return exact
@@ -3083,6 +3092,11 @@ class ImporterWindow(QtWidgets.QMainWindow):
             if text.startswith(source):
                 return translated + text[len(source) :]
         return text
+
+    def translate_multiline_runtime_text(self, text: str) -> str:
+        if not text or self.language_code == "en_us":
+            return text
+        return "\n".join(self.translate_runtime_text(line) for line in str(text).splitlines())
 
     def set_language(self, code: str) -> None:
         valid_codes = {item[0] for item in LANGUAGE_OPTIONS}
@@ -8373,10 +8387,12 @@ class ImporterWindow(QtWidgets.QMainWindow):
             f" | Materials: {analysis.material_count:,}"
         )
         if analysis.warnings:
-            escaped = "<br>".join(html.escape(f"- {warning}") for warning in analysis.warnings)
-            self.main_warning_label.setText(f'<span style="color:#d29922;">Warnings:</span><br>{escaped}')
+            escaped = "<br>".join(html.escape(f"- {self.translate_preflight_warning(warning)}") for warning in analysis.warnings)
+            self.main_warning_label.setText(f'<span style="color:#d29922;">{html.escape(self._t("preflight.warning_label", "Warnings:"))}</span><br>{escaped}')
         else:
-            self.main_warning_label.setText('<span style="color:#2ea043;">No preflight warnings.</span>')
+            self.main_warning_label.setText(
+                f'<span style="color:#2ea043;">{html.escape(self._t("preflight.no_warnings", "No preflight warnings."))}</span>'
+            )
 
     def load_main_preview(self, silent: bool = False) -> None:
         if self.main_model_preview is None:
@@ -8663,8 +8679,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
     def confirm_main_warnings(self, analysis: core.PmxAnalysis) -> bool:
         return self.confirm_preflight_warnings(
             analysis,
-            "Preflight warnings",
-            "The PMX has warnings. Proceed with the full import?",
+            self._t("preflight.title", "Preflight warnings"),
+            self._t("preflight.generic_full_import", "The PMX has warnings. Proceed with the full import?"),
             full_import=True,
         )
 
@@ -8685,44 +8701,125 @@ class ImporterWindow(QtWidgets.QMainWindow):
         dialog.setIcon(QtWidgets.QMessageBox.Icon.Warning)
         scan = getattr(analysis, "content_warning_scan", {}) if analysis else {}
         content_triggered = isinstance(scan, dict) and bool(scan.get("triggered"))
-        dialog.setWindowTitle("Potential NSFW model content" if content_triggered else title)
+        dialog.setWindowTitle(self._t("preflight.title_nsfw", "Potential NSFW model content") if content_triggered else title)
         if content_triggered:
             dialog.setText(
-                "The program detected NSFW elements in the model you provided. "
-                "It is not encouraged to do so, and the automatic porting function is not optimized for that "
-                "and might return unexpected results."
+                self._t(
+                    "preflight.nsfw_description",
+                    "The program detected NSFW elements in the model you provided. "
+                    "It is not encouraged to do so, and the automatic porting function is not optimized for that "
+                    "and might return unexpected results.",
+                )
             )
             match_count = int(scan.get("match_count") or 0)
             morph_count = int(scan.get("matched_morph_count") or 0)
             keywords = scan.get("matched_keywords") if isinstance(scan.get("matched_keywords"), list) else []
             keyword_preview = ", ".join(str(keyword) for keyword in keywords[:12])
             lines = [
-                f"Detected {match_count:,} keyword match(es) across {morph_count:,} shapekey/morph name(s).",
-                "If you intend to continue, the manual step-by-step workflow is recommended over one-click auto porting."
+                self._t(
+                    "preflight.nsfw_detected",
+                    "Detected {match_count} keyword match(es) across {morph_count} shapekey/morph name(s).",
+                    match_count=f"{match_count:,}",
+                    morph_count=f"{morph_count:,}",
+                ),
+                self._t(
+                    "preflight.nsfw_continue_full",
+                    "If you intend to continue, the manual step-by-step workflow is recommended over one-click auto porting.",
+                )
                 if full_import
-                else "If you intend to continue, review each later step carefully and prefer manual corrections when needed.",
+                else self._t(
+                    "preflight.nsfw_continue_manual",
+                    "If you intend to continue, review each later step carefully and prefer manual corrections when needed.",
+                ),
             ]
             if keyword_preview:
                 suffix = "" if len(keywords) <= 12 else f" and {len(keywords) - 12} more"
-                lines.append(f"Matched keyword hints: {keyword_preview}{suffix}")
+                if suffix:
+                    lines.append(
+                        self._t(
+                            "preflight.matched_keyword_hints_more",
+                            "Matched keyword hints: {keywords} and {more_count} more",
+                            keywords=keyword_preview,
+                            more_count=len(keywords) - 12,
+                        )
+                    )
+                else:
+                    lines.append(
+                        self._t(
+                            "preflight.matched_keyword_hints",
+                            "Matched keyword hints: {keywords}",
+                            keywords=keyword_preview,
+                        )
+                    )
             other_warnings = [
-                warning
+                self.translate_preflight_warning(warning)
                 for warning in analysis.warnings
                 if "Potential NSFW shapekey names detected" not in warning
             ]
             if other_warnings:
                 lines.append("")
-                lines.append("Other preflight warnings:")
+                lines.append(self._t("preflight.other_warnings", "Other preflight warnings:"))
                 lines.extend(f"- {warning}" for warning in other_warnings)
             dialog.setInformativeText("\n".join(lines))
         else:
             dialog.setText(generic_text)
-            dialog.setInformativeText("\n".join(analysis.warnings))
-        proceed = dialog.addButton("Proceed Anyway" if content_triggered else "Proceed", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
-        dialog.addButton("Cancel", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+            dialog.setInformativeText("\n".join(self.translate_preflight_warning(warning) for warning in analysis.warnings))
+        proceed = dialog.addButton(
+            self._t("preflight.proceed_anyway", "Proceed Anyway") if content_triggered else self._t("common.proceed", "Proceed"),
+            QtWidgets.QMessageBox.ButtonRole.AcceptRole,
+        )
+        dialog.addButton(self._t("common.cancel", "Cancel"), QtWidgets.QMessageBox.ButtonRole.RejectRole)
         dialog.setDefaultButton(proceed)
         dialog.exec()
         return dialog.clickedButton() == proceed
+
+    def translate_preflight_warning(self, warning: str) -> str:
+        text = str(warning or "")
+        if not text:
+            return text
+        match = re.fullmatch(r"Missing expected MMD humanoid skeleton groups: (.+)", text)
+        if match:
+            return self._t("preflight.warning_missing_skeleton_groups", "Missing expected MMD humanoid skeleton groups: {groups}", groups=match.group(1))
+        if text == "No native texture files were found in the selected model folder.":
+            return self._t("preflight.warning_no_native_textures", text)
+        match = re.fullmatch(r"(\d+) PMX texture references could not be resolved: (.*) and (\d+) more", text)
+        if match:
+            return self._t(
+                "preflight.warning_unresolved_texture_refs_more",
+                "{count} PMX texture references could not be resolved: {refs} and {more_count} more",
+                count=match.group(1),
+                refs=match.group(2),
+                more_count=match.group(3),
+            )
+        match = re.fullmatch(r"(\d+) PMX texture references could not be resolved: (.*)", text)
+        if match:
+            return self._t(
+                "preflight.warning_unresolved_texture_refs",
+                "{count} PMX texture references could not be resolved: {refs}",
+                count=match.group(1),
+                refs=match.group(2),
+            )
+        match = re.fullmatch(r"High vertex count: ([\d,]+) vertices; Source/GMod work may be slow\.", text)
+        if match:
+            return self._t("preflight.warning_high_vertex_count", "High vertex count: {count} vertices; Source/GMod work may be slow.", count=match.group(1))
+        match = re.fullmatch(r"High morph/shapekey count: ([\d,]+); later flex work may be slow\.", text)
+        if match:
+            return self._t("preflight.warning_high_morph_count", "High morph/shapekey count: {count}; later flex work may be slow.", count=match.group(1))
+        match = re.fullmatch(
+            r"Potential NSFW shapekey names detected: ([\d,]+) keyword matches across ([\d,]+) morphs\. Auto porting is not optimized for this kind of model\.",
+            text,
+        )
+        if match:
+            return self._t(
+                "preflight.warning_nsfw_summary",
+                "Potential NSFW shapekey names detected: {match_count} keyword matches across {morph_count} morphs. Auto porting is not optimized for this kind of model.",
+                match_count=match.group(1),
+                morph_count=match.group(2),
+            )
+        match = re.fullmatch(r"High native PMX texture count: ([\d,]+); material work may be slow\.", text)
+        if match:
+            return self._t("preflight.warning_high_texture_count", "High native PMX texture count: {count}; material work may be slow.", count=match.group(1))
+        return self.translate_runtime_text(text)
 
     def cancel_full_import(self) -> None:
         if self.worker and self.worker.isRunning() and hasattr(self.worker, "cancel"):
@@ -9217,10 +9314,10 @@ class ImporterWindow(QtWidgets.QMainWindow):
         )
         self.stats_label.setText(stats)
         if analysis.warnings:
-            escaped = "<br>".join(html.escape(f"- {warning}") for warning in analysis.warnings)
-            self.warning_label.setText(f'<span style="color:#d29922;">Warnings:</span><br>{escaped}')
+            escaped = "<br>".join(html.escape(f"- {self.translate_preflight_warning(warning)}") for warning in analysis.warnings)
+            self.warning_label.setText(f'<span style="color:#d29922;">{html.escape(self._t("preflight.warning_label", "Warnings:"))}</span><br>{escaped}')
         else:
-            self.warning_label.setText('<span style="color:#2ea043;">No preflight warnings.</span>')
+            self.warning_label.setText(f'<span style="color:#2ea043;">{html.escape(self._t("preflight.no_warnings", "No preflight warnings."))}</span>')
 
     def render_error_analysis(self, exc: Exception) -> None:
         self.stats_label.setText("Could not analyze the selected PMX.")
@@ -9254,8 +9351,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
             return True
         return self.confirm_preflight_warnings(
             analysis,
-            "Preflight warnings",
-            "The PMX has warnings. Proceed with import?",
+            self._t("preflight.title", "Preflight warnings"),
+            self._t("preflight.generic_import", "The PMX has warnings. Proceed with import?"),
             full_import=False,
         )
 
@@ -9270,7 +9367,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
             self.clear_step_state(1)
             return
         if not self.confirm_warnings(analysis):
-            self.statusBar().showMessage("Import cancelled before Blender launch.")
+            self.statusBar().showMessage(self._t("preflight.import_cancelled_before_blender", "Import cancelled before Blender launch."))
             self.clear_step_state(1)
             return
 
@@ -17599,13 +17696,13 @@ class ImporterWindow(QtWidgets.QMainWindow):
 
     def show_error(self, title: str, message: str) -> None:
         dialog = QtWidgets.QDialog(self)
-        dialog.setWindowTitle(title)
+        dialog.setWindowTitle(self.translate_static_text(str(title)))
         dialog.resize(820, 540)
         layout = QtWidgets.QVBoxLayout(dialog)
         text = QtWidgets.QPlainTextEdit()
         text.setReadOnly(True)
-        text.setPlainText(message)
-        close_button = QtWidgets.QPushButton("Close")
+        text.setPlainText(self.translate_multiline_runtime_text(str(message)))
+        close_button = QtWidgets.QPushButton(self._t("common.close", "Close"))
         close_button.clicked.connect(dialog.accept)
         layout.addWidget(text, 1)
         layout.addWidget(close_button, 0, QtCore.Qt.AlignmentFlag.AlignRight)

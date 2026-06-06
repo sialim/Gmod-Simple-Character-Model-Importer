@@ -104,6 +104,7 @@ function Invoke-NativeRelaxed([scriptblock]$Command, [switch]$CaptureOutput) {
     $ErrorActionPreference = "Continue"
     try {
         if ($CaptureOutput) {
+            $script:LastNativeOutput = @()
             $output = & $Command 2>&1
             $script:LastNativeOutput = $output
         }
@@ -117,18 +118,60 @@ function Invoke-NativeRelaxed([scriptblock]$Command, [switch]$CaptureOutput) {
     }
 }
 
+function Get-NativeOutputText() {
+    if ($null -eq $script:LastNativeOutput) {
+        return ""
+    }
+    return (@($script:LastNativeOutput) | ForEach-Object { [string]$_ }) -join "`n"
+}
+
+function Get-NativeOutputLastLine() {
+    $Lines = @(
+        @($script:LastNativeOutput) |
+        ForEach-Object { [string]$_ } |
+        Where-Object { $_.Trim().Length -gt 0 }
+    )
+    if ($Lines.Count -le 0) {
+        return ""
+    }
+    return $Lines[$Lines.Count - 1].Trim()
+}
+
+function Invoke-NativeLastLine([scriptblock]$Command, [string]$Description) {
+    $ExitCode = Invoke-NativeRelaxed $Command -CaptureOutput
+    if ($ExitCode -ne 0) {
+        throw "$Description failed.`n$(Get-NativeOutputText)"
+    }
+    $Line = Get-NativeOutputLastLine
+    if (-not $Line) {
+        throw "$Description did not produce output."
+    }
+    return $Line
+}
+
+function Invoke-NativeJsonOutput([scriptblock]$Command, [string]$Description) {
+    $ExitCode = Invoke-NativeRelaxed $Command -CaptureOutput
+    $Text = Get-NativeOutputText
+    if ($ExitCode -ne 0) {
+        throw "$Description failed.`n$Text"
+    }
+    $Start = $Text.IndexOf("{")
+    $End = $Text.LastIndexOf("}")
+    if ($Start -lt 0 -or $End -lt $Start) {
+        throw "$Description did not produce JSON output.`n$Text"
+    }
+    return $Text.Substring($Start, $End - $Start + 1)
+}
+
 Push-Location $Root
 try {
     $BuildTimeUtc = (Get-Date).ToUniversalTime().ToString("o")
-    $PyInstallerVersionExitCode = Invoke-NativeRelaxed { & $Python -m PyInstaller --version *> $null }
+    $PyInstallerVersionExitCode = Invoke-NativeRelaxed { & $Python -m PyInstaller --version } -CaptureOutput
     if ($PyInstallerVersionExitCode -ne 0) {
-        throw "PyInstaller is not installed. Run: $Python -m pip install pyinstaller"
+        throw "PyInstaller is not installed. Run: $Python -m pip install pyinstaller`n$(Get-NativeOutputText)"
     }
 
-    $PythonPrefix = (& $Python -c "import sys; print(sys.prefix)")
-    if ($LASTEXITCODE -ne 0) {
-        throw "Could not resolve Python prefix."
-    }
+    $PythonPrefix = Invoke-NativeLastLine { & $Python -c "import sys; print(sys.prefix)" } "Could not resolve Python prefix"
 
     $DataArgs = @()
     $DataManifest = @()
@@ -385,16 +428,18 @@ try {
         Copy-Item -LiteralPath $DistOneFileExe -Destination $StandaloneExe
     }
 
-    $PackageJson = (& $Python -c "import importlib.metadata as m, json, sys; names=sys.argv[1:]; out={};`nfor name in names:`n    try: out[name]=m.version(name)`n    except Exception: out[name]=None`nprint(json.dumps(out, ensure_ascii=False, indent=2))" pyinstaller PySide6 numpy Pillow requests PyOpenGL)
+    $PackageJson = Invoke-NativeJsonOutput { & $Python -c "import importlib.metadata as m, json, sys; names=sys.argv[1:]; out={};`nfor name in names:`n    try: out[name]=m.version(name)`n    except Exception: out[name]=None`nprint(json.dumps(out, ensure_ascii=False, indent=2))" pyinstaller PySide6 numpy Pillow requests PyOpenGL } "Could not resolve Python package versions"
     $Packages = $PackageJson | ConvertFrom-Json
     $BuildMode = if ($OneDir) { if ($Console) { "onedir_console" } else { "onedir_windowed" } } else { if ($Console) { "onefile_console" } else { "onefile_windowed" } }
     $ReleaseTarget = if ($OneDir) { $PortableDir } else { $StandaloneExe }
+    $PythonExecutable = Invoke-NativeLastLine { & $Python -c "import sys; print(sys.executable)" } "Could not resolve Python executable"
+    $PythonVersion = Invoke-NativeLastLine { & $Python -c "import sys; print(sys.version)" } "Could not resolve Python version"
     $BundledPrograms = @(
         [ordered]@{
             name = "Blender"
             path = "blender-4.5.10-windows-x64.zip"
             required = $false
-            role = "Portable Blender 4.5 setup fallback (optional; app can auto-download or use system Blender)"
+            role = "Portable Blender 4.5 setup source (optional; app can auto-download the official Blender 4.5 zip when omitted)"
         },
         [ordered]@{
             name = "VTFCmd"
@@ -417,8 +462,8 @@ try {
         build_time_utc = $BuildTimeUtc
         release_page_url = $UpdateReleasePageUrl
         latest_release_api_url = $UpdateLatestReleaseApiUrl
-        python_executable = (& $Python -c "import sys; print(sys.executable)")
-        python_version = (& $Python -c "import sys; print(sys.version)")
+        python_executable = $PythonExecutable
+        python_version = $PythonVersion
         pyinstaller_mode = $BuildMode
         release_target = $ReleaseTarget
         bundled_data = $DataManifest
@@ -435,7 +480,7 @@ try {
         notes = @(
             "Default builds are single-file executables. No _internal folder is required at runtime.",
             "Bundled tools/plugins/templates are extracted by PyInstaller to a temporary runtime folder when the executable starts.",
-            "Blender zip is optional. If not bundled, the app will auto-download or use a system-installed Blender.",
+            "Blender zip is optional. If not bundled, the app will auto-download the official Blender 4.5 zip and use its managed portable Blender.",
             "VTFCmd is bundled for VTF conversion. A separate VTFEdit/VTFCmd install is not required at runtime.",
             "A local Garry's Mod install is still required because StudioMDL and gmad are distributed with Garry's Mod."
         )

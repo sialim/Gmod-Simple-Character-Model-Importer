@@ -35,7 +35,8 @@
     "size": "Size",
     "stage": "Stage",
     "type": "Type",
-    "validate": "Validate"
+    "validate": "Validate",
+    "close": "Close"
   },
   "dialogs": {
     "distribution_folder_title": "Select addon distribution folder",
@@ -362,7 +363,13 @@
     "already_the_active_studiomdl_compile_source_fold_08a2fe6d": "Already the active StudioMDL compile source folder.",
     "failed_to_copy_qc_compile_source_folder_e1442b7d": "Failed to copy QC compile source folder: ",
     "the_selected_distribution_folder_cannot_be_insid_4a263ee7": "The selected distribution folder cannot be inside the QC compile source folder.",
-    "already_copied_in_this_folder_e6d00cc1": "Already copied in this folder."
+    "already_copied_in_this_folder_e6d00cc1": "Already copied in this folder.",
+    "runtime_diagnostics.environment_issue": "This is usually a Windows/runtime environment issue, not a model import error.",
+    "runtime_diagnostics.suggested_fixes": "Suggested fixes:",
+    "runtime_diagnostics.vc_redist": "1. Install/reinstall the Microsoft Visual C++ Redistributable 2015-2022 x64.",
+    "runtime_diagnostics.antivirus": "2. Whitelist MMD Character Importer and Blender in antivirus/security software.",
+    "runtime_diagnostics.gpu_driver": "3. Update your GPU driver from the vendor site.",
+    "runtime_diagnostics.resources": "4. Make sure the system has at least 1 GiB free storage and 2.5 GiB spare memory."
   },
   "main": {
     "auto_prefix": "Auto",
@@ -4211,5 +4218,39 @@
     "optional_missing_short": "Optional outputs missing: {steps}.",
     "required_upstream": "Required upstream complete. Marker: {marker_path}",
     "required_upstream_short": "Required upstream complete."
+  },
+  "preflight": {
+    "title": "Preflight warnings",
+    "title_nsfw": "Potential NSFW model content",
+    "generic_import": "The PMX has warnings. Proceed with import?",
+    "generic_full_import": "The PMX has warnings. Proceed with the full import?",
+    "nsfw_description": "The program detected NSFW elements in the model you provided. It is not encouraged to do so, and the automatic porting function is not optimized for that and might return unexpected results.",
+    "nsfw_detected": "Detected {match_count} keyword match(es) across {morph_count} shapekey/morph name(s).",
+    "nsfw_continue_full": "If you intend to continue, the manual step-by-step workflow is recommended over one-click auto porting.",
+    "nsfw_continue_manual": "If you intend to continue, review each later step carefully and prefer manual corrections when needed.",
+    "matched_keyword_hints": "Matched keyword hints: {keywords}",
+    "matched_keyword_hints_more": "Matched keyword hints: {keywords} and {more_count} more",
+    "other_warnings": "Other preflight warnings:",
+    "proceed_anyway": "Proceed Anyway",
+    "import_cancelled_before_blender": "Import cancelled before Blender launch.",
+    "warning_label": "Warnings:",
+    "no_warnings": "No preflight warnings.",
+    "warning_missing_skeleton_groups": "Missing expected MMD humanoid skeleton groups: {groups}",
+    "warning_no_native_textures": "No native texture files were found in the selected model folder.",
+    "warning_unresolved_texture_refs": "{count} PMX texture references could not be resolved: {refs}",
+    "warning_unresolved_texture_refs_more": "{count} PMX texture references could not be resolved: {refs} and {more_count} more",
+    "warning_high_vertex_count": "High vertex count: {count} vertices; Source/GMod work may be slow.",
+    "warning_high_morph_count": "High morph/shapekey count: {count}; later flex work may be slow.",
+    "warning_nsfw_summary": "Potential NSFW shapekey names detected: {match_count} keyword matches across {morph_count} morphs. Auto porting is not optimized for this kind of model.",
+    "warning_high_texture_count": "High native PMX texture count: {count}; material work may be slow."
+  },
+  "runtime_diagnostics": {
+    "dll_init_failed": "Windows error 0xC0000142 (STATUS_DLL_INIT_FAILED): {subject} or one of its DLL/application components failed during initialization.",
+    "environment_issue": "This is usually a Windows/runtime environment issue, not a model import error.",
+    "suggested_fixes": "Suggested fixes:",
+    "vc_redist": "1. Install/reinstall the Microsoft Visual C++ Redistributable 2015-2022 x64.",
+    "antivirus": "2. Whitelist MMD Character Importer and Blender in antivirus/security software.",
+    "gpu_driver": "3. Update your GPU driver from the vendor site.",
+    "resources": "4. Make sure the system has at least 1 GiB free storage and 2.5 GiB spare memory."
   }
 }

@@ -35,7 +35,8 @@
     "size": "大小",
     "stage": "階段",
     "type": "類型",
-    "validate": "驗證"
+    "validate": "驗證",
+    "close": "關閉"
   },
   "dialogs": {
     "existing_output_incomplete": "現有輸出不完整：{errors}",
@@ -362,7 +363,13 @@
     "already_the_active_studiomdl_compile_source_fold_08a2fe6d": "這已經是目前的 StudioMDL 編譯來源資料夾。",
     "failed_to_copy_qc_compile_source_folder_e1442b7d": "無法複製 QC 編譯來源資料夾：",
     "the_selected_distribution_folder_cannot_be_insid_4a263ee7": "選擇的發佈資料夾不能位於 QC 編譯來源資料夾內。",
-    "already_copied_in_this_folder_e6d00cc1": "已複製到此資料夾。"
+    "already_copied_in_this_folder_e6d00cc1": "已複製到此資料夾。",
+    "runtime_diagnostics.environment_issue": "這通常是 Windows/執行階段環境問題，不是模型匯入錯誤。",
+    "runtime_diagnostics.suggested_fixes": "建議修復方法：",
+    "runtime_diagnostics.vc_redist": "1. 安裝或重新安裝 Microsoft Visual C++ Redistributable 2015-2022 x64。",
+    "runtime_diagnostics.antivirus": "2. 在防毒/安全軟體中將 MMD Character Importer 和 Blender 加入白名單。",
+    "runtime_diagnostics.gpu_driver": "3. 從顯示卡廠商官網更新 GPU 驅動。",
+    "runtime_diagnostics.resources": "4. 確認系統至少有 1 GiB 可用儲存空間和 2.5 GiB 空閒記憶體。"
   },
   "preview": {
     "bones": "骨骼",
@@ -4211,5 +4218,39 @@
     "step_13": "13 整理圖標和美術",
     "step_14": "14 整理 QC 並編譯",
     "step_15": "15 整理發佈說明"
+  },
+  "preflight": {
+    "title": "預檢警告",
+    "title_nsfw": "可能包含 NSFW 模型內容",
+    "generic_import": "此 PMX 存在警告。是否繼續匯入？",
+    "generic_full_import": "此 PMX 存在警告。是否繼續完整匯入？",
+    "nsfw_description": "程式偵測到你提供的模型中可能存在 NSFW 內容。不建議匯入此類模型，自動移植流程也未針對這種模型最佳化，可能產生異常結果。",
+    "nsfw_detected": "偵測到 {match_count} 個關鍵字匹配，涉及 {morph_count} 個形態鍵/表情名稱。",
+    "nsfw_continue_full": "如果仍要繼續，建議使用手動分步流程，而不是一鍵自動移植。",
+    "nsfw_continue_manual": "如果仍要繼續，請仔細檢查後續每一步，並優先進行手動修正。",
+    "matched_keyword_hints": "匹配到的關鍵字提示：{keywords}",
+    "matched_keyword_hints_more": "匹配到的關鍵字提示：{keywords}，以及另外 {more_count} 個",
+    "other_warnings": "其他預檢警告：",
+    "proceed_anyway": "仍然繼續",
+    "import_cancelled_before_blender": "已在啟動 Blender 前取消匯入。",
+    "warning_label": "警告：",
+    "no_warnings": "沒有預檢警告。",
+    "warning_missing_skeleton_groups": "缺少預期的 MMD 人形骨骼組：{groups}",
+    "warning_no_native_textures": "在所選模型資料夾中未找到原始貼圖檔案。",
+    "warning_unresolved_texture_refs": "{count} 個 PMX 貼圖引用無法解析：{refs}",
+    "warning_unresolved_texture_refs_more": "{count} 個 PMX 貼圖引用無法解析：{refs}，以及另外 {more_count} 個",
+    "warning_high_vertex_count": "頂點數較高：{count} 個頂點；Source/GMod 處理可能會變慢。",
+    "warning_high_morph_count": "形態鍵/表情數量較高：{count}；後續 Flex 處理可能會變慢。",
+    "warning_nsfw_summary": "偵測到可能的 NSFW 形態鍵名稱：{match_count} 個關鍵字匹配，涉及 {morph_count} 個形態鍵。自動移植流程未針對這種模型最佳化。",
+    "warning_high_texture_count": "PMX 原始貼圖數量較高：{count}；材質處理可能會變慢。"
+  },
+  "runtime_diagnostics": {
+    "dll_init_failed": "Windows 錯誤 0xC0000142（STATUS_DLL_INIT_FAILED）：{subject} 或其某個 DLL/應用程式元件初始化失敗。",
+    "environment_issue": "這通常是 Windows/執行階段環境問題，不是模型匯入錯誤。",
+    "suggested_fixes": "建議修復方法：",
+    "vc_redist": "1. 安裝或重新安裝 Microsoft Visual C++ Redistributable 2015-2022 x64。",
+    "antivirus": "2. 在防毒/安全軟體中將 MMD Character Importer 和 Blender 加入白名單。",
+    "gpu_driver": "3. 從顯示卡廠商官網更新 GPU 驅動。",
+    "resources": "4. 確認系統至少有 1 GiB 可用儲存空間和 2.5 GiB 空閒記憶體。"
   }
 }

@@ -324,7 +324,13 @@
     "already_the_active_studiomdl_compile_source_fold_08a2fe6d": "Это уже активная исходная папка компиляции StudioMDL.",
     "failed_to_copy_qc_compile_source_folder_e1442b7d": "Не удалось скопировать исходную папку компиляции QC: ",
     "the_selected_distribution_folder_cannot_be_insid_4a263ee7": "Выбранная папка дистрибутива не может находиться внутри исходной папки компиляции QC.",
-    "already_copied_in_this_folder_e6d00cc1": "Уже скопировано в эту папку."
+    "already_copied_in_this_folder_e6d00cc1": "Уже скопировано в эту папку.",
+    "runtime_diagnostics.environment_issue": "Обычно это проблема среды Windows/runtime, а не ошибка импорта модели.",
+    "runtime_diagnostics.suggested_fixes": "Рекомендуемые исправления:",
+    "runtime_diagnostics.vc_redist": "1. Установите/переустановите Microsoft Visual C++ Redistributable 2015-2022 x64.",
+    "runtime_diagnostics.antivirus": "2. Добавьте MMD Character Importer и Blender в белый список антивируса/защитного ПО.",
+    "runtime_diagnostics.gpu_driver": "3. Обновите драйвер GPU с сайта производителя.",
+    "runtime_diagnostics.resources": "4. Убедитесь, что в системе есть минимум 1 GiB свободного места и 2.5 GiB свободной памяти."
   },
   "preview": {
     "collision_overlay": "Physics overlay: {part_count} parts",
@@ -4008,7 +4014,8 @@
     "size": "Размер",
     "stage": "Этап",
     "type": "Тип",
-    "validate": "Подтвердить"
+    "validate": "Подтвердить",
+    "close": "Закрыть"
   },
   "main": {
     "auto_prefix": "Авто",
@@ -4211,5 +4218,39 @@
     "term_094_fix_complete": "Исправление завершено",
     "term_095_sort_complete": "Сортировка завершена",
     "term_096_scan_complete": "Сканирование завершено"
+  },
+  "preflight": {
+    "title": "Предупреждения предварительной проверки",
+    "title_nsfw": "Возможное NSFW-содержимое модели",
+    "generic_import": "У этого PMX есть предупреждения. Продолжить импорт?",
+    "generic_full_import": "У этого PMX есть предупреждения. Продолжить полный импорт?",
+    "nsfw_description": "Программа обнаружила возможные NSFW-элементы в предоставленной модели. Импорт таких моделей не рекомендуется, а автоматический перенос для них не оптимизирован и может дать неожиданные результаты.",
+    "nsfw_detected": "Обнаружено {match_count} совпадение(й) ключевых слов в {morph_count} имени(ах) shapekey/morph.",
+    "nsfw_continue_full": "Если вы продолжите, рекомендуется ручной пошаговый процесс вместо автоматического переноса в один клик.",
+    "nsfw_continue_manual": "Если вы продолжите, внимательно проверяйте каждый следующий шаг и предпочитайте ручные исправления.",
+    "matched_keyword_hints": "Найденные подсказки ключевых слов: {keywords}",
+    "matched_keyword_hints_more": "Найденные подсказки ключевых слов: {keywords}, и ещё {more_count}",
+    "other_warnings": "Другие предупреждения предварительной проверки:",
+    "proceed_anyway": "Всё равно продолжить",
+    "import_cancelled_before_blender": "Импорт отменён до запуска Blender.",
+    "warning_label": "Предупреждения:",
+    "no_warnings": "Нет предупреждений предварительной проверки.",
+    "warning_missing_skeleton_groups": "Отсутствуют ожидаемые группы гуманоидного скелета MMD: {groups}",
+    "warning_no_native_textures": "В выбранной папке модели не найдены исходные файлы текстур.",
+    "warning_unresolved_texture_refs": "Не удалось разрешить {count} ссылку(и) на текстуры PMX: {refs}",
+    "warning_unresolved_texture_refs_more": "Не удалось разрешить {count} ссылку(и) на текстуры PMX: {refs}, и ещё {more_count}",
+    "warning_high_vertex_count": "Большое число вершин: {count}; работа Source/GMod может быть медленной.",
+    "warning_high_morph_count": "Большое число morph/shapekey: {count}; дальнейшая работа Flex может быть медленной.",
+    "warning_nsfw_summary": "Обнаружены потенциально NSFW-имена shapekey: {match_count} совпадение(й) ключевых слов в {morph_count} morph. Автоматический перенос не оптимизирован для таких моделей.",
+    "warning_high_texture_count": "Большое число исходных текстур PMX: {count}; работа с материалами может быть медленной."
+  },
+  "runtime_diagnostics": {
+    "dll_init_failed": "Ошибка Windows 0xC0000142 (STATUS_DLL_INIT_FAILED): {subject} или один из его DLL/компонентов приложения не смог инициализироваться.",
+    "environment_issue": "Обычно это проблема среды Windows/runtime, а не ошибка импорта модели.",
+    "suggested_fixes": "Рекомендуемые исправления:",
+    "vc_redist": "1. Установите/переустановите Microsoft Visual C++ Redistributable 2015-2022 x64.",
+    "antivirus": "2. Добавьте MMD Character Importer и Blender в белый список антивируса/защитного ПО.",
+    "gpu_driver": "3. Обновите драйвер GPU с сайта производителя.",
+    "resources": "4. Убедитесь, что в системе есть минимум 1 GiB свободного места и 2.5 GiB свободной памяти."
   }
 }

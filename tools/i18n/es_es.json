@@ -324,7 +324,13 @@
     "already_the_active_studiomdl_compile_source_fold_08a2fe6d": "Ya es la carpeta activa de origen de compilación de StudioMDL.",
     "failed_to_copy_qc_compile_source_folder_e1442b7d": "No se pudo copiar la carpeta de origen de compilación QC: ",
     "the_selected_distribution_folder_cannot_be_insid_4a263ee7": "La carpeta de distribución seleccionada no puede estar dentro de la carpeta de origen de compilación QC.",
-    "already_copied_in_this_folder_e6d00cc1": "Ya copiado en esta carpeta."
+    "already_copied_in_this_folder_e6d00cc1": "Ya copiado en esta carpeta.",
+    "runtime_diagnostics.environment_issue": "Normalmente es un problema del entorno Windows/runtime, no un error de importación del modelo.",
+    "runtime_diagnostics.suggested_fixes": "Soluciones sugeridas:",
+    "runtime_diagnostics.vc_redist": "1. Instale o reinstale Microsoft Visual C++ Redistributable 2015-2022 x64.",
+    "runtime_diagnostics.antivirus": "2. Añada MMD Character Importer y Blender a la lista blanca del antivirus/software de seguridad.",
+    "runtime_diagnostics.gpu_driver": "3. Actualice el controlador de la GPU desde el sitio del fabricante.",
+    "runtime_diagnostics.resources": "4. Asegúrese de tener al menos 1 GiB de almacenamiento libre y 2.5 GiB de memoria disponible."
   },
   "preview": {
     "collision_overlay": "Physics overlay: {part_count} parts",
@@ -4008,7 +4014,8 @@
     "size": "Tamaño",
     "stage": "etapa",
     "type": "Tipo",
-    "validate": "Validar"
+    "validate": "Validar",
+    "close": "Cerrar"
   },
   "main": {
     "auto_prefix": "Automático",
@@ -4211,5 +4218,39 @@
     "term_094_fix_complete": "Reparación completa",
     "term_095_sort_complete": "Ordenar completo",
     "term_096_scan_complete": "Escaneo completo"
+  },
+  "preflight": {
+    "title": "Advertencias de precomprobación",
+    "title_nsfw": "Contenido de modelo potencialmente NSFW",
+    "generic_import": "Este PMX tiene advertencias. ¿Continuar con la importación?",
+    "generic_full_import": "Este PMX tiene advertencias. ¿Continuar con la importación completa?",
+    "nsfw_description": "El programa detectó elementos potencialmente NSFW en el modelo proporcionado. No se recomienda importar este tipo de modelo, y la importación automática no está optimizada para ello; puede producir resultados inesperados.",
+    "nsfw_detected": "Se detectaron {match_count} coincidencia(s) de palabras clave en {morph_count} nombre(s) de shapekey/morph.",
+    "nsfw_continue_full": "Si desea continuar, se recomienda el flujo manual paso a paso en lugar del portado automático de un clic.",
+    "nsfw_continue_manual": "Si desea continuar, revise cuidadosamente cada paso posterior y priorice las correcciones manuales.",
+    "matched_keyword_hints": "Pistas de palabras clave coincidentes: {keywords}",
+    "matched_keyword_hints_more": "Pistas de palabras clave coincidentes: {keywords}, y {more_count} más",
+    "other_warnings": "Otras advertencias de precomprobación:",
+    "proceed_anyway": "Continuar de todos modos",
+    "import_cancelled_before_blender": "Importación cancelada antes de iniciar Blender.",
+    "warning_label": "Advertencias:",
+    "no_warnings": "No hay advertencias de precomprobación.",
+    "warning_missing_skeleton_groups": "Faltan grupos esperados del esqueleto humanoide MMD: {groups}",
+    "warning_no_native_textures": "No se encontraron archivos de textura nativos en la carpeta del modelo seleccionado.",
+    "warning_unresolved_texture_refs": "No se pudieron resolver {count} referencia(s) de textura PMX: {refs}",
+    "warning_unresolved_texture_refs_more": "No se pudieron resolver {count} referencia(s) de textura PMX: {refs}, y {more_count} más",
+    "warning_high_vertex_count": "Recuento alto de vértices: {count} vértices; el trabajo de Source/GMod puede ser lento.",
+    "warning_high_morph_count": "Recuento alto de morphs/shapekeys: {count}; el trabajo posterior de Flex puede ser lento.",
+    "warning_nsfw_summary": "Se detectaron nombres de shapekeys potencialmente NSFW: {match_count} coincidencia(s) en {morph_count} morph(s). La importación automática no está optimizada para este tipo de modelo.",
+    "warning_high_texture_count": "Recuento alto de texturas PMX nativas: {count}; el trabajo de materiales puede ser lento."
+  },
+  "runtime_diagnostics": {
+    "dll_init_failed": "Error de Windows 0xC0000142 (STATUS_DLL_INIT_FAILED): {subject} o uno de sus componentes DLL/aplicación falló durante la inicialización.",
+    "environment_issue": "Normalmente es un problema del entorno Windows/runtime, no un error de importación del modelo.",
+    "suggested_fixes": "Soluciones sugeridas:",
+    "vc_redist": "1. Instale o reinstale Microsoft Visual C++ Redistributable 2015-2022 x64.",
+    "antivirus": "2. Añada MMD Character Importer y Blender a la lista blanca del antivirus/software de seguridad.",
+    "gpu_driver": "3. Actualice el controlador de la GPU desde el sitio del fabricante.",
+    "resources": "4. Asegúrese de tener al menos 1 GiB de almacenamiento libre y 2.5 GiB de memoria disponible."
   }
 }
