@@ -560,7 +560,8 @@ if CLIENT then
         button:SetTextColor(textColor)
         button.Paint = function(self, width, height)
             local bg = accent
-            if not self:IsEnabled() then
+            local disabled = self.GetDisabled and self:GetDisabled() or false
+            if disabled then
                 bg = Color(80, 80, 80)
             elseif self.Depressed then
                 bg = Color(math.max(accent.r - 38, 0), math.max(accent.g - 38, 0), math.max(accent.b - 38, 0), accent.a)

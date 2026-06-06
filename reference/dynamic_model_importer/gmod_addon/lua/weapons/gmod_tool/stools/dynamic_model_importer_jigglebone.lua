@@ -161,9 +161,12 @@ end
 
 if CLIENT then
     function TOOL.BuildCPanel(panel)
+        local UI = DynamicModelImporter.UI
         panel:AddControl("Header", {
             Description = L("Right-click an NPC, ragdoll, or player to select its model. Left-click toggles all jigglebones.")
         })
+
+        UI.AddSection(panel, "1. Select Target", "Right-click an NPC, ragdoll, or player. Saved jigglebone overrides apply to every entity using that model path.", UI.Colors.Green)
 
         local state = {
             model_path = DynamicModelImporter.NormalizeOverrideModelPath(read_convar_string("dynamic_model_importer_jigglebone_model_path", "")),
@@ -175,11 +178,13 @@ if CLIENT then
         local status = vgui.Create("DLabel")
         status:SetWrap(true)
         status:SetAutoStretchVertical(true)
-        status:SetTextColor(color_white)
+        status:SetTextColor(UI.Colors.Muted)
         panel:AddItem(status)
 
         local selected = panel:TextEntry(L("Selected model path"), "dynamic_model_importer_jigglebone_model_path")
         selected:SetEditable(false)
+
+        UI.AddSection(panel, "2. Bone Table", "Disabled jigglebones are marked in red. Left-click in the world toggles all jigglebones for the selected model.", UI.Colors.Blue)
 
         local boneList = vgui.Create("DListView")
         boneList:SetTall(260)
@@ -187,12 +192,18 @@ if CLIENT then
         boneList:AddColumn(L("Index"))
         boneList:AddColumn(L("Bone"))
         boneList:AddColumn(L("No jiggle"))
-        panel:AddItem(boneList)
+        panel:AddItem(UI.StyleList(boneList))
+
+        UI.AddSection(panel, "3. Jigglebone Actions", "Use selected-bone actions for precise fixes, or bulk actions when the model should have no jiggle at all.", UI.Colors.Orange)
 
         local disableBoneButton = panel:Button(L("Disable selected bone jiggle"))
         local restoreBoneButton = panel:Button(L("Restore selected bone jiggle"))
         local disableAllButton = panel:Button(L("Disable all jiggle"))
         local restoreAllButton = panel:Button(L("Restore all jiggle"))
+        UI.StyleButton(disableBoneButton, UI.Colors.Orange)
+        UI.StyleButton(restoreBoneButton, UI.Colors.Green)
+        UI.StyleButton(disableAllButton, UI.Colors.Red)
+        UI.StyleButton(restoreAllButton, UI.Colors.Blue)
 
         local function set_status(text)
             if IsValid(status) then status:SetText(L(text or "")) end
@@ -210,8 +221,16 @@ if CLIENT then
         local function populate_bones()
             boneList:Clear()
             for _, boneInfo in ipairs(state.bones) do
-                local line = boneList:AddLine(tostring(boneInfo.index), boneInfo.name, bone_disabled(boneInfo.name) and L("yes") or L("no"))
+                local disabled = bone_disabled(boneInfo.name)
+                local line = boneList:AddLine(tostring(boneInfo.index), boneInfo.name, disabled and L("yes") or L("no"))
                 line.BoneName = boneInfo.name
+                if disabled then
+                    for _, column in pairs(line.Columns or {}) do
+                        if IsValid(column) and column.SetTextColor then
+                            column:SetTextColor(UI.Colors.Red)
+                        end
+                    end
+                end
             end
         end
 
