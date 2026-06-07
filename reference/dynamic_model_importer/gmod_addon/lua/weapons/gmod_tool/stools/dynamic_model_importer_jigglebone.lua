@@ -62,6 +62,35 @@ if CLIENT then
 end
 
 if CLIENT then
+    local function valid_bone_name(name)
+        name = tostring(name or "")
+        if name == "" then return false end
+        return not string.find(string.upper(name), "INVALIDBONE", 1, true)
+    end
+
+    local function prime_bone_entity(ent)
+        if not IsValid(ent) then return end
+        if ent.InvalidateBoneCache then pcall(function() ent:InvalidateBoneCache() end) end
+        if ent.SetupBones then pcall(function() ent:SetupBones() end) end
+    end
+
+    local function collect_bone_infos(ent)
+        if not IsValid(ent) or not ent.GetBoneCount or not ent.GetBoneName then return {}, 0 end
+        prime_bone_entity(ent)
+        local boneCount = ent:GetBoneCount() or 0
+        local bones = {}
+        for index = 0, math.max(boneCount - 1, -1) do
+            local name = tostring(ent:GetBoneName(index) or "")
+            if valid_bone_name(name) then
+                bones[#bones + 1] = {
+                    index = index,
+                    name = name,
+                }
+            end
+        end
+        return bones, boneCount
+    end
+
     function request_override(modelPath)
         modelPath = DynamicModelImporter.NormalizeOverrideModelPath(modelPath)
         if not modelPath then return end
@@ -93,7 +122,9 @@ if CLIENT then
     end
 
     function TOOL:RightClick(trace)
-        local modelPath = DynamicModelImporter.EntityModelPath(get_target(trace, LocalPlayer()))
+        local target = get_target(trace, LocalPlayer())
+        local modelPath = DynamicModelImporter.EntityModelPath(target)
+        DynamicModelImporter.LastJiggleboneTargetEntity = IsValid(target) and target or nil
         if modelPath then select_model_path(modelPath) end
         return true
     end
@@ -174,6 +205,7 @@ if CLIENT then
             bones = {},
             override = DynamicModelImporter.EmptyModelOverride(),
         }
+        local inspectAttempt = 0
 
         local status = vgui.Create("DLabel")
         status:SetWrap(true)
@@ -235,35 +267,65 @@ if CLIENT then
         end
 
         local function inspect_model()
-            cleanup_preview()
             state.bones = {}
+            inspectAttempt = inspectAttempt + 1
             if not state.model_path then
                 set_status("Select a model by right-clicking an NPC, ragdoll, or player.")
                 populate_bones()
                 return
             end
-            local model = ClientsideModel(state.model_path, RENDERGROUP_OTHER)
+
+            local liveTarget = DynamicModelImporter.LastJiggleboneTargetEntity
+            if DynamicModelImporter.EntityModelPath(liveTarget) == state.model_path then
+                state.bones = collect_bone_infos(liveTarget)
+                if #state.bones > 0 then
+                    populate_bones()
+                    set_status("Loaded repair settings.")
+                    return
+                end
+            end
+
+            local model = state.preview
+            if IsValid(model) and model.DynamicModelImporterModelPath ~= state.model_path then
+                cleanup_preview()
+                model = nil
+            end
+            if not IsValid(model) then
+                model = ClientsideModel(state.model_path, RENDERGROUP_OTHER)
+            end
             if not IsValid(model) then
                 set_status(string.format(L("Could not inspect model: %s"), state.model_path))
                 populate_bones()
                 return
             end
             model:SetNoDraw(true)
+            if model.SetLOD then pcall(function() model:SetLOD(0) end) end
+            model.DynamicModelImporterModelPath = state.model_path
             state.preview = model
-            local boneCount = model:GetBoneCount() or 0
-            for index = 0, math.max(boneCount - 1, -1) do
-                state.bones[#state.bones + 1] = {
-                    index = index,
-                    name = tostring(model:GetBoneName(index) or ("bone_" .. index)),
-                }
+            local bones, boneCount = collect_bone_infos(model)
+            state.bones = bones
+            if #state.bones <= 0 and boneCount > 0 and inspectAttempt < 8 then
+                populate_bones()
+                set_status("")
+                timer.Simple(0.1, function()
+                    if not IsValid(panel) or state.model_path ~= DynamicModelImporter.NormalizeOverrideModelPath(read_convar_string("dynamic_model_importer_jigglebone_model_path", "")) then return end
+                    inspect_model()
+                end)
+                return
             end
             populate_bones()
-            set_status("Loaded repair settings.")
+            if #state.bones > 0 then
+                set_status("Loaded repair settings.")
+            else
+                set_status(string.format(L("Could not inspect model: %s"), state.model_path))
+            end
         end
 
         local function load_model_path(modelPath)
             modelPath = DynamicModelImporter.NormalizeOverrideModelPath(modelPath)
             if not modelPath then return end
+            inspectAttempt = 0
+            cleanup_preview()
             state.model_path = modelPath
             state.override = copy_model_override((DynamicModelImporter.LastModelOverrides or {})[modelPath])
             RunConsoleCommand("dynamic_model_importer_jigglebone_model_path", modelPath)
