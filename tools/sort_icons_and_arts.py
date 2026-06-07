@@ -41,6 +41,18 @@ def configure_text_streams() -> None:
                 pass
 
 
+def hidden_subprocess_kwargs() -> dict[str, object]:
+    if os.name != "nt":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+    startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+    return {
+        "startupinfo": startupinfo,
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=["analyze", "process"], required=True)
@@ -351,6 +363,7 @@ def convert_to_vtf(vtfcmd: Path, image_path: Path, output_dir: Path) -> Path:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             cwd=str(vtfcmd.parent),
+            **hidden_subprocess_kwargs(),
         )
         if completed.returncode != 0:
             raise RuntimeError(f"VTFCmd failed for {image_path.name}: {completed.stdout}")

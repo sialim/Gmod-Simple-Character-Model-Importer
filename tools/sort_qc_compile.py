@@ -39,6 +39,7 @@ MISSING_PARENT_RE = re.compile(
 DEFINEBONE_RE = re.compile(
     r'^\s*\$definebone\s+"(?P<name>[^"]+)"\s+"(?P<parent>[^"]*)"\s+(?P<rest>.*?)\s*$'
 )
+BAD_OPEN_BRACE_RE = re.compile(r"\((?P<line>\d+)\):\s*-\s*bad command\s+\{", re.IGNORECASE)
 
 ESSENTIAL_EXACT = {"ZArmTwist_L", "ZArmTwist_R", "ZHandTwist_L", "ZHandTwist_R", "Eye_L", "Eye_R"}
 PLAYER_ANIMATION_INCLUDES = [
@@ -99,6 +100,26 @@ def emit(message: str) -> None:
 def write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+class StudioMDLCompileError(RuntimeError):
+    def __init__(self, qc_path: Path, log_path: Path, output: str) -> None:
+        self.qc_path = qc_path
+        self.log_path = log_path
+        self.output = output
+        super().__init__(f"StudioMDL failed for {qc_path.name}; see {log_path}")
+
+
+def hidden_subprocess_kwargs() -> dict[str, object]:
+    if os.name != "nt":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+    startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+    return {
+        "startupinfo": startupinfo,
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    }
 
 
 def path_is_ascii(path: Path | str) -> bool:
@@ -1554,6 +1575,28 @@ STANDARD_PHYSICS_QC_LINES = [
 ]
 
 
+QC_BLOCK_COMMANDS_WITH_SEPARATE_OPEN_BRACE = (
+    "$collisionjoints",
+    "$collisionmodel",
+)
+
+
+def split_inline_qc_block_opening_braces(lines: list[str]) -> list[str]:
+    normalized: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        lower = stripped.lower()
+        uses_collision_block = any(
+            lower.startswith(command) for command in QC_BLOCK_COMMANDS_WITH_SEPARATE_OPEN_BRACE
+        )
+        if uses_collision_block and stripped.endswith("{"):
+            normalized.append(line.rstrip("\r\n").rstrip()[:-1].rstrip() + "\n")
+            normalized.append("{\n")
+            continue
+        normalized.append(line)
+    return normalized
+
+
 def normalize_qc_line_list(raw_lines: object) -> list[str]:
     if not isinstance(raw_lines, list):
         return []
@@ -1563,7 +1606,7 @@ def normalize_qc_line_list(raw_lines: object) -> list[str]:
         if not text:
             continue
         lines.append(text if text.endswith("\n") else text + "\n")
-    return lines
+    return split_inline_qc_block_opening_braces(lines)
 
 
 def collision_qc_block(plan: dict[str, Any]) -> list[str]:
@@ -1572,8 +1615,12 @@ def collision_qc_block(plan: dict[str, Any]) -> list[str]:
     # $concaveperjoint because StudioMDL collapses these thin Physics meshes
     # into a bad single convex hull when that option is present.
     inputs = plan.get("inputs", {}) if isinstance(plan.get("inputs"), dict) else {}
-    physics_settings_path = Path(str(inputs.get("step8_physics_settings") or ""))
-    if physics_settings_path.exists():
+    physics_settings_value = str(inputs.get("step8_physics_settings") or "").strip()
+    if physics_settings_value:
+        physics_settings_path = Path(physics_settings_value)
+    else:
+        physics_settings_path = None
+    if physics_settings_path and physics_settings_path.exists():
         try:
             settings = json.loads(physics_settings_path.read_text(encoding="utf-8"))
             dynamic_lines = normalize_qc_line_list(settings.get("collision_qc_lines") if isinstance(settings, dict) else [])
@@ -1599,6 +1646,7 @@ def run_command(command: list[str], log_path: Path, cwd: Path | None = None) -> 
         errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        **hidden_subprocess_kwargs(),
     )
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text(completed.stdout or "", encoding="utf-8")
@@ -2010,6 +2058,7 @@ def convert_one_vtf(vtfcmd: Path, image_path: Path, output_dir: Path) -> Path:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         cwd=str(vtfcmd.parent),
+        **hidden_subprocess_kwargs(),
     )
     if completed.returncode != 0:
         raise RuntimeError(f"VTFCmd failed for {image_path.name}: {completed.stdout}")
@@ -2269,8 +2318,61 @@ def write_dynamic_model_importer_manifest(plan: dict[str, Any], addon_dir: Path,
 def compile_one(studiomdl: Path, game_dir: Path, qc_path: Path, log_path: Path) -> str:
     code, output = run_command([str(studiomdl), "-game", str(game_dir), "-nop4", "-verbose", str(qc_path)], log_path, cwd=qc_path.parent)
     if code != 0:
-        raise RuntimeError(f"StudioMDL failed for {qc_path.name}; see {log_path}")
+        raise StudioMDLCompileError(qc_path, log_path, output)
     return output
+
+
+def is_collision_block_parser_failure(error: StudioMDLCompileError) -> bool:
+    try:
+        qc_lines = error.qc_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        qc_lines = []
+    for match in BAD_OPEN_BRACE_RE.finditer(error.output or ""):
+        try:
+            line_number = int(match.group("line"))
+        except ValueError:
+            continue
+        candidates = []
+        if 1 <= line_number <= len(qc_lines):
+            candidates.append(qc_lines[line_number - 1].strip().lower())
+        if 1 < line_number <= len(qc_lines):
+            candidates.append(qc_lines[line_number - 2].strip().lower())
+        for candidate in candidates:
+            if any(candidate.startswith(command) for command in QC_BLOCK_COMMANDS_WITH_SEPARATE_OPEN_BRACE):
+                return True
+    return False
+
+
+def fallback_gmod_compile_candidates(gmod: dict[str, Any]) -> list[dict[str, str]]:
+    current_install = Path(str(gmod.get("install_root") or ""))
+    current_studiomdl = Path(str(gmod.get("studiomdl_path") or ""))
+    roots: list[Path] = []
+    if current_install:
+        roots.append(current_install.parent / "GarrysMod")
+    for library in steam_library_roots():
+        roots.append(library / "steamapps" / "common" / "GarrysMod")
+    roots.append(Path(r"C:\Program Files (x86)\Steam\steamapps\common\GarrysMod"))
+
+    seen: set[str] = set()
+    candidates: list[dict[str, str]] = []
+    for root in roots:
+        try:
+            resolved_root = root.resolve()
+        except Exception:
+            resolved_root = root
+        key = str(resolved_root).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        hit = validate_gmod_root(resolved_root)
+        if not hit:
+            continue
+        candidate_studiomdl = Path(str(hit.get("studiomdl_path") or ""))
+        if current_studiomdl and same_resolved_path(candidate_studiomdl, current_studiomdl):
+            continue
+        hit["source"] = "collision_compile_fallback"
+        candidates.append(hit)
+    return candidates
 
 
 def clean_expected_compiled(game_dir: Path, author: str, category: str, stems: list[str]) -> None:
@@ -2448,6 +2550,8 @@ def compose(plan_path: Path) -> dict[str, Any]:
     gmod = plan["gmod"]
     studiomdl = Path(str(gmod["studiomdl_path"]))
     game_dir = Path(str(gmod["game_dir"]))
+    compile_studiomdl = studiomdl
+    compile_game_dir = game_dir
     author = str(plan["author"])
     category = str(plan["character_category"])
     model = str(plan["model_name"])
@@ -2507,7 +2611,7 @@ def compose(plan_path: Path) -> dict[str, Any]:
 
     def compile_with_definebone_repair(label: str, qc_path: Path, log_path: Path) -> tuple[str, bool]:
         nonlocal definebones, carms_qc, definebone_support_bones
-        output = compile_one(studiomdl, game_dir, qc_path, log_path)
+        output = compile_one(compile_studiomdl, compile_game_dir, qc_path, log_path)
         missing, warning_lines = parse_missing_parent_warnings(output)
         if not missing:
             return output, False
@@ -2525,7 +2629,7 @@ def compose(plan_path: Path) -> dict[str, Any]:
         refresh_jiggle_outputs()
         carms_qc = refresh_compile_qcs()
         retry_log = log_path.with_name(f"{log_path.stem}_retry{log_path.suffix}")
-        retry_output = compile_one(studiomdl, game_dir, qc_path, retry_log)
+        retry_output = compile_one(compile_studiomdl, compile_game_dir, qc_path, retry_log)
         retry_missing, retry_warnings = parse_missing_parent_warnings(retry_output)
         if retry_missing:
             missing_text = ", ".join(sorted(retry_missing, key=natural_key))
@@ -2540,23 +2644,76 @@ def compose(plan_path: Path) -> dict[str, Any]:
     stems = [model, f"{model}_pm"]
     if carms_qc:
         stems.append(f"{model}_arms")
-    clean_expected_compiled(game_dir, author, category, stems)
-    emit("Compiling main model.")
-    _main_output, main_repaired = compile_with_definebone_repair("main", main_qc, qc_dir / "compile_main.log")
-    emit("Compiling player model.")
-    _pm_output, pm_repaired = compile_with_definebone_repair("player", pm_qc, qc_dir / "compile_pm.log")
-    if pm_repaired:
-        emit("Recompiling main model after player-model definebone repair.")
-        _main_output, _main_repaired_after_pm = compile_with_definebone_repair("main_after_player_repair", main_qc, qc_dir / "compile_main_after_definebone_repair.log")
-    if carms_qc:
-        emit("Compiling c_arms model.")
-        _carms_output, carms_repaired = compile_with_definebone_repair("carms", carms_qc, qc_dir / "compile_carms.log")
-        if carms_repaired:
-            emit("Recompiling main and player models after c_arms definebone repair.")
-            _main_output, _ = compile_with_definebone_repair("main_after_carms_repair", main_qc, qc_dir / "compile_main_after_carms_definebone_repair.log")
-            _pm_output, _ = compile_with_definebone_repair("player_after_carms_repair", pm_qc, qc_dir / "compile_pm_after_carms_definebone_repair.log")
-    else:
+
+    def compile_log_path(stem: str, suffix: str = "") -> Path:
+        suffix_text = f"_{suffix}" if suffix else ""
+        return qc_dir / f"{stem}{suffix_text}.log"
+
+    def compile_all_models(log_suffix: str = "") -> None:
+        emit("Compiling main model.")
+        _main_output, main_repaired = compile_with_definebone_repair(
+            f"main{('_' + log_suffix) if log_suffix else ''}",
+            main_qc,
+            compile_log_path("compile_main", log_suffix),
+        )
+        emit("Compiling player model.")
+        _pm_output, pm_repaired = compile_with_definebone_repair(
+            f"player{('_' + log_suffix) if log_suffix else ''}",
+            pm_qc,
+            compile_log_path("compile_pm", log_suffix),
+        )
+        if pm_repaired:
+            emit("Recompiling main model after player-model definebone repair.")
+            _main_output, _main_repaired_after_pm = compile_with_definebone_repair(
+                f"main_after_player_repair{('_' + log_suffix) if log_suffix else ''}",
+                main_qc,
+                compile_log_path("compile_main_after_definebone_repair", log_suffix),
+            )
+        if carms_qc:
+            emit("Compiling c_arms model.")
+            _carms_output, carms_repaired = compile_with_definebone_repair(
+                f"carms{('_' + log_suffix) if log_suffix else ''}",
+                carms_qc,
+                compile_log_path("compile_carms", log_suffix),
+            )
+            if carms_repaired:
+                emit("Recompiling main and player models after c_arms definebone repair.")
+                _main_output, _ = compile_with_definebone_repair(
+                    f"main_after_carms_repair{('_' + log_suffix) if log_suffix else ''}",
+                    main_qc,
+                    compile_log_path("compile_main_after_carms_definebone_repair", log_suffix),
+                )
+                _pm_output, _ = compile_with_definebone_repair(
+                    f"player_after_carms_repair{('_' + log_suffix) if log_suffix else ''}",
+                    pm_qc,
+                    compile_log_path("compile_pm_after_carms_definebone_repair", log_suffix),
+                )
+
+    if not carms_qc:
         warnings.append("Step 10 c_arms output was not found; c_arms QC and Lua hands registration were skipped.")
+    clean_expected_compiled(compile_game_dir, author, category, stems)
+    try:
+        compile_all_models()
+    except StudioMDLCompileError as exc:
+        if not is_collision_block_parser_failure(exc):
+            raise
+        fallback_candidates = fallback_gmod_compile_candidates(gmod)
+        if not fallback_candidates:
+            raise RuntimeError(
+                "The selected StudioMDL rejected the physics collision block, and no standard Garry's Mod "
+                f"StudioMDL fallback was found. See {exc.log_path}"
+            ) from exc
+        fallback = fallback_candidates[0]
+        compile_studiomdl = Path(str(fallback["studiomdl_path"]))
+        compile_game_dir = Path(str(fallback["game_dir"]))
+        warning = (
+            "Selected StudioMDL rejected the physics collision block; retrying Step 14 compile with standard "
+            f"Garry's Mod StudioMDL: {compile_studiomdl}"
+        )
+        warnings.append(warning)
+        emit("WARNING: " + warning)
+        clean_expected_compiled(compile_game_dir, author, category, stems)
+        compile_all_models("fallback")
     write_definebone_repair_report(qc_dir, definebone_repair_reports)
 
     emit("Composing final addon folder.")
@@ -2570,7 +2727,7 @@ def compose(plan_path: Path) -> dict[str, Any]:
             generated_files.append(folder_row(compile_source_copy_dir, "qc_compile_source"))
     except Exception as exc:
         errors.append(f"Failed to copy QC compile source folder: {exc}")
-    compiled_files, compiled_errors = copy_compiled_outputs(game_dir, addon_dir, author, category, stems)
+    compiled_files, compiled_errors = copy_compiled_outputs(compile_game_dir, addon_dir, author, category, stems)
     generated_files.extend(compiled_files)
     errors.extend(compiled_errors)
     material_files, material_warnings, material_errors = compose_materials(plan, addon_dir)

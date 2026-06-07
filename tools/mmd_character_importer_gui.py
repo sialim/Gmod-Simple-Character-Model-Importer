@@ -747,7 +747,7 @@ class SortBonesManualMergeWorker(QtCore.QThread):
             setup = core.ensure_portable_blender(self._log)
             self._log(f"Opening Blender for manual bone merge: {manual_path}")
             self._log("Waiting for Blender to close before re-analyzing manually merged bones.")
-            self.process = subprocess.Popen([str(setup.blender_exe), str(manual_path)])
+            self.process = subprocess.Popen([str(setup.blender_exe), str(manual_path)], **core.hidden_subprocess_kwargs())
             while True:
                 return_code = self.process.poll()
                 if return_code is not None:
@@ -1128,7 +1128,7 @@ class BodygroupManualEditWorker(QtCore.QThread):
             setup = core.ensure_portable_blender(self._log)
             self.log.emit(f"Opening Blender for manual bodygroup edit: {manual_path}")
             self.log.emit("Waiting for Blender to close before validating manual bodygroups.")
-            self.process = subprocess.Popen([str(setup.blender_exe), str(manual_path)])
+            self.process = subprocess.Popen([str(setup.blender_exe), str(manual_path)], **core.hidden_subprocess_kwargs())
             return_code = self.process.wait()
             self.process = None
             if self.cancel_requested:

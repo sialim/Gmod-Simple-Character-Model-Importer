@@ -15,6 +15,18 @@ from pathlib import Path
 import bpy
 
 
+def hidden_subprocess_kwargs() -> dict[str, object]:
+    if os.name != "nt":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+    startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+    return {
+        "startupinfo": startupinfo,
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     argv = sys.argv
     if "--" in argv:
@@ -439,8 +451,8 @@ def ensure_pillow(check_only: bool) -> None:
         return
     try:
         print("Installing Pillow for Blender's Python environment.")
-        subprocess.run([sys.executable, "-m", "ensurepip", "--upgrade"], check=False)
-        subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "Pillow"], check=True)
+        subprocess.run([sys.executable, "-m", "ensurepip", "--upgrade"], check=False, **hidden_subprocess_kwargs())
+        subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "Pillow"], check=True, **hidden_subprocess_kwargs())
     except Exception as exc:
         print(f"Warning: Pillow install failed; Material Combiner may be unavailable: {exc}")
         return
@@ -464,7 +476,7 @@ def ensure_sklearn(check_only: bool) -> None:
         return
     try:
         print("Installing scikit-learn for Blender's Python environment.")
-        subprocess.run([sys.executable, "-m", "ensurepip", "--upgrade"], check=False)
+        subprocess.run([sys.executable, "-m", "ensurepip", "--upgrade"], check=False, **hidden_subprocess_kwargs())
         env = dict(os.environ)
         env["PYTHONNOUSERSITE"] = "1"
         subprocess.run(
@@ -482,6 +494,7 @@ def ensure_sklearn(check_only: bool) -> None:
             ],
             check=True,
             env=env,
+            **hidden_subprocess_kwargs(),
         )
     except Exception as exc:
         print(f"Warning: scikit-learn install failed; Step 6 will use fallback clustering: {exc}")

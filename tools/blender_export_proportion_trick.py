@@ -34,6 +34,18 @@ def log(message: str) -> None:
     print(f"[Step9 Proportion] {message}", flush=True)
 
 
+def hidden_subprocess_kwargs() -> dict[str, object]:
+    if sys.platform != "win32":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+    startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+    return {
+        "startupinfo": startupinfo,
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    }
+
+
 def is_essential_bone(name: str) -> bool:
     return name.startswith("ValveBiped") or name in PROTECTED_EXTRA_BONES
 
@@ -828,6 +840,7 @@ def run_fresh_session_verification(processed_blend: Path, workspace_dir: Path) -
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         check=False,
+        **hidden_subprocess_kwargs(),
     )
     verify_log.write_text(completed.stdout or "", encoding="utf-8")
     if completed.returncode != 0:
