@@ -2383,6 +2383,20 @@ def analyze_scene(
         "splits": plan_splits,
         "warnings": [],
     }
+    name_repairs = repair_plan_bodygroup_names(plan)
+    if name_repairs:
+        repair_by_uid = {str(item.get("uid") or ""): str(item.get("new_name") or "") for item in name_repairs}
+        for candidate in split_candidates:
+            if isinstance(candidate, dict):
+                uid = str(candidate.get("uid") or "")
+                if uid in repair_by_uid and repair_by_uid[uid]:
+                    candidate["proposed_name"] = repair_by_uid[uid]
+        warning = f"Adjusted {len(name_repairs)} duplicate or unsafe bodygroup name(s)."
+        warnings.append(warning)
+        plan["warnings"] = [warning]
+        plan["name_repairs"] = name_repairs
+        analysis["warnings"] = warnings
+        analysis["name_repairs"] = name_repairs
     return analysis, plan
 
 
@@ -2396,6 +2410,26 @@ def source_objects_by_uid(sources: list[dict[str, object]]) -> dict[str, list[bp
                 objects.append(obj)
         out[str(entry.get("uid") or "")] = objects
     return out
+
+
+def live_mesh_object_name(obj: bpy.types.Object | None) -> str:
+    try:
+        if obj is None or obj.type != "MESH":
+            return ""
+        name = str(obj.name)
+        if name not in bpy.data.objects:
+            return ""
+        return name
+    except ReferenceError:
+        return ""
+
+
+def live_mesh_objects(objects: Iterable[bpy.types.Object]) -> list[bpy.types.Object]:
+    return [obj for obj in objects if live_mesh_object_name(obj)]
+
+
+def live_mesh_object_names(objects: Iterable[bpy.types.Object]) -> list[str]:
+    return [name for obj in objects if (name := live_mesh_object_name(obj))]
 
 
 def vertex_indices_for_group(obj: bpy.types.Object, group_name: str) -> set[int]:
@@ -2521,7 +2555,7 @@ def apply_component_splits(plan: dict[str, object], source_map: dict[str, list[b
     temp_groups: list[tuple[bpy.types.Object, str, dict[str, object]]] = []
     try:
         for source_uid_value, specs in specs_by_source.items():
-            objects = [obj for obj in source_map.get(source_uid_value, []) if obj.name in bpy.data.objects and obj.type == "MESH"]
+            objects = live_mesh_objects(source_map.get(source_uid_value, []))
             for obj in objects:
                 for index, spec in enumerate(specs, start=1):
                     component_ids = {int(value) for value in spec.get("component_ids", []) if str(value).isdigit()}
@@ -2548,23 +2582,24 @@ def apply_component_splits(plan: dict[str, object], source_map: dict[str, list[b
                     if selected_count:
                         temp_groups.append((obj, temp_name, spec))
         for obj, temp_name, spec in temp_groups:
-            if obj.name not in bpy.data.objects:
+            if not live_mesh_object_name(obj):
                 continue
             new_uid = str(spec.get("new_uid") or "")
             new_name = stripped_safe_name(str(spec.get("proposed_name") or new_uid)) or new_uid
             split_objects = split_object_by_vertex_group(obj, temp_name, new_name)
             if split_objects:
+                split_objects = live_mesh_objects(split_objects)
                 created.setdefault(new_uid, []).extend(split_objects)
-                split_names = {item.name for item in split_objects}
+                split_names = set(live_mesh_object_names(split_objects))
                 source_uid_value = str(spec.get("source_uid") or "")
                 source_map[source_uid_value] = [
                     item
-                    for item in source_map.get(source_uid_value, [])
-                    if item.name not in split_names
+                    for item in live_mesh_objects(source_map.get(source_uid_value, []))
+                    if live_mesh_object_name(item) not in split_names
                 ]
             for report in reports:
                 if report.get("new_uid") == new_uid:
-                    report["created_objects"] = [item.name for item in split_objects]
+                    report["created_objects"] = live_mesh_object_names(split_objects)
                     break
     finally:
         remove_temp_split_groups()
@@ -2588,29 +2623,36 @@ def apply_splits(plan: dict[str, object], groups: list[dict[str, object]], sourc
             continue
         name = stripped_safe_name(str(split.get("proposed_name") or new_uid)) or new_uid
         source_group = group_by_uid.get(source_group_uid, {})
-        objects = [obj for source_uid in source_group.get("source_uids", []) for obj in source_map.get(str(source_uid), [])]
+        objects = [
+            obj
+            for source_uid in source_group.get("source_uids", [])
+            for obj in live_mesh_objects(source_map.get(str(source_uid), []))
+        ]
         split_objects: list[bpy.types.Object] = []
         for obj in list(objects):
+            if not live_mesh_object_name(obj):
+                continue
             split_objects.extend(split_object_by_vertex_group(obj, vertex_group, name))
+        split_objects = live_mesh_objects(split_objects)
         if split_objects:
             created[new_uid] = split_objects
-            split_object_ids = {obj.name for obj in split_objects}
+            split_object_ids = set(live_mesh_object_names(split_objects))
             for source_uid in source_group.get("source_uids", []):
                 source_uid = str(source_uid)
                 source_map[source_uid] = [
                     obj
-                    for obj in source_map.get(source_uid, [])
-                    if obj.name not in split_object_ids
+                    for obj in live_mesh_objects(source_map.get(source_uid, []))
+                    if live_mesh_object_name(obj) not in split_object_ids
                 ]
         reports.append(
             {
                 "source_bodygroup_uid": source_group_uid,
                 "vertex_group": vertex_group,
                 "new_uid": new_uid,
-                "created_objects": [obj.name for obj in split_objects],
+                "created_objects": live_mesh_object_names(split_objects),
             }
         )
-    source_map.update(created)
+    source_map.update({uid: live_mesh_objects(objects) for uid, objects in created.items()})
     return {"splits": component_reports + reports, "created_uid_count": len(created)}
 
 
@@ -2633,6 +2675,70 @@ def validate_plan(plan: dict[str, object]) -> list[str]:
     if enabled_count <= 0:
         errors.append("No enabled bodygroups.")
     return errors
+
+
+def repair_plan_bodygroup_names(plan: dict[str, object]) -> list[dict[str, object]]:
+    """Make enabled bodygroup names safe and unique before validation/apply.
+
+    Auto split candidates may be generated after the initial auto bodygroup
+    names are made unique.  This final pass also protects manually edited or
+    stale plans loaded from disk.
+    """
+    repairs: list[dict[str, object]] = []
+    used: set[str] = set()
+    uid_to_name: dict[str, str] = {}
+    groups = plan.get("bodygroups", [])
+    if not isinstance(groups, list):
+        return repairs
+    for index, group in enumerate(groups, start=1):
+        if not isinstance(group, dict) or not group.get("enabled", True):
+            continue
+        original = str(group.get("proposed_name") or group.get("uid") or "").strip()
+        fallback = f"Bodygroup_{index:03d}"
+        candidate = stripped_safe_name(original) or fallback
+        if not SAFE_NAME_RE.fullmatch(candidate):
+            candidate = fallback
+        root = candidate
+        suffix_index = 2
+        while candidate in used:
+            candidate = f"{root}_{suffix_index:02d}"
+            suffix_index += 1
+        used.add(candidate)
+        uid = str(group.get("uid") or "")
+        if uid:
+            uid_to_name[uid] = candidate
+        if candidate != original:
+            group["proposed_name"] = candidate
+            warnings = list(group.get("warnings", [])) if isinstance(group.get("warnings"), list) else []
+            warning = f"Bodygroup name was changed from {original!r} to {candidate!r} to avoid duplicate or unsafe names."
+            if warning not in warnings:
+                warnings.append(warning)
+            group["warnings"] = warnings
+            repairs.append(
+                {
+                    "uid": uid,
+                    "old_name": original,
+                    "new_name": candidate,
+                    "reason": "duplicate_or_unsafe",
+                }
+            )
+    if uid_to_name:
+        for key in ("splits", "split_regions", "split_candidates"):
+            entries = plan.get(key, [])
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                uid = str(entry.get("new_uid") or entry.get("uid") or "")
+                if uid in uid_to_name:
+                    entry["proposed_name"] = uid_to_name[uid]
+    if repairs:
+        existing = plan.get("name_repairs", [])
+        if not isinstance(existing, list):
+            existing = []
+        plan["name_repairs"] = existing + repairs
+    return repairs
 
 
 def join_objects(objects: list[bpy.types.Object], name: str) -> bpy.types.Object | None:
@@ -2743,6 +2849,8 @@ def apply_plan(
 ) -> None:
     started = time.monotonic()
     vertex_limit = max(1, int(vertex_limit or plan.get("vertex_limit") or DEFAULT_SOURCE_VERTEX_LIMIT))
+    repair_plan_bodygroup_names(plan)
+    name_repairs = list(plan.get("name_repairs", [])) if isinstance(plan.get("name_repairs"), list) else []
     errors = validate_plan(plan)
     if errors:
         raise RuntimeError("Bodygroup plan validation failed:\n" + "\n".join(errors))
@@ -2777,7 +2885,7 @@ def apply_plan(
         objects: list[bpy.types.Object] = []
         for source_uid in group.get("source_uids", []):
             objects.extend(source_map.get(str(source_uid), []))
-        objects = [obj for obj in objects if obj not in used_objects and obj.name in bpy.data.objects]
+        objects = [obj for obj in live_mesh_objects(objects) if obj not in used_objects]
         joined = join_objects(objects, name)
         if joined is None:
             continue
@@ -2871,6 +2979,7 @@ def apply_plan(
         "scale": analysis.get("scale", {}),
         "separation": analysis.get("separation", {}),
         "shapekey_prune": analysis.get("shapekey_prune", {}),
+        "name_repairs": name_repairs,
         "auto_split": analysis.get("auto_split", {}),
         "facial_merge": plan.get("facial_merge", analysis.get("facial_merge", {})),
         "vertex_limit": vertex_limit,
