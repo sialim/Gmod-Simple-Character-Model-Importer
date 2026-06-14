@@ -619,13 +619,73 @@ def scan_collision_bones(input_blend: Path) -> dict[str, object]:
     }
 
 
+def branch_parallel_siblings(armature: bpy.types.Object, bone_name: str) -> list[str]:
+    """Bones at the same depth below ``bone_name``'s nearest branching ancestor.
+
+    Walks up to the nearest ancestor with more than one child (the branch point),
+    then descends every *other* child branch the same number of steps to the
+    parallel bone at the matching depth. Mirrors the GUI's
+    ``_collision_branch_parallel_siblings``: for a chain bone whose direct parent
+    already branches this is the plain same-parent siblings; for a deeper chain
+    bone it returns the matching level of each adjacent chain (e.g.
+    Bn_L_Mawei05 -> Bn_Lf/Ll/Lr_Mawei03). Strands shorter than the depth are skipped.
+    """
+    bones = armature.data.bones
+    if bone_name not in bones:
+        return []
+    children_cache: dict[str, list[str]] = {}
+
+    def children_of(name: str) -> list[str]:
+        cached = children_cache.get(name)
+        if cached is None:
+            cached = [bone.name for bone in bones if bone.parent and bone.parent.name == name]
+            children_cache[name] = cached
+        return cached
+
+    node = bone_name
+    depth = 0
+    branch_child = bone_name
+    branch_kids: list[str] = []
+    visited: set[str] = set()
+    while True:
+        bone = bones.get(node)
+        parent = bone.parent.name if (bone is not None and bone.parent) else ""
+        if not parent or parent in visited:
+            return []
+        visited.add(parent)
+        depth += 1
+        kids = children_of(parent)
+        if len(kids) > 1:
+            branch_child = node
+            branch_kids = kids
+            break
+        node = parent
+    result: list[str] = []
+    for child in branch_kids:
+        if child == branch_child:
+            continue
+        cur = child
+        ok = True
+        for _ in range(depth - 1):
+            grandkids = children_of(cur)
+            if not grandkids:
+                ok = False
+                break
+            cur = grandkids[0]
+        if ok and cur != bone_name and cur not in result:
+            result.append(cur)
+    return result
+
+
 def ordered_connected_group(armature: bpy.types.Object, raw_names: Iterable[str]) -> tuple[list[str], list[str]]:
     """Validate a selection-ordered additional collision group.
 
     The first bone is the merge target. Every later bone must be the target's
-    parent, a direct child of an already-accepted bone, or share the target's
-    parent (sibling) — mirroring the interactive rule in the GUI. The returned
-    list preserves selection order so callers can use bones[0] as the target.
+    parent, a direct child of an already-accepted bone, share the target's
+    parent (sibling), or be a parallel-chain sibling of the target at the same
+    depth below their nearest common branch point — mirroring the interactive
+    rule in the GUI. The returned list preserves selection order so callers can
+    use bones[0] as the target.
     """
 
     names = [str(name) for name in raw_names if str(name)]
@@ -647,18 +707,24 @@ def ordered_connected_group(armature: bpy.types.Object, raw_names: Iterable[str]
     target = unique[0]
     target_parent = parent_name(target)
     accepted = [target]
+    # Parallel-chain siblings of every accepted member (grows as bones join), so
+    # a bone may be a parallel sibling of any already-accepted member, not just
+    # the target — mirroring the GUI's collision_group_addition_error.
+    accepted_parallel = set(branch_parallel_siblings(armature, target))
     for name in unique[1:]:
         bone_parent = parent_name(name)
         is_parent_of_target = name == target_parent
         is_child_of_accepted = bool(bone_parent) and bone_parent in accepted
         is_sibling_of_target = bool(target_parent) and bone_parent == target_parent
-        if not (is_parent_of_target or is_child_of_accepted or is_sibling_of_target):
+        is_parallel_sibling = name in accepted_parallel
+        if not (is_parent_of_target or is_child_of_accepted or is_sibling_of_target or is_parallel_sibling):
             errors.append(
                 f"{name} must be the parent of target bone {target}, a direct child of a selected bone, "
-                f"or share a parent with {target}."
+                f"share a parent with {target}, or be a parallel-chain sibling of a selected bone at the same depth."
             )
             continue
         accepted.append(name)
+        accepted_parallel.update(branch_parallel_siblings(armature, name))
     if errors:
         return [], errors
     return accepted, []

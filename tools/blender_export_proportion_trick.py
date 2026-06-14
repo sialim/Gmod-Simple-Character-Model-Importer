@@ -179,61 +179,115 @@ def find_named_mesh(name: str) -> bpy.types.Object | None:
     return None
 
 
-def fix_face_basis_stacking(threshold: float = 1.0e-6, move_step: float = 7.5e-6) -> dict[str, object]:
-    face = find_named_mesh("Face")
-    if face is None:
-        return {"face_object": "", "moved_vertex_count": 0, "duplicate_cluster_count": 0, "warnings": ["Face object not found."]}
+# Coincident flex-vertex separation. MMD morphs routinely duplicate vertices at
+# the exact same position. In Blender the flexes work, but studiomdl WELDS
+# coincident vertices (within its tolerance) when compiling, collapsing the
+# duplicates' distinct flex deltas and breaking the morph in Garry's Mod. We
+# nudge each extra duplicate apart far enough to survive studiomdl's weld and
+# float32, yet well below visible scale.
+#
+# The offset must be SCALE-AWARE: Step 9 runs at Source scale (~64-unit
+# character), where the previous fixed 7.5e-6 nudge was ~1 float32 ULP and far
+# under studiomdl's weld tolerance, so the duplicates merged straight back (the
+# bug). The detection grid stays tight because uniform scaling preserves exact
+# coincidence, so true duplicates always share a bucket.
+COINCIDENT_DETECT_THRESHOLD = 1.0e-6      # detection grid (exact duplicates share a bucket)
+COINCIDENT_OFFSET_FRACTION = 1.5e-4       # separation as a fraction of the model's largest extent
+COINCIDENT_MIN_OFFSET = 5.0e-4            # absolute floor in Source units
 
-    mesh = face.data
-    key_blocks = list(mesh.shape_keys.key_blocks) if mesh.shape_keys else []
-    basis = mesh.shape_keys.key_blocks.get("Basis") if mesh.shape_keys else None
-    if basis is None and key_blocks:
-        basis = key_blocks[0]
 
-    def vertex_co(index: int) -> Vector:
-        if basis is not None:
-            return basis.data[index].co.copy()
-        return mesh.vertices[index].co.copy()
+def model_extent_reference() -> float:
+    """Largest world-space bounding-box dimension across the export meshes.
 
-    buckets: dict[tuple[int, int, int], list[int]] = {}
-    for vertex in mesh.vertices:
-        co = vertex_co(vertex.index)
-        key = (round(co.x / threshold), round(co.y / threshold), round(co.z / threshold))
-        buckets.setdefault(key, []).append(vertex.index)
+    Used to scale the coincident-vertex nudge to the model (Source units at this
+    stage), so the separation is meaningful regardless of the character's size.
+    """
+    lo = [math.inf, math.inf, math.inf]
+    hi = [-math.inf, -math.inf, -math.inf]
+    for obj in visible_export_meshes():
+        matrix = obj.matrix_world
+        for corner in obj.bound_box:
+            world = matrix @ Vector(corner)
+            for axis in range(3):
+                lo[axis] = min(lo[axis], world[axis])
+                hi[axis] = max(hi[axis], world[axis])
+    if not all(math.isfinite(value) for value in lo + hi):
+        return 1.0
+    return max((hi[axis] - lo[axis]) for axis in range(3)) or 1.0
 
-    moved = 0
-    clusters: list[dict[str, object]] = []
+
+def fix_face_basis_stacking(threshold: float = COINCIDENT_DETECT_THRESHOLD) -> dict[str, object]:
+    # Every shapekeyed export mesh is checked, not just "Face": any bodygroup
+    # carrying flex morphs can hold coincident duplicates.
+    meshes = [
+        obj
+        for obj in visible_export_meshes()
+        if obj.data.shape_keys is not None and len(obj.data.shape_keys.key_blocks) > 1
+    ]
+    scale_ref = model_extent_reference()
+    offset = max(COINCIDENT_MIN_OFFSET, scale_ref * COINCIDENT_OFFSET_FRACTION)
+    if not meshes:
+        return {
+            "meshes": [],
+            "scale_reference": round(scale_ref, 4),
+            "offset": round(offset, 8),
+            "moved_vertex_count": 0,
+            "duplicate_cluster_count": 0,
+            "warnings": ["No shapekeyed meshes found."],
+        }
+
+    total_moved = 0
+    total_clusters = 0
     max_movement = 0.0
-    for indices in buckets.values():
-        if len(indices) < 2:
-            continue
-        indices = sorted(indices)
-        cluster_record = {"kept_vertex": indices[0], "moved_vertices": []}
-        for order, vertex_index in enumerate(indices[1:], start=1):
-            angle = order * 2.399963229728653
-            radius = move_step * (1.0 + 0.35 * (order % 5))
-            delta = Vector((math.cos(angle) * radius, math.sin(angle) * radius, move_step * 0.25 * ((order % 3) - 1)))
-            if key_blocks:
+    object_reports: list[dict[str, object]] = []
+    for face in meshes:
+        mesh = face.data
+        key_blocks = list(mesh.shape_keys.key_blocks)
+        basis = mesh.shape_keys.key_blocks.get("Basis") or key_blocks[0]
+
+        buckets: dict[tuple[int, int, int], list[int]] = {}
+        for vertex in mesh.vertices:
+            co = basis.data[vertex.index].co
+            key = (round(co.x / threshold), round(co.y / threshold), round(co.z / threshold))
+            buckets.setdefault(key, []).append(vertex.index)
+
+        moved = 0
+        clusters = 0
+        for indices in buckets.values():
+            if len(indices) < 2:
+                continue
+            indices = sorted(indices)
+            clusters += 1
+            for order, vertex_index in enumerate(indices[1:], start=1):
+                angle = order * 2.399963229728653
+                radius = offset * (1.0 + 0.35 * (order % 5))
+                delta = Vector((math.cos(angle) * radius, math.sin(angle) * radius, offset * 0.25 * ((order % 3) - 1)))
+                # Apply to every shape key so the duplicate stays separated in the
+                # basis AND in all flex frames (keeping the VTA deltas distinct).
                 for key_block in key_blocks:
                     key_block.data[vertex_index].co += delta
-            else:
-                mesh.vertices[vertex_index].co += delta
-            moved += 1
-            max_movement = max(max_movement, float(delta.length))
-            cluster_record["moved_vertices"].append({"index": vertex_index, "offset": [delta.x, delta.y, delta.z]})
-        clusters.append(cluster_record)
+                moved += 1
+                max_movement = max(max_movement, float(delta.length))
+        if moved:
+            mesh.update()
+        total_moved += moved
+        total_clusters += clusters
+        object_reports.append({"object": face.name, "moved_vertex_count": moved, "duplicate_cluster_count": clusters})
 
-    if moved:
-        mesh.update()
-    log(f"Face Basis stacking check moved {moved} duplicate vertex/vertices across {len(clusters)} cluster(s).")
+    log(
+        f"Coincident flex-vertex check moved {total_moved} duplicate vertex/vertices across {total_clusters} "
+        f"cluster(s) in {len(meshes)} shapekeyed mesh(es); offset={offset:.6f} (model extent {scale_ref:.2f})."
+    )
     return {
-        "face_object": face.name,
+        "meshes": [obj.name for obj in meshes],
+        "face_object": next((obj.name for obj in meshes if obj.name == "Face"), meshes[0].name),
+        "scale_reference": round(scale_ref, 4),
         "threshold": threshold,
-        "move_step": move_step,
-        "moved_vertex_count": moved,
-        "duplicate_cluster_count": len(clusters),
-        "max_movement": max_movement,
-        "clusters": clusters[:200],
+        "offset": round(offset, 8),
+        "moved_vertex_count": total_moved,
+        "duplicate_cluster_count": total_clusters,
+        "max_movement": round(max_movement, 8),
+        "objects": object_reports,
     }
 
 

@@ -2238,6 +2238,11 @@ class MaterialPreviewWidget(QOpenGLWidget):
         self._active_flex_uid = ""
         self._active_flex_value = 1.0
         self._isolated_bodygroup = ""
+        # Manual Step 8/14 preview aids (render-only; never mutate plan data).
+        self._bones_on_top = False
+        self._show_bone_labels = False
+        self._front_bodygroup = ""
+        self._constraint_arcs: dict[str, np.ndarray] = {}
         self._scene_center = np.zeros(3, dtype=np.float64)
         self._scene_extent = 1.0
         self._scene_mins = np.zeros(3, dtype=np.float64)
@@ -2583,6 +2588,44 @@ class MaterialPreviewWidget(QOpenGLWidget):
 
     def set_respect_alpha(self, visible: bool) -> None:
         self._respect_alpha = bool(visible)
+        self.update()
+
+    def set_bones_on_top(self, visible: bool) -> None:
+        """Draw the bone skeleton overlay in front of the mesh (manual Step 8)."""
+        self._bones_on_top = bool(visible)
+        self.update()
+
+    def set_bone_labels_visible(self, visible: bool) -> None:
+        """Draw per-bone name labels over the model (manual Step 8)."""
+        self._show_bone_labels = bool(visible)
+        self.update()
+
+    def set_front_bodygroup(self, bodygroup: str) -> None:
+        """Draw one bodygroup in front of everything without hiding the rest.
+
+        Unlike set_isolated_bodygroup (a hard hide used by the flex tab), this
+        keeps the whole character visible and re-draws the named bodygroup last
+        with depth-testing disabled so it pops to the front (manual Step 8).
+        """
+        self._front_bodygroup = str(bodygroup or "")
+        self.update()
+
+    def set_constraint_arcs(self, arcs: dict[str, object] | None) -> None:
+        """Set per-axis rotation-limit arc polylines (world space) for Step 14.
+
+        ``arcs`` maps an axis/label key to an (N,3) array of points drawn as a
+        depth-disabled line strip. Render-only; not added to the scene bounds.
+        """
+        cleaned: dict[str, np.ndarray] = {}
+        if isinstance(arcs, dict):
+            for key, value in arcs.items():
+                try:
+                    array = np.asarray(value, dtype=np.float32)
+                except Exception:
+                    continue
+                if array.ndim == 2 and array.shape[0] >= 2 and array.shape[1] >= 3:
+                    cleaned[str(key)] = array[:, :3].copy()
+        self._constraint_arcs = cleaned
         self.update()
 
     def reset_view(self, direction: str = "Front") -> None:
@@ -3110,8 +3153,10 @@ class MaterialPreviewWidget(QOpenGLWidget):
             GL.glVertexPointer(3, GL.GL_FLOAT, stride, ctypes.c_void_p(base_ptr))
             GL.glDrawArrays(GL.GL_TRIANGLES, 0, int(len(vertex_data)))
             self._gl_debug_error(f"highlight {uid}")
+        self._draw_front_bodygroup_gl(stride)
         self._draw_collision_overlay_gl(stride)
         self._draw_bone_overlay_gl()
+        self._draw_constraint_arcs_gl()
         GL.glLineWidth(1.0)
         GL.glEnable(GL.GL_DEPTH_TEST)
         GL.glPolygonMode(GL.GL_FRONT_AND_BACK, GL.GL_FILL)
@@ -3149,6 +3194,72 @@ class MaterialPreviewWidget(QOpenGLWidget):
         GL.glLineWidth(1.0)
         GL.glEnable(GL.GL_DEPTH_TEST)
 
+    def _material_bodygroup(self, uid: str) -> str:
+        entry = self._materials.get(uid, {})
+        return str(entry.get("bodygroup") or entry.get("material_name") or entry.get("proposed_name") or "")
+
+    def _draw_front_bodygroup_gl(self, stride: int) -> None:
+        """Re-draw one bodygroup last, depth-disabled, so it pops to the front
+        without hiding the rest of the character (manual collision-source hover)."""
+        if not GL or not self._front_bodygroup:
+            return
+        front_uids = [
+            uid
+            for uid in self._material_vertex_data
+            if self._material_bodygroup(uid) == self._front_bodygroup and self._material_visible(uid)
+        ]
+        if not front_uids:
+            return
+        GL.glDisableClientState(GL.GL_TEXTURE_COORD_ARRAY)
+        GL.glDisable(GL.GL_TEXTURE_2D)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+        GL.glDisable(GL.GL_DEPTH_TEST)
+        GL.glPolygonMode(GL.GL_FRONT_AND_BACK, GL.GL_LINE if self._wireframe else GL.GL_FILL)
+        for uid in front_uids:
+            vertex_data = self._material_vertex_data.get(uid)
+            if vertex_data is None or len(vertex_data) < 3:
+                continue
+            red, green, blue, alpha = self._material_rgba(uid, True)
+            GL.glColor4f(red, green, blue, max(0.9, alpha))
+            GL.glVertexPointer(3, GL.GL_FLOAT, stride, ctypes.c_void_p(int(vertex_data.ctypes.data)))
+            GL.glDrawArrays(GL.GL_TRIANGLES, 0, int(len(vertex_data)))
+            self._gl_debug_error(f"front bodygroup {uid}")
+        GL.glPolygonMode(GL.GL_FRONT_AND_BACK, GL.GL_LINE)
+        GL.glEnable(GL.GL_DEPTH_TEST)
+
+    def _draw_constraint_arcs_gl(self) -> None:
+        """Draw Step-14 rotation-limit arcs (and a small axis triad) over the
+        model, depth-disabled, colored per axis (X=red, Y=green, Z=blue)."""
+        if not GL or not self._constraint_arcs:
+            return
+        GL.glDisableClientState(GL.GL_TEXTURE_COORD_ARRAY)
+        GL.glDisable(GL.GL_TEXTURE_2D)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+        GL.glEnableClientState(GL.GL_VERTEX_ARRAY)
+        GL.glPolygonMode(GL.GL_FRONT_AND_BACK, GL.GL_LINE)
+        GL.glDisable(GL.GL_DEPTH_TEST)
+        GL.glLineWidth(2.6)
+        axis_colors = {
+            "x": (1.0, 0.38, 0.36, 1.0),
+            "y": (0.42, 1.0, 0.48, 1.0),
+            "z": (0.45, 0.62, 1.0, 1.0),
+        }
+        for key, arr in self._constraint_arcs.items():
+            if arr is None or len(arr) < 2:
+                continue
+            color = (0.86, 0.88, 0.94, 1.0)
+            lowered = str(key).lower()
+            for prefix, value in axis_colors.items():
+                if lowered.startswith(prefix):
+                    color = value
+                    break
+            GL.glColor4f(*color)
+            # arr is stored as contiguous float32 by set_constraint_arcs.
+            GL.glVertexPointer(3, GL.GL_FLOAT, 0, ctypes.c_void_p(int(arr.ctypes.data)))
+            GL.glDrawArrays(GL.GL_LINE_STRIP, 0, int(len(arr)))
+        GL.glLineWidth(1.0)
+        GL.glEnable(GL.GL_DEPTH_TEST)
+
     def _draw_bone_overlay_gl(self) -> None:
         if not GL or not self._bone_lines:
             return
@@ -3174,7 +3285,11 @@ class MaterialPreviewWidget(QOpenGLWidget):
                 else:
                     GL.glColor4f(1.0, 0.72, 0.05, 1.0)
             else:
-                GL.glEnable(GL.GL_DEPTH_TEST)
+                # Bones-on-top: skip depth so the mesh never hides the skeleton.
+                if self._bones_on_top:
+                    GL.glDisable(GL.GL_DEPTH_TEST)
+                else:
+                    GL.glEnable(GL.GL_DEPTH_TEST)
                 GL.glLineWidth(BONE_OVERLAY_LINE_WIDTH)
                 GL.glPointSize(BONE_OVERLAY_POINT_SIZE)
                 GL.glColor4f(0.78, 0.84, 0.94, 0.86)
@@ -3213,6 +3328,8 @@ class MaterialPreviewWidget(QOpenGLWidget):
             label = self._bone_labels.get(self._hovered_bone_uid, self._hovered_bone_uid)
             suffix = f" | {label}" if label else ""
             painter.drawText(12, y, f"Bone overlay: {len(self._bone_lines):,} bones{suffix}")
+        if self._show_bone_labels and self._bone_lines:
+            self._draw_bone_labels(painter)
         if self._height_meters_per_unit > 0.0 and self._material_positions:
             draw_meter_height_bar(
                 painter,
@@ -3223,6 +3340,50 @@ class MaterialPreviewWidget(QOpenGLWidget):
                 self._height_meters_per_unit,
                 self._height_reference_m,
             )
+
+    def _draw_bone_labels(self, painter: QtGui.QPainter) -> None:
+        """Draw bone name labels at each bone head (always over the mesh).
+
+        Highlighted bones (collision-group members / selected / hovered) are
+        emphasized and colored by their group so they stand out for selection.
+        """
+        heads: list[list[float]] = []
+        uids: list[str] = []
+        for uid, arr in self._bone_lines.items():
+            if len(arr) >= 2:
+                heads.append([float(arr[1][0]), float(arr[1][1]), float(arr[1][2])])
+                uids.append(uid)
+        if not heads:
+            return
+        points, _depth = self._project_np(np.asarray(heads, dtype=np.float64))
+        old_font = painter.font()
+        label_font = QtGui.QFont(old_font)
+        label_font.setPointSize(max(7, old_font.pointSize() - 1))
+        painter.setFont(label_font)
+        visible_rect = self.rect().adjusted(-60, -16, 120, 28)
+        for point, uid in zip(points, uids):
+            if not visible_rect.contains(point.toPoint()):
+                continue
+            name = self._bone_labels.get(uid, uid)
+            group_color = self._bone_group_colors.get(uid)
+            highlighted = uid == self._hovered_bone_uid or uid in self._highlighted_bone_uids or group_color is not None
+            if group_color is not None:
+                fg = QtGui.QColor.fromRgbF(
+                    min(1.0, group_color[0] * 1.15 + 0.12),
+                    min(1.0, group_color[1] * 1.15 + 0.12),
+                    min(1.0, group_color[2] * 1.15 + 0.12),
+                )
+            elif highlighted:
+                fg = QtGui.QColor(255, 210, 90)
+            else:
+                fg = QtGui.QColor(210, 216, 226, 215)
+            anchor = QtCore.QPointF(point.x() + 5.0, point.y() - 2.0)
+            # Drop shadow for legibility over bright textures.
+            painter.setPen(QtGui.QColor(12, 13, 15, 220))
+            painter.drawText(QtCore.QPointF(anchor.x() + 1.0, anchor.y() + 1.0), name)
+            painter.setPen(fg)
+            painter.drawText(anchor, name)
+        painter.setFont(old_font)
 
     def _emit_stats(self) -> None:
         if not self.scan:

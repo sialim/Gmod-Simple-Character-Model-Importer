@@ -7,6 +7,7 @@ import faulthandler
 import hashlib
 import html
 import json
+import math
 import os
 import re
 import runpy
@@ -3342,7 +3343,6 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self._hover_merge_material_uid = ""
         self._hover_bodygroup_uid = ""
         self._hover_flex_uid = ""
-        self._hover_collision_bone_uid = ""
         self._hover_collision_source_bodygroup = ""
         self._hover_collision_uid = ""
         self._hover_vrd_uid = ""
@@ -3363,6 +3363,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self._updating_qc_table = False
         self._updating_qc_jiggle_controls = False
         self._updating_qc_physics_table = False
+        self._selected_qc_physics_row = -1
         self.pmx_paths: list[Path] = []
 
         self.setWindowTitle(self._t("app.title", "MMD Character Importer"))
@@ -3630,6 +3631,25 @@ class ImporterWindow(QtWidgets.QMainWindow):
             fmt = "pmx"
         default_mult = float(MODEL_SCALE_DEFAULTS.get(fmt, 1.0)) or 1.0
         meters_per_unit = float(BLENDER_PREVIEW_METERS_PER_UNIT) * default_mult
+        widget.set_height_reference(meters_per_unit, up_axis=2, reference_m=HEIGHT_REFERENCE_METERS)
+
+    def update_bodygroup_preview_height_reference(self) -> None:
+        """Feed the Step 6 preview a meters-per-unit for its height bar.
+
+        Unlike Step 5, Step 6's analyze step scales the character to Source/game
+        scale *before* building its preview, so the previewed mesh is post-scale.
+        Source units -> meters is the fixed game conversion
+        (BLENDER_PREVIEW_METERS_PER_UNIT / default scale factor), independent of
+        format/preset, so the bar shows the model's RESULTING in-game height: a
+        standard character at the default factor reads ~1.65 m (aligned with the
+        reference line), and a taller scale/preset reads taller. It re-syncs on
+        each re-analyze (when the displayed mesh actually re-scales).
+        """
+        widget = getattr(self, "bodygroup_preview", None)
+        if widget is None or not hasattr(widget, "set_height_reference"):
+            return
+        default_factor = float(getattr(core, "DEFAULT_BODYGROUP_SCALE_FACTOR", 40.457)) or 40.457
+        meters_per_unit = float(BLENDER_PREVIEW_METERS_PER_UNIT) / default_factor
         widget.set_height_reference(meters_per_unit, up_axis=2, reference_m=HEIGHT_REFERENCE_METERS)
 
     def configured_category_pairs(self) -> list[dict[str, object]]:
@@ -7086,12 +7106,37 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.collision_bone_hint_label = QtWidgets.QLabel(
             "Optional. Pick a Group number (1-14) on a bone to start a collision group: the first bone you add becomes "
             "the group's Target bone, and every other bone in the group is merged into it. A bone can join a group only "
-            "if it is the Target's parent, a direct child of a bone already in the group, or shares the Target's parent. "
+            "if it is the Target's parent, a direct child of a bone already in the group, shares the Target's parent, or "
+            "is a parallel-chain sibling at the same depth (e.g. matching levels of adjacent hair strands). "
             "Each group needs one rotation type. Group bones are tinted with the group's color in the preview."
         )
         self.collision_bone_hint_label.setObjectName("fieldHint")
         self.collision_bone_hint_label.setWordWrap(True)
         bone_layout.addWidget(self.collision_bone_hint_label)
+        bone_select_buttons = QtWidgets.QHBoxLayout()
+        self.collision_select_children_button = QtWidgets.QPushButton("+ Children of selected")
+        self.collision_select_children_button.setToolTip("Add every direct child bone of the selected bone to its collision group (skips any that break the grouping rule).")
+        self.collision_select_parent_button = QtWidgets.QPushButton("+ Parent of selected")
+        self.collision_select_parent_button.setToolTip("Add the parent bone of the selected bone to its collision group.")
+        self.collision_select_siblings_button = QtWidgets.QPushButton("+ Siblings of selected")
+        self.collision_select_siblings_button.setToolTip(
+            "Add the parallel-chain siblings of the selected bone - the bones at the same depth in adjacent chains "
+            "(e.g. the matching level of each hair strand). Falls back to plain same-parent siblings near a branch point."
+        )
+        self.collision_select_group_children_button = QtWidgets.QPushButton("+ Children of all in group")
+        self.collision_select_group_children_button.setToolTip(
+            "Add every direct child of every bone already in the selected bone's collision group "
+            "(skips any that break the grouping rule)."
+        )
+        for _bone_button in (
+            self.collision_select_children_button,
+            self.collision_select_parent_button,
+            self.collision_select_siblings_button,
+            self.collision_select_group_children_button,
+        ):
+            bone_select_buttons.addWidget(_bone_button)
+        bone_select_buttons.addStretch(1)
+        bone_layout.addLayout(bone_select_buttons)
         self.collision_bone_table = QtWidgets.QTableWidget(0, 7)
         self.collision_bone_table.setHorizontalHeaderLabels(
             ["Group", "Role", "Rotation Type", "Bone", "Parent", "Children", "Warnings"]
@@ -7103,9 +7148,6 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.collision_bone_table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.collision_bone_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.collision_bone_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
-        self.collision_bone_table.setMouseTracking(True)
-        self.collision_bone_table.viewport().setMouseTracking(True)
-        self.collision_bone_table.viewport().installEventFilter(self)
         self.collision_bone_table.verticalHeader().setDefaultSectionSize(34)
         self.collision_bone_table.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Fixed)
         self.collision_bone_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -7122,6 +7164,22 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.collision_source_hint_label.setObjectName("fieldHint")
         self.collision_source_hint_label.setWordWrap(True)
         source_layout.addWidget(self.collision_source_hint_label)
+        source_buttons = QtWidgets.QHBoxLayout()
+        self.collision_source_select_all_button = QtWidgets.QPushButton("Select All")
+        self.collision_source_deselect_all_button = QtWidgets.QPushButton("Deselect All")
+        self.collision_source_face_button = QtWidgets.QPushButton("Face only")
+        self.collision_source_body_button = QtWidgets.QPushButton("Body only")
+        self.collision_source_hair_button = QtWidgets.QPushButton("Hair only")
+        for _src_button in (
+            self.collision_source_select_all_button,
+            self.collision_source_deselect_all_button,
+            self.collision_source_face_button,
+            self.collision_source_body_button,
+            self.collision_source_hair_button,
+        ):
+            source_buttons.addWidget(_src_button)
+        source_buttons.addStretch(1)
+        source_layout.addLayout(source_buttons)
         self.collision_source_table = QtWidgets.QTableWidget(0, 7)
         self.collision_source_table.setHorizontalHeaderLabels(
             ["Use", "Bodygroup", "Vertices", "Faces", "Materials", "Target-Weighted Verts", "Warnings"]
@@ -7153,8 +7211,14 @@ class ImporterWindow(QtWidgets.QMainWindow):
             preview_controls = QtWidgets.QHBoxLayout()
             self.collision_wireframe_check = QtWidgets.QCheckBox("Wireframe")
             self.collision_alpha_check = QtWidgets.QCheckBox("Respect Alpha")
+            self.collision_bones_on_top_check = QtWidgets.QCheckBox("Bones In Front")
+            self.collision_bones_on_top_check.setToolTip("Draw the bone skeleton over the mesh so it is never hidden by the model.")
+            self.collision_bone_labels_check = QtWidgets.QCheckBox("Bone Labels")
+            self.collision_bone_labels_check.setToolTip("Show each bone's name over the model to help pick bones for collision groups.")
             preview_controls.addWidget(self.collision_wireframe_check)
             preview_controls.addWidget(self.collision_alpha_check)
+            preview_controls.addWidget(self.collision_bones_on_top_check)
+            preview_controls.addWidget(self.collision_bone_labels_check)
             for direction in ("Front", "Back", "Left", "Right", "Top", "Bottom"):
                 button = QtWidgets.QPushButton(direction)
                 button.setMaximumWidth(70)
@@ -7165,6 +7229,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
             preview_layout.addWidget(self.collision_preview_status_label)
             self.collision_wireframe_check.toggled.connect(self.collision_preview.set_wireframe_visible)
             self.collision_alpha_check.toggled.connect(self.collision_preview.set_respect_alpha)
+            self.collision_bones_on_top_check.toggled.connect(self.collision_preview.set_bones_on_top)
+            self.collision_bone_labels_check.toggled.connect(self.collision_preview.set_bone_labels_visible)
         else:
             self.collision_preview = None
             self.collision_preview_status_label = QtWidgets.QLabel("Collision preview dependencies are unavailable.")
@@ -7279,8 +7345,17 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.collision_cancel_button.clicked.connect(self.cancel_collision)
         self.open_collision_folder_button.clicked.connect(self.open_collision_folder)
         self.collision_bone_table.itemSelectionChanged.connect(self.on_collision_bone_table_selection_changed)
+        self.collision_select_children_button.clicked.connect(self.add_collision_children_of_current)
+        self.collision_select_parent_button.clicked.connect(self.add_collision_parent_of_current)
+        self.collision_select_siblings_button.clicked.connect(self.add_collision_siblings_of_current)
+        self.collision_select_group_children_button.clicked.connect(self.add_collision_children_of_group)
         self.collision_source_table.itemChanged.connect(self.on_collision_source_table_item_changed)
         self.collision_source_table.itemSelectionChanged.connect(self.on_collision_source_table_selection_changed)
+        self.collision_source_select_all_button.clicked.connect(lambda: self.set_all_collision_sources(True))
+        self.collision_source_deselect_all_button.clicked.connect(lambda: self.set_all_collision_sources(False))
+        self.collision_source_face_button.clicked.connect(lambda: self.select_collision_source_category("face"))
+        self.collision_source_body_button.clicked.connect(lambda: self.select_collision_source_category("body"))
+        self.collision_source_hair_button.clicked.connect(lambda: self.select_collision_source_category("hair"))
         self.collision_table.itemChanged.connect(self.on_collision_table_item_changed)
         self.collision_table.itemSelectionChanged.connect(self.on_collision_table_selection_changed)
         self.collision_outputs_toggle.toggled.connect(self.set_collision_outputs_visible)
@@ -8539,6 +8614,14 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.qc_physics_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self.qc_physics_table.horizontalHeader().setStretchLastSection(False)
         physics_layout.addWidget(self.qc_physics_table, 1)
+        self.qc_physics_table.itemSelectionChanged.connect(self.on_qc_physics_row_selected)
+        self.qc_physics_hint_label = QtWidgets.QLabel(
+            "Select a bone row to highlight it in the preview and see its rotation limits drawn as colored arcs "
+            "(X=red twist, Y=green, Z=blue swing). The arcs update live as you edit the min/max values."
+        )
+        self.qc_physics_hint_label.setObjectName("fieldHint")
+        self.qc_physics_hint_label.setWordWrap(True)
+        physics_layout.addWidget(self.qc_physics_hint_label)
         self.qc_reset_physics_button = QtWidgets.QPushButton("Reload analyzed physics defaults")
         physics_layout.addWidget(self.qc_reset_physics_button, 0, QtCore.Qt.AlignmentFlag.AlignLeft)
         self.qc_advanced_panel.addTab(physics_tab, "Physics Constraints")
@@ -12892,16 +12975,6 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 self.update_collision_hover_for_row(row)
             elif event.type() == QtCore.QEvent.Type.Leave:
                 self.clear_collision_hover()
-        if hasattr(self, "collision_bone_table") and watched is self.collision_bone_table.viewport():
-            if event.type() == QtCore.QEvent.Type.MouseMove:
-                try:
-                    pos = event.position().toPoint()  # type: ignore[attr-defined]
-                except Exception:
-                    pos = event.pos()  # type: ignore[attr-defined]
-                row = self.collision_bone_table.rowAt(pos.y())
-                self.update_collision_bone_hover_for_row(row)
-            elif event.type() == QtCore.QEvent.Type.Leave:
-                self.clear_collision_bone_hover()
         if hasattr(self, "collision_source_table") and watched is self.collision_source_table.viewport():
             if event.type() == QtCore.QEvent.Type.MouseMove:
                 try:
@@ -13859,6 +13932,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.bodygroup_preview.set_material_data(scan, scan)
         self.bodygroup_preview.set_hovered_material(self._hover_bodygroup_uid)
         self.bodygroup_preview.set_highlighted_materials(self.selected_bodygroup_uids())
+        self.update_bodygroup_preview_height_reference()
 
     def update_bodygroup_hover_for_row(self, row: int) -> None:
         if row < 0 or row >= self.bodygroup_table.rowCount():
@@ -15127,12 +15201,83 @@ class ImporterWindow(QtWidgets.QMainWindow):
             )
         return result or None
 
+    def _collision_hierarchy_maps(self) -> tuple[dict[str, str], dict[str, list[str]], set[str]]:
+        """Build name->parent, name->children, and the set of selectable bone names."""
+        parent_by: dict[str, str] = {}
+        children_by: dict[str, list[str]] = {}
+        names: set[str] = set()
+        for entry in self.collision_bone_entries():
+            name = str(entry.get("name") or "")
+            if not name:
+                continue
+            names.add(name)
+            parent_by[name] = str(entry.get("parent") or "")
+            kids = entry.get("children")
+            children_by[name] = [str(child) for child in kids if str(child)] if isinstance(kids, list) else []
+        return parent_by, children_by, names
+
+    def _collision_branch_parallel_siblings(self, bone_name: str) -> list[str]:
+        """Bones at the same depth below ``bone_name``'s nearest branching ancestor.
+
+        Walks up to the nearest ancestor that has more than one child (the branch
+        point), then for every *other* child branch descends the same number of
+        steps to the parallel bone at the matching depth. For a chain whose direct
+        parent already branches this reduces to the plain same-parent siblings; for
+        a deeper chain bone it returns the matching level of each adjacent chain
+        (e.g. Bn_L_Mawei05 -> Bn_Lf/Ll/Lr_Mawei03). Strands shorter than the depth
+        are skipped.
+        """
+        parent_by, children_by, names = self._collision_hierarchy_maps()
+        if bone_name not in names:
+            return []
+
+        def children_of(name: str) -> list[str]:
+            kids = children_by.get(name)
+            if kids is None:
+                kids = [child for child, parent in parent_by.items() if parent == name]
+            return kids
+
+        node = bone_name
+        depth = 0
+        branch_child = bone_name
+        branch_kids: list[str] = []
+        visited: set[str] = set()
+        while True:
+            parent = parent_by.get(node, "")
+            if not parent or parent in visited:
+                return []
+            visited.add(parent)
+            depth += 1
+            kids = children_of(parent)
+            if len(kids) > 1:
+                branch_child = node
+                branch_kids = kids
+                break
+            node = parent
+        result: list[str] = []
+        for child in branch_kids:
+            if child == branch_child:
+                continue
+            cur = child
+            ok = True
+            for _ in range(depth - 1):
+                grandkids = children_of(cur)
+                if not grandkids:
+                    ok = False
+                    break
+                cur = grandkids[0]
+            if ok and cur in names and cur != bone_name and cur not in result:
+                result.append(cur)
+        return result
+
     def collision_group_addition_error(self, group_id: int, bone_name: str, members: list[str] | None = None) -> str:
         """Enforce the interactive grouping rule for adding ``bone_name``.
 
         A bone may join a non-empty group only when it is the target's parent,
-        a direct child of any bone already in the group, or shares the target's
-        parent (sibling).
+        a direct child of any bone already in the group, shares the target's
+        parent (sibling), or is a parallel-chain sibling (at the same depth below
+        their nearest common branch point, e.g. matching levels of adjacent hair
+        strands) of any bone already in the group.
         """
         if members is None:
             members = self._collision_group_members.get(group_id) or []
@@ -15150,9 +15295,16 @@ class ImporterWindow(QtWidgets.QMainWindow):
             return ""
         if target_parent and bone_parent == target_parent:
             return ""
+        # Parallel-chain sibling of ANY member (not just the target), so the
+        # Siblings button stays correct even when the selected bone is a
+        # secondary member rather than the group's target.
+        for member in members:
+            if bone_name in set(self._collision_branch_parallel_siblings(member)):
+                return ""
         return (
             f"{bone_name} cannot join group {group_id}: it must be the parent of the target bone {target}, "
-            f"a direct child of a bone already in the group, or share {target}'s parent."
+            f"a direct child of a bone already in the group, share {target}'s parent, or be a parallel-chain "
+            f"sibling of a bone already in the group at the same depth."
         )
 
     def _revalidate_collision_group_members(self, group_id: int) -> list[str]:
@@ -15217,8 +15369,9 @@ class ImporterWindow(QtWidgets.QMainWindow):
             if not bones:
                 errors.append(f"CoACD bone group {group_id} has no bones.")
                 continue
-            # Same incremental rule the interactive selection enforces:
-            # target first, then parent-of-target / child-of-selected / sibling.
+            # Same incremental rule the interactive selection enforces: target
+            # first, then parent-of-target / child-of-selected / sibling /
+            # parallel-chain sibling (same depth) of any already-accepted bone.
             accepted = [bones[0]]
             for bone_name in bones[1:]:
                 message = self.collision_group_addition_error(group_id, bone_name, accepted)
@@ -15376,6 +15529,173 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self._invalidate_collision_plan_after_group_change()
         self.update_collision_summary()
 
+    def _current_collision_bone_row(self) -> int:
+        model = self.collision_bone_table.selectionModel()
+        rows = model.selectedRows() if model is not None else []
+        return rows[0].row() if rows else -1
+
+    def _collision_default_target_names(self) -> set[str]:
+        return {
+            str(entry.get("name") or "")
+            for entry in self.collision_bone_entries()
+            if bool(entry.get("is_default_target", False))
+        }
+
+    def _add_collision_bones_to_current_group(self, candidates: list[str], relation_label: str) -> None:
+        """Add ``candidates`` to the current bone's collision group (manual Step 8).
+
+        Auto-starts a new group with the selected bone as the merge target when
+        it has none. Every candidate is funneled through the connectivity rule;
+        ineligible ones are skipped and reported on the status bar.
+        """
+        if not self.current_collision_bones:
+            return
+        row = self._current_collision_bone_row()
+        if row < 0:
+            self.statusBar().showMessage("Select a bone row first, then use the selection buttons.", 6000)
+            return
+        current_bone = self.collision_bone_name_for_row(row)
+        default_names = self._collision_default_target_names()
+        if not current_bone or current_bone in default_names:
+            self.statusBar().showMessage(
+                "The selected bone is a default target and cannot start a custom collision group.", 8000
+            )
+            return
+        cleaned = [str(c) for c in candidates if str(c or "") and str(c) != current_bone]
+        if not cleaned:
+            self.statusBar().showMessage(f"{current_bone} has no {relation_label} to add.", 6000)
+            return
+        candidates = cleaned
+        group_widget = self.collision_bone_table.cellWidget(row, 0)
+        group_id = 0
+        if isinstance(group_widget, QtWidgets.QComboBox):
+            try:
+                group_id = int(group_widget.currentData() or 0)
+            except Exception:
+                group_id = 0
+        started_new = False
+        if group_id <= 0:
+            used = {gid for gid, members in self._collision_group_members.items() if members}
+            group_id = next((gid for gid in range(1, 15) if gid not in used), 0)
+            if group_id <= 0:
+                self.statusBar().showMessage("All 14 collision groups are in use; cannot start a new one.", 8000)
+                return
+            self._collision_group_members.setdefault(group_id, []).append(current_bone)
+            self._set_collision_row_group_silent(current_bone, group_id)
+            rotation_widget = self.collision_bone_table.cellWidget(row, 2)
+            if isinstance(rotation_widget, QtWidgets.QComboBox):
+                self._updating_collision_bone_table = True
+                try:
+                    rotation_widget.setEnabled(True)
+                finally:
+                    self._updating_collision_bone_table = False
+            started_new = True
+        assigned = {name for members in self._collision_group_members.values() for name in members}
+        added: list[str] = []
+        skipped: list[str] = []
+        for candidate in candidates:
+            candidate = str(candidate or "")
+            if not candidate or candidate == current_bone:
+                continue
+            if candidate in self._collision_group_members.get(group_id, []):
+                continue
+            if candidate in default_names or candidate in assigned:
+                skipped.append(candidate)
+                continue
+            if self.collision_group_addition_error(group_id, candidate):
+                skipped.append(candidate)
+                continue
+            self._collision_group_members.setdefault(group_id, []).append(candidate)
+            assigned.add(candidate)
+            self._set_collision_row_group_silent(candidate, group_id)
+            crow = self.collision_bone_row_for_name(candidate)
+            rot_widget = self.collision_bone_table.cellWidget(crow, 2) if crow >= 0 else None
+            if isinstance(rot_widget, QtWidgets.QComboBox):
+                group_rotation = self.collision_bone_group_rotation(group_id)
+                self._updating_collision_bone_table = True
+                try:
+                    rot_widget.setEnabled(True)
+                    if group_rotation:
+                        idx = rot_widget.findData(group_rotation)
+                        if idx >= 0:
+                            rot_widget.setCurrentIndex(idx)
+                finally:
+                    self._updating_collision_bone_table = False
+            added.append(candidate)
+        self._invalidate_collision_plan_after_group_change()
+        self.update_collision_group_visuals()
+        self.update_collision_summary()
+        self.refresh_collision_bone_preview_state()
+        parts: list[str] = []
+        if started_new:
+            parts.append(f"started group {group_id} (target {current_bone})")
+        if added:
+            parts.append(f"added {len(added)} {relation_label} to group {group_id}")
+        if skipped:
+            preview = ", ".join(skipped[:6]) + ("..." if len(skipped) > 6 else "")
+            parts.append(f"skipped {len(skipped)} ineligible ({preview})")
+        if started_new and not self.collision_bone_group_rotation(group_id):
+            parts.append(f"set a rotation type for group {group_id}")
+        self.statusBar().showMessage("; ".join(parts) if parts else f"No eligible {relation_label} to add.", 8000)
+
+    def _selected_collision_bone_entry(self) -> dict[str, object] | None:
+        row = self._current_collision_bone_row()
+        bone = self.collision_bone_name_for_row(row) if row >= 0 else ""
+        if not bone:
+            self.statusBar().showMessage("Select a bone row first.", 6000)
+            return None
+        return next((entry for entry in self.collision_bone_entries() if str(entry.get("name") or "") == bone), None)
+
+    def add_collision_children_of_current(self) -> None:
+        entry = self._selected_collision_bone_entry()
+        if entry is None:
+            return
+        children = [str(name) for name in (entry.get("children") or []) if str(name)]
+        self._add_collision_bones_to_current_group(children, "child bone(s)")
+
+    def add_collision_parent_of_current(self) -> None:
+        entry = self._selected_collision_bone_entry()
+        if entry is None:
+            return
+        parent = str(entry.get("parent") or "")
+        self._add_collision_bones_to_current_group([parent] if parent else [], "parent bone")
+
+    def add_collision_siblings_of_current(self) -> None:
+        entry = self._selected_collision_bone_entry()
+        if entry is None:
+            return
+        current = str(entry.get("name") or "")
+        siblings = self._collision_branch_parallel_siblings(current)
+        self._add_collision_bones_to_current_group(siblings, "sibling bone(s)")
+
+    def add_collision_children_of_group(self) -> None:
+        """Add the direct children of every bone already in the selected bone's group."""
+        row = self._current_collision_bone_row()
+        if row < 0:
+            self.statusBar().showMessage("Select a bone row first.", 6000)
+            return
+        bone = self.collision_bone_name_for_row(row)
+        if not bone:
+            self.statusBar().showMessage("Select a bone row first.", 6000)
+            return
+        group_id = next(
+            (gid for gid, members in self._collision_group_members.items() if members and bone in members),
+            0,
+        )
+        if group_id <= 0:
+            # The selected bone has no group yet; fall back to adding its own children.
+            self.add_collision_children_of_current()
+            return
+        _parent_by, children_by, _names = self._collision_hierarchy_maps()
+        candidates: list[str] = []
+        seen: set[str] = set()
+        for member in self._collision_group_members.get(group_id, []):
+            for child in children_by.get(member, []):
+                if child and child not in seen:
+                    seen.add(child)
+                    candidates.append(child)
+        self._add_collision_bones_to_current_group(candidates, "child bone(s) of group members")
+
     def update_collision_group_visuals(self) -> None:
         """Sync Role labels, per-group row tints, and preview bone colors."""
         membership: dict[str, tuple[int, bool]] = {}
@@ -15491,21 +15811,9 @@ class ImporterWindow(QtWidgets.QMainWindow):
             if name:
                 highlighted.add(name)
         self.collision_preview.set_highlighted_bone_overlay(highlighted)
-        self.collision_preview.set_hovered_bone_overlay(self._hover_collision_bone_uid)
-
-    def update_collision_bone_hover_for_row(self, row: int) -> None:
-        if row < 0 or row >= self.collision_bone_table.rowCount():
-            self.clear_collision_bone_hover()
-            return
-        uid = self.collision_bone_name_for_row(row)
-        if uid == self._hover_collision_bone_uid:
-            return
-        self._hover_collision_bone_uid = uid
-        self.refresh_collision_bone_preview_state()
-
-    def clear_collision_bone_hover(self) -> None:
-        self._hover_collision_bone_uid = ""
-        self.refresh_collision_bone_preview_state()
+        # The active bone in the preview follows the table SELECTION (left click)
+        # only; hovering rows must not change it, so the hover overlay stays clear.
+        self.collision_preview.set_hovered_bone_overlay("")
 
     def on_collision_bone_table_selection_changed(self) -> None:
         self.refresh_collision_bone_preview_state()
@@ -15670,13 +15978,14 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self._hover_collision_source_bodygroup = bodygroup
         highlight_uid = self.collision_source_highlight_uid(bodygroup)
         self.collision_preview.set_highlighted_materials({highlight_uid} if highlight_uid else set())
-        self.collision_preview.set_isolated_bodygroup(bodygroup)
+        # Draw the hovered bodygroup in front WITHOUT hiding the rest of the model.
+        self.collision_preview.set_front_bodygroup(bodygroup)
 
     def clear_collision_source_hover(self) -> None:
         self._hover_collision_source_bodygroup = ""
         if self.collision_preview is not None:
             self.collision_preview.set_highlighted_materials(set())
-            self.collision_preview.set_isolated_bodygroup("")
+            self.collision_preview.set_front_bodygroup("")
 
     def on_collision_source_table_selection_changed(self) -> None:
         rows = sorted({index.row() for index in self.collision_source_table.selectionModel().selectedRows()})
@@ -15701,6 +16010,87 @@ class ImporterWindow(QtWidgets.QMainWindow):
             self.collision_validate_button.setEnabled(False)
         self.refresh_collision_source_visibility_only()
         self.update_collision_summary()
+
+    def _apply_collision_source_enabled(self, names_to_enabled: dict[str, bool]) -> None:
+        """Bulk-set source-bodygroup enabled flags + checkboxes, refreshing once."""
+        if not self.current_collision_sources:
+            return
+        changed = False
+        self._updating_collision_source_table = True
+        try:
+            for entry in self.collision_source_entries():
+                name = str(entry.get("name") or "")
+                if name in names_to_enabled:
+                    new_value = bool(names_to_enabled[name])
+                    if bool(entry.get("enabled", True)) != new_value:
+                        entry["enabled"] = new_value
+                        changed = True
+            for row in range(self.collision_source_table.rowCount()):
+                item = self.collision_source_table.item(row, 0)
+                if item is None:
+                    continue
+                name = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+                if name in names_to_enabled:
+                    state = QtCore.Qt.CheckState.Checked if names_to_enabled[name] else QtCore.Qt.CheckState.Unchecked
+                    if item.checkState() != state:
+                        item.setCheckState(state)
+        finally:
+            self._updating_collision_source_table = False
+        if changed and self.current_collision_plan is not None:
+            self.current_collision_analysis = None
+            self.current_collision_plan = None
+            self.collision_table.setRowCount(0)
+            self.collision_apply_button.setEnabled(False)
+            self.collision_validate_button.setEnabled(False)
+        self.refresh_collision_source_visibility_only()
+        self.update_collision_summary()
+
+    def set_all_collision_sources(self, enabled: bool) -> None:
+        names = {str(entry.get("name") or ""): bool(enabled) for entry in self.collision_source_entries() if str(entry.get("name") or "")}
+        self._apply_collision_source_enabled(names)
+
+    def select_collision_source_category(self, kind: str) -> None:
+        kind = str(kind or "").lower()
+        names: dict[str, bool] = {}
+        matched = 0
+        for entry in self.collision_source_entries():
+            name = str(entry.get("name") or "")
+            if not name:
+                continue
+            on = self._classify_collision_source_bodygroup(name) == kind
+            names[name] = on
+            matched += 1 if on else 0
+        self._apply_collision_source_enabled(names)
+        self.statusBar().showMessage(f"Enabled {matched} '{kind}' bodygroup(s) for CoACD collision; others disabled.", 6000)
+
+    def _classify_collision_source_bodygroup(self, name: str) -> str:
+        """Heuristically bucket a bodygroup name as face / hair / body / other.
+
+        Covers common English and Japanese MMD bodygroup/material names. Order
+        matters: the most specific buckets (face, hair) are tested before body.
+        """
+        low = str(name or "").lower()
+        face_tokens = (
+            "face", "head", "kao", "顔", "eye", "目", "瞳", "hitomi", "brow", "mayu",
+            "eyebrow", "eyeline", "eyelash", "lash", "mouth", "kuchi", "口", "teeth", "tooth",
+            "ha_", "tongue", "shitan", "sirome", "shiro", "白目", "cheek", "ear", "mimi", "耳",
+        )
+        hair_tokens = (
+            "hair", "kami", "髪", "骸", "bang", "前髪", "ahoge", "ponytail", "twintail",
+            "braid", "fringe", "毛", "tail",
+        )
+        body_tokens = (
+            "body", "karada", "体", "胴", "skin", "hada", "肌", "torso", "neck", "kubi", "首",
+            "chest", "breast", "胸", "arm", "ude", "腕", "hand", "手", "leg", "脚", "ashi",
+            "foot", "足", "waist", "腰", "hip", "butt",
+        )
+        if any(token in low for token in face_tokens):
+            return "face"
+        if any(token in low for token in hair_tokens):
+            return "hair"
+        if any(token in low for token in body_tokens):
+            return "body"
+        return "other"
 
     def start_collision_analyze(self) -> None:
         if self._reject_if_busy():
@@ -19456,6 +19846,17 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 constraints[axis] = constraint
         self._qc_plan_user_modified = True
         self.update_qc_summary()
+        # Live-update the rotation arcs only on min/max edits (friction does not
+        # change arc geometry) and only for the row shown in the preview.
+        if (
+            (key.endswith(".min") or key.endswith(".max"))
+            and getattr(self, "_selected_qc_physics_row", -1) == row_index
+            and self.qc_preview is not None
+        ):
+            item = self.qc_physics_table.item(row_index, 0)
+            bone = str(item.text()) if item is not None else ""
+            if bone:
+                self.qc_preview.set_constraint_arcs(self.qc_constraint_arc_geometry(bone, row_index))
 
     def reload_qc_physics_from_plan_defaults(self) -> None:
         if not self.current_qc_plan:
@@ -19909,6 +20310,9 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.qc_preview.set_material_data(scan, {})
         bone_overlay = self.current_qc_analysis.get("bone_preview", {})
         self.qc_preview.set_bone_overlay(bone_overlay if isinstance(bone_overlay, dict) else {})
+        # A fresh analysis invalidates any previously drawn constraint arcs.
+        self._selected_qc_physics_row = -1
+        self.qc_preview.set_constraint_arcs({})
         self.refresh_qc_preview_state()
 
     def refresh_qc_preview_state(self) -> None:
@@ -19917,6 +20321,133 @@ class ImporterWindow(QtWidgets.QMainWindow):
         selected = self.selected_qc_bone_uids() if hasattr(self, "qc_bone_table") else set()
         self.qc_preview.set_highlighted_bone_overlay(selected)
         self.qc_preview.set_hovered_bone_overlay(self._hover_qc_bone_uid)
+
+    def qc_bone_head_tail(self, bone: str) -> tuple[list[float] | None, list[float] | None]:
+        """World-space head and a reconstructed tail for a QC-analysis bone.
+
+        The QC bone_preview emits tail == head (its SMD nodes carry only a single
+        position), so the tail is rebuilt here from the hierarchy: toward the
+        average of the bone's children, or extended along the parent->bone
+        direction for leaf bones. This gives each bone its real rest direction so
+        the Step-14 rotation arcs orient correctly.
+        """
+        analysis = self.current_qc_analysis or {}
+        preview = analysis.get("bone_preview", {}) if isinstance(analysis, dict) else {}
+        bones = preview.get("bones", []) if isinstance(preview, dict) else []
+        if not isinstance(bones, list):
+            return None, None
+        head_by_name: dict[str, list[float]] = {}
+        parent_by_name: dict[str, str] = {}
+        children_heads: dict[str, list[list[float]]] = {}
+        for entry in bones:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or "")
+            head = entry.get("head")
+            if not name or not (isinstance(head, list) and len(head) >= 3):
+                continue
+            head_v = [float(head[0]), float(head[1]), float(head[2])]
+            head_by_name[name] = head_v
+            parent = str(entry.get("parent") or "")
+            parent_by_name[name] = parent
+            if parent:
+                children_heads.setdefault(parent, []).append(head_v)
+        head = head_by_name.get(bone)
+        if head is None:
+            return None, None
+        kids = children_heads.get(bone, [])
+        if kids:
+            tail = [sum(k[i] for k in kids) / len(kids) for i in range(3)]
+        else:
+            parent_head = head_by_name.get(parent_by_name.get(bone, ""))
+            if parent_head is not None:
+                tail = [head[i] + (head[i] - parent_head[i]) for i in range(3)]
+            else:
+                tail = None
+        return head, tail
+
+    def qc_constraint_arc_geometry(self, bone: str, row_index: int) -> dict[str, object]:
+        """Build per-axis rotation-limit arcs (world space) for a physics bone.
+
+        Approximate visual aid: the bone's local frame is reconstructed from its
+        head/tail (twist = bone direction = local X; Y/Z = swing axes). X arcs
+        sweep about the bone axis; Y/Z arcs sweep the bone direction. Degrees are
+        the live min/max from the physics table.
+        """
+        head, tail = self.qc_bone_head_tail(bone)
+        if head is None:
+            return {}
+        rows = self.qc_physics_rows()
+        if row_index < 0 or row_index >= len(rows):
+            return {}
+        row = rows[row_index]
+
+        def sub(a: list[float], b: list[float]) -> list[float]:
+            return [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+
+        def length(a: list[float]) -> float:
+            return math.sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2])
+
+        def norm(a: list[float]) -> list[float] | None:
+            mag = length(a)
+            return [a[0] / mag, a[1] / mag, a[2] / mag] if mag > 1e-9 else None
+
+        def cross(a: list[float], b: list[float]) -> list[float]:
+            return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+
+        bone_vec = sub(tail, head) if tail else None
+        twist = norm(bone_vec) if bone_vec else None
+        bone_len = length(bone_vec) if bone_vec else 0.0
+        if twist is None:
+            twist = [0.0, 0.0, 1.0]
+            bone_len = 8.0
+        if bone_len <= 1e-6:
+            bone_len = 8.0
+        reference = [1.0, 0.0, 0.0] if abs(twist[2]) > 0.9 else [0.0, 0.0, 1.0]
+        swing1 = norm(cross(twist, reference)) or [1.0, 0.0, 0.0]
+        swing2 = norm(cross(twist, swing1)) or [0.0, 1.0, 0.0]
+        radius = max(1.5, min(bone_len * 0.6, bone_len))
+
+        def arc(axis_zero: list[float], axis_ninety: list[float], dmin: float, dmax: float) -> list[list[float]]:
+            steps = max(2, int(abs(dmax - dmin) / 6.0) + 2)
+            points: list[list[float]] = []
+            for i in range(steps + 1):
+                angle = math.radians(dmin + (dmax - dmin) * (i / steps))
+                ca, sa = math.cos(angle), math.sin(angle)
+                points.append(
+                    [head[j] + radius * (ca * axis_zero[j] + sa * axis_ninety[j]) for j in range(3)]
+                )
+            return points
+
+        arcs: dict[str, object] = {}
+        cx = self.physics_constraint_for_gui(row, "x")
+        if cx["max"] - cx["min"] >= 1.0:  # X = twist about the bone axis
+            arcs["x_twist"] = arc(swing1, swing2, cx["min"], cx["max"])
+        cy = self.physics_constraint_for_gui(row, "y")
+        if cy["max"] - cy["min"] >= 1.0:  # Y = swing of the bone direction
+            arcs["y_swing"] = arc(twist, swing2, cy["min"], cy["max"])
+        cz = self.physics_constraint_for_gui(row, "z")
+        if cz["max"] - cz["min"] >= 1.0:  # Z = swing of the bone direction
+            arcs["z_swing"] = arc(twist, swing1, cz["min"], cz["max"])
+        # Rest-direction reference line so the swings have an anchor.
+        arcs["twist_axis"] = [list(head), [head[j] + radius * twist[j] for j in range(3)]]
+        return arcs
+
+    def on_qc_physics_row_selected(self) -> None:
+        if self.qc_preview is None:
+            return
+        model = self.qc_physics_table.selectionModel()
+        rows = model.selectedRows() if model is not None else []
+        if not rows or not self.current_qc_analysis:
+            self._selected_qc_physics_row = -1
+            self.qc_preview.set_constraint_arcs({})
+            return
+        row_index = rows[0].row()
+        self._selected_qc_physics_row = row_index
+        item = self.qc_physics_table.item(row_index, 0)
+        bone = str(item.text()) if item is not None else ""
+        self.qc_preview.set_highlighted_bone_overlay({bone} if bone else set())
+        self.qc_preview.set_constraint_arcs(self.qc_constraint_arc_geometry(bone, row_index) if bone else {})
 
     def update_qc_summary(self) -> None:
         if not self.current_qc_plan:

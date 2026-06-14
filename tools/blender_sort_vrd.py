@@ -25,6 +25,96 @@ VRD_FRAMES = [0, 10, 20, 30]
 VRD_WEIGHT_FRAMES = [10, 20, 30]
 DEFAULT_VRD_INTENSITY_MULTIPLIERS = {"10": 1.0, "20": 0.75, "30": 0.42}
 DRIVER_BONES = {"ValveBiped.Bip01_L_Thigh", "ValveBiped.Bip01_R_Thigh"}
+# Each driver thigh's calf, used to derive the twist (roll) axis = the vector
+# from the thigh head to the calf head (i.e. the thigh's head -> knee direction).
+THIGH_TO_CALF = {
+    "ValveBiped.Bip01_L_Thigh": "ValveBiped.Bip01_L_Calf",
+    "ValveBiped.Bip01_R_Thigh": "ValveBiped.Bip01_R_Calf",
+}
+# Step 11 export densification. The GUI still exposes only the three driver
+# poses (frames 10/20/30), but the exported .vrd samples a denser grid (the swing
+# sweep crossed with the thigh's roll axis) so the runtime $proceduralbones
+# interpolation has intermediate cases to blend between.
+#
+# *** studiomdl trigger limits (measured empirically with the GMod studiomdl) ***
+# 1. A single quatinterp helper with >64 triggers hard-crashes studiomdl with
+#    EXCEPTION_ACCESS_VIOLATION.
+# 2. There is also a shared procedural-data budget: a complex character (Shinku,
+#    252 bones + flex + included anims) fails with `procedural bone ""` once the
+#    TOTAL trigger count across all helpers exceeds ~400 (it compiled at 380,
+#    failed at 430). A simple model tolerated far more, so the ceiling scales
+#    down with model complexity. The original released models used 4 triggers
+#    per helper (rest + 3 driver poses) and always compiled.
+# The grid below is therefore ADAPTIVE: it caps both per-helper triggers and the
+# total across helpers, then fills a priority-ordered list (the three driver
+# keyframes first, widening twist before adding swing intermediates), so it
+# degrades gracefully to the proven 4-trigger baseline when there are many
+# helpers and never overruns either limit.
+VRD_MAX_TRIGGERS_PER_HELPER = 28   # << the 64 hard-crash wall, with headroom
+VRD_MAX_TOTAL_TRIGGERS = 200       # << the ~400 shared-buffer ceiling, with headroom
+VRD_MIN_TRIGGERS_PER_HELPER = 4    # rest + the three driver keyframes (the proven baseline)
+# Twist axis: roll of the procedural cloth bone about its driver thigh's
+# head -> calf vector, at 0, +-20, +-40, +-60 degrees (neutral kept explicit).
+VRD_TWIST_DEGREES = (-60.0, -40.0, -20.0, 0.0, 20.0, 40.0, 60.0)
+# Fraction of the driver thigh's roll that a fully-engaged cloth bone follows.
+VRD_TWIST_FOLLOW = 0.5
+# Swing positions: the three user keyframes (the driver poses) are always kept;
+# the segment midpoints are added only when the budget allows.
+VRD_SWING_KEYFRAMES = (10.0, 20.0, 30.0)
+VRD_SWING_INTERMEDIATES = (5.0, 15.0, 25.0)
+
+
+def _vrd_priority_pairs() -> list[tuple[float, float]]:
+    """(swing_frame, twist_deg) pairs in descending importance.
+
+    The three driver keyframes come first (neutral, then widening twist), so a
+    tight budget keeps the user-authored poses; segment midpoints and the extreme
+    +-60 roll fill in only when there is room.
+    """
+    plan = (
+        (VRD_SWING_KEYFRAMES, (0.0,)),
+        (VRD_SWING_KEYFRAMES, (-20.0, 20.0)),
+        (VRD_SWING_KEYFRAMES, (-40.0, 40.0)),
+        (VRD_SWING_INTERMEDIATES, (0.0,)),
+        (VRD_SWING_KEYFRAMES, (-60.0, 60.0)),
+        (VRD_SWING_INTERMEDIATES, (-20.0, 20.0)),
+        (VRD_SWING_INTERMEDIATES, (-40.0, 40.0)),
+        (VRD_SWING_INTERMEDIATES, (-60.0, 60.0)),
+    )
+    seen: set[tuple[float, float]] = set()
+    out: list[tuple[float, float]] = []
+    for frames, twists in plan:
+        for twist in twists:
+            for frame in frames:
+                key = (frame, twist)
+                if key not in seen:
+                    seen.add(key)
+                    out.append(key)
+    return out
+
+
+VRD_PRIORITY_PAIRS = _vrd_priority_pairs()
+
+
+def vrd_triggers_per_helper(helper_count: int) -> int:
+    """Per-helper trigger budget (including the rest anchor) for ``helper_count``
+    enabled helpers, capped so neither studiomdl limit is exceeded."""
+    if helper_count <= 0:
+        return min(VRD_MAX_TRIGGERS_PER_HELPER, 1 + len(VRD_PRIORITY_PAIRS))
+    return min(
+        VRD_MAX_TRIGGERS_PER_HELPER,
+        max(VRD_MIN_TRIGGERS_PER_HELPER, VRD_MAX_TOTAL_TRIGGERS // helper_count),
+    )
+
+
+def vrd_grid_pairs(helper_count: int) -> list[tuple[float, float]]:
+    """The (swing_frame, twist_deg) grid for one helper, sized to the budget.
+
+    Excludes the rest anchor (emitted separately), so the helper writes
+    ``1 + len(vrd_grid_pairs(...))`` triggers.
+    """
+    grid_budget = max(0, vrd_triggers_per_helper(helper_count) - 1)
+    return VRD_PRIORITY_PAIRS[:grid_budget]
 ESSENTIAL_BONE_PREFIXES = ("ValveBiped.",)
 ESSENTIAL_BONES = {"ZArmTwist_L", "ZArmTwist_R", "ZHandTwist_L", "ZHandTwist_R", "Eye_L", "Eye_R"}
 AUTO_VRD_ESSENTIAL_ROOTS = {
@@ -1313,34 +1403,6 @@ def build_vrd_preview(
     }
 
 
-def create_vrd_project(armature: bpy.types.Object, rows: list[dict[str, object]], vrd_path: Path) -> bool:
-    if not hasattr(bpy.context.scene, "project_items"):
-        return False
-    scene = bpy.context.scene
-    scene.project_items.clear()
-    project = scene.project_items.add()
-    project.name = "VRD Project 1"
-    try:
-        project.animation_name = "VRD"
-    except Exception:
-        pass
-    scene.active_project_index = 0
-    for row in rows:
-        if not row.get("enabled", True):
-            continue
-        cxbone = project.bone_set.cxbone_list.add()
-        cxbone.name = str(row.get("procedural_bone") or "")
-        cxbone.angle = float(row.get("angle", 90.0) or 90.0)
-        qdbone = project.bone_set.qdbone_list.add()
-        qdbone.name = str(row.get("driver_bone") or "")
-    scene.export_all = False
-    scene.export_default = True
-    scene.export_nekomdl = False
-    scene.vrd_export_path = str(vrd_path)
-    set_active_only(armature)
-    return True
-
-
 def get_transforms(pose_bone: bpy.types.PoseBone, transform_type: str) -> str:
     if pose_bone.parent:
         matrix = pose_bone.parent.matrix.inverted_safe() @ pose_bone.matrix
@@ -1353,51 +1415,179 @@ def get_transforms(pose_bone: bpy.types.PoseBone, transform_type: str) -> str:
     return " ".join(str(round(float(value), 6)) for value in values)
 
 
-def manual_export_vrd(armature: bpy.types.Object, rows: list[dict[str, object]], vrd_path: Path) -> str:
+def _local_matrix(matrix: Matrix, parent_matrix: Matrix | None) -> Matrix:
+    if parent_matrix is not None:
+        return parent_matrix.inverted_safe() @ matrix
+    return matrix
+
+
+def _rotation_str(matrix: Matrix, parent_matrix: Matrix | None) -> str:
+    """Parent-relative euler (degrees) of an armature-space bone matrix.
+
+    Mirrors get_transforms("ROTATION") but works off captured matrices so the
+    swing/twist grid can be derived without mutating the pose.
+    """
+    local = _local_matrix(matrix, parent_matrix)
+    values = [math.degrees(value) for value in local.to_euler()]
+    return " ".join(str(round(float(value), 6)) for value in values)
+
+
+def _translation_values(matrix: Matrix, parent_matrix: Matrix | None) -> list[float]:
+    local = _local_matrix(matrix, parent_matrix)
+    return list(local.to_translation().xyz)
+
+
+def _interp_keyframed(frame: float, keyframes: list[tuple[float, float]]) -> float:
+    """Piecewise-linear lookup of a value keyed at the VRD weight frames."""
+    if not keyframes:
+        return 0.0
+    if frame <= keyframes[0][0]:
+        return keyframes[0][1]
+    for (frame0, value0), (frame1, value1) in zip(keyframes, keyframes[1:]):
+        if frame0 <= frame <= frame1:
+            span = frame1 - frame0
+            if span <= 1e-9:
+                return value1
+            ratio = (frame - frame0) / span
+            return value0 + (value1 - value0) * ratio
+    return keyframes[-1][1]
+
+
+def thigh_twist_axis(armature: bpy.types.Object, driver: str, driver_pose: bpy.types.PoseBone) -> Vector:
+    """Driver thigh head -> calf direction in armature space (the roll axis).
+
+    Falls back to the bone's own +Y (head -> tail) if the calf is missing.
+    """
+    calf_name = THIGH_TO_CALF.get(driver, "")
+    calf_pose = armature.pose.bones.get(calf_name) if calf_name else None
+    if calf_pose is not None:
+        axis = calf_pose.head - driver_pose.head
+        if axis.length > 1e-6:
+            return axis.normalized()
+    axis = driver_pose.y_axis
+    return axis.normalized() if axis.length > 1e-6 else Vector((0.0, 1.0, 0.0))
+
+
+def manual_export_vrd(
+    armature: bpy.types.Object,
+    rows: list[dict[str, object]],
+    vrd_path: Path,
+    intensity_multipliers: dict[str, float] | None = None,
+) -> str:
+    multipliers = normalize_intensity_multipliers(intensity_multipliers)
+    axes = landmark_axes(armature)
     content = "// VRD Project 1\n"
     enabled_rows = [row for row in rows if row.get("enabled", True)]
-    for index, row in enumerate(enabled_rows):
+    valid_rows = [
+        row
+        for row in enabled_rows
+        if str(row.get("procedural_bone") or "") in armature.data.bones
+        and str(row.get("driver_bone") or "") in armature.data.bones
+    ]
+    # Size the swing x twist grid to the helper count so the total trigger budget
+    # stays under studiomdl's shared-buffer ceiling, then group by swing frame so
+    # the scene is posed once per frame.
+    grid_pairs = vrd_grid_pairs(len(valid_rows))
+    swing_order: list[float] = []
+    twists_by_swing: dict[float, list[float]] = {}
+    for swing_frame, twist in grid_pairs:
+        if swing_frame not in twists_by_swing:
+            twists_by_swing[swing_frame] = []
+            swing_order.append(swing_frame)
+        twists_by_swing[swing_frame].append(twist)
+    log(
+        f"VRD grid: {len(valid_rows)} helper(s) x (1 rest + {len(grid_pairs)} swing/twist) "
+        f"= {1 + len(grid_pairs)} triggers/helper, {len(valid_rows) * (1 + len(grid_pairs))} total."
+    )
+    for index, row in enumerate(valid_rows):
         proc = str(row.get("procedural_bone") or "")
         driver = str(row.get("driver_bone") or "")
-        if proc not in armature.data.bones or driver not in armature.data.bones:
-            continue
         proc_parent = armature.data.bones[proc].parent.name if armature.data.bones[proc].parent else "Bip01_Pelvis"
         driver_parent = armature.data.bones[driver].parent.name if armature.data.bones[driver].parent else "Bip01_Pelvis"
         proc_parent = proc_parent.replace("ValveBiped.", "")
         driver_parent = driver_parent.replace("ValveBiped.", "")
         driver_short = driver.replace("ValveBiped.", "")
         content += f"<helper> {proc} {proc_parent} {driver_parent} {driver_short}\n"
+        angle = float(row.get("angle", 90.0) or 90.0)
+        proc_pose = armature.pose.bones[proc]
+        driver_pose = armature.pose.bones[driver]
+
+        # Rest translation -> <basepos>.
         bpy.context.scene.frame_set(0)
-        basepos = get_transforms(armature.pose.bones[proc], "TRANSLATION")
+        bpy.context.view_layer.update()
+        basepos = get_transforms(proc_pose, "TRANSLATION")
         content += f"<basepos> {basepos}\n"
         base_values = [float(value) for value in basepos.split()]
-        for frame in VRD_FRAMES:
-            bpy.context.scene.frame_set(frame)
-            qd_rotation = get_transforms(armature.pose.bones[driver], "ROTATION")
-            cx_rotation = get_transforms(armature.pose.bones[proc], "ROTATION")
-            frame_translation = get_transforms(armature.pose.bones[proc], "TRANSLATION")
-            frame_values = [float(value) for value in frame_translation.split()]
-            translation = [str(round(frame_values[idx] - base_values[idx], 6)) for idx in range(3)]
-            content += f"<trigger> {float(row.get('angle', 90.0) or 90.0):.1f} {qd_rotation} {cx_rotation} {' '.join(translation)}\n"
-        if index < len(enabled_rows) - 1:
+
+        # Neutral/rest anchor: driver at bind -> helper at base, zero offset.
+        rest_qd = get_transforms(driver_pose, "ROTATION")
+        rest_cx = get_transforms(proc_pose, "ROTATION")
+        content += f"<trigger> {angle:.1f} {rest_qd} {rest_cx} 0.0 0.0 0.0\n"
+
+        # Per-row swing response and intensity are keyed at 0/10/20/30 and
+        # linearly interpolated across the swing positions.
+        response_keys: list[tuple[float, float]] = [(0.0, 0.0)] + [
+            (float(weight_frame), clamp01(effective_row_frame_weight(armature, row, weight_frame, axes)))
+            for weight_frame in VRD_WEIGHT_FRAMES
+        ]
+        intensity_keys: list[tuple[float, float]] = [(0.0, 0.0)] + [
+            (float(weight_frame), frame_intensity_multiplier(multipliers, weight_frame))
+            for weight_frame in VRD_WEIGHT_FRAMES
+        ]
+
+        for swing_frame in swing_order:
+            bpy.context.scene.frame_set(int(round(swing_frame)))
+            bpy.context.view_layer.update()
+            driver_matrix = driver_pose.matrix.copy()
+            driver_parent_matrix = driver_pose.parent.matrix.copy() if driver_pose.parent else None
+            proc_matrix = proc_pose.matrix.copy()
+            proc_parent_matrix = proc_pose.parent.matrix.copy() if proc_pose.parent else None
+            driver_pivot = driver_matrix.translation.copy()
+            proc_pivot = proc_matrix.translation.copy()
+            twist_axis = thigh_twist_axis(armature, driver, driver_pose)
+            response = _interp_keyframed(swing_frame, response_keys)
+            intensity = _interp_keyframed(swing_frame, intensity_keys)
+            helper_roll = response * VRD_TWIST_FOLLOW * intensity
+            # Roll about the bone head does not move the head, so the swing
+            # translation offset is shared by every twist sample at this frame.
+            swing_translation = _translation_values(proc_matrix, proc_parent_matrix)
+            translation_str = " ".join(str(round(swing_translation[idx] - base_values[idx], 6)) for idx in range(3))
+            for twist_degrees in twists_by_swing[swing_frame]:
+                twist_radians = math.radians(twist_degrees)
+                driver_twisted = (
+                    Matrix.Translation(driver_pivot)
+                    @ Matrix.Rotation(twist_radians, 4, twist_axis)
+                    @ Matrix.Translation(-driver_pivot)
+                    @ driver_matrix
+                )
+                proc_twisted = (
+                    Matrix.Translation(proc_pivot)
+                    @ Matrix.Rotation(twist_radians * helper_roll, 4, twist_axis)
+                    @ Matrix.Translation(-proc_pivot)
+                    @ proc_matrix
+                )
+                qd_rotation = _rotation_str(driver_twisted, driver_parent_matrix)
+                cx_rotation = _rotation_str(proc_twisted, proc_parent_matrix)
+                content += f"<trigger> {angle:.1f} {qd_rotation} {cx_rotation} {translation_str}\n"
+        if index < len(valid_rows) - 1:
             content += "\n"
     vrd_path.parent.mkdir(parents=True, exist_ok=True)
     vrd_path.write_text(content, encoding="utf-8")
     return content
 
 
-def export_vrd(armature: bpy.types.Object, rows: list[dict[str, object]], vrd_path: Path, addon_available: bool) -> tuple[str, bool]:
+def export_vrd(
+    armature: bpy.types.Object,
+    rows: list[dict[str, object]],
+    vrd_path: Path,
+    intensity_multipliers: dict[str, float] | None = None,
+) -> tuple[str, bool]:
     vrd_path.parent.mkdir(parents=True, exist_ok=True)
-    if addon_available and create_vrd_project(armature, rows, vrd_path):
-        try:
-            log(f"Exporting StudioMDL VRD with L4D2 Character Tools: {vrd_path}")
-            result = bpy.ops.vrd.export_bones(action="DEFAULT_EXPORT_FILE")
-            if result == {"FINISHED"} and vrd_path.exists():
-                return vrd_path.read_text(encoding="utf-8", errors="replace"), True
-        except Exception as exc:
-            log(f"L4D2 VRD export failed; using manual fallback: {exc}")
-    log(f"Exporting StudioMDL VRD with manual fallback: {vrd_path}")
-    return manual_export_vrd(armature, rows, vrd_path), False
+    # The densified swing x twist trigger grid (including the thigh-roll axis)
+    # can only be produced by the manual generator; the L4D2 add-on exporter
+    # emits a fixed driver-pose set with no twist samples. Always use the grid.
+    log(f"Exporting StudioMDL VRD trigger grid: {vrd_path}")
+    return manual_export_vrd(armature, rows, vrd_path, intensity_multipliers), False
 
 
 def validate_plan(armature: bpy.types.Object, rows: list[dict[str, object]]) -> dict[str, object]:
@@ -1406,6 +1596,13 @@ def validate_plan(armature: bpy.types.Object, rows: list[dict[str, object]]) -> 
     for required in sorted(DRIVER_BONES):
         if required not in armature.data.bones:
             errors.append(f"Missing required driver bone: {required}")
+        else:
+            calf = THIGH_TO_CALF.get(required, "")
+            if calf and calf not in armature.data.bones:
+                warnings.append(
+                    f"Calf bone {calf} is missing; the twist axis for {required} will fall back to the "
+                    f"thigh's head->tail direction, which can roll asymmetrically from the opposite leg."
+                )
     enabled = [row for row in rows if row.get("enabled", True)]
     if not enabled:
         warnings.append("No enabled VRD rows; export will not contain skirt/dress helpers.")
@@ -1533,12 +1730,19 @@ def run_apply(args: argparse.Namespace) -> dict[str, object]:
     log(f"Saving VRD workspace blend: {workspace_blend}")
     workspace_blend.parent.mkdir(parents=True, exist_ok=True)
     bpy.ops.wm.save_as_mainfile(filepath=str(workspace_blend))
-    vrd_content, addon_export_used = export_vrd(armature, rows, args.vrd_path.resolve(), addon_available)
+    vrd_content, addon_export_used = export_vrd(armature, rows, args.vrd_path.resolve(), intensity_multipliers)
     helper_count, trigger_count = count_vrd_helpers(vrd_content)
     if helper_count <= 0 and any(row.get("enabled", True) for row in rows):
         raise RuntimeError("VRD export completed but no <helper> blocks were written.")
-    if trigger_count != helper_count * 4:
-        validation["warnings"].append(f"Expected four triggers per helper; found {trigger_count} triggers for {helper_count} helpers.")
+    expected_per_helper = 1 + len(vrd_grid_pairs(helper_count))
+    if helper_count > 0 and trigger_count != helper_count * expected_per_helper:
+        validation["warnings"].append(
+            f"Expected {expected_per_helper} triggers per helper; found {trigger_count} triggers for {helper_count} helpers."
+        )
+    if trigger_count > VRD_MAX_TOTAL_TRIGGERS:
+        validation["warnings"].append(
+            f"VRD has {trigger_count} procedural triggers; studiomdl may fail above ~{VRD_MAX_TOTAL_TRIGGERS} for complex models."
+        )
     if pose_warning:
         validation["warnings"].append(pose_warning)
     report = {
