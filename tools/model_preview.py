@@ -45,6 +45,158 @@ BONE_HIGHLIGHT_LINE_WIDTH = 6.0
 BONE_HIGHLIGHT_POINT_RADIUS = 8.0
 BONE_HIGHLIGHT_POINT_SIZE = 10.0
 
+# --- Height indicator (issue #79) ---------------------------------------
+# Calibrated from the firefly_alt reference model (full bounding box = 1.65 m
+# in game). Main preview shows raw model space; Step 5 shows Blender space.
+HEIGHT_REFERENCE_METERS = 1.65
+# Raw preview-space units per meter at each format's DEFAULT scale multiplier.
+# PMX import space (CATS, ~0.076 m/unit): firefly_alt Y-extent 20.669 -> 1.65 m.
+# VRM/glTF is authored in real meters, so ~1 unit per meter.
+MAIN_PREVIEW_UNITS_PER_METER = {"pmx": 12.527, "vrm": 1.0}
+# Blender (Step 6 pre-scale) Z-unit -> meters at scale multiplier 1.0:
+# firefly_alt Blender height 1.5748 -> 1.65 m  (= 40.457 / 38.61).
+BLENDER_PREVIEW_METERS_PER_UNIT = 1.04776
+
+
+def _nice_tick_interval_meters(pixels_per_meter: float) -> float:
+    """Pick a tick interval that keeps labels readable and gets finer on zoom-in.
+
+    Defaults to 0.25 m at normal zoom and shrinks (0.1, 0.05, ...) as the model
+    fills more pixels per meter, or grows (0.5, 1.0, ...) when zoomed out.
+    """
+    ladder = (0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0)
+    if not math.isfinite(pixels_per_meter) or pixels_per_meter <= 0.0:
+        return 0.25
+    for interval in ladder:
+        if interval * pixels_per_meter >= 30.0:  # min vertical gap between ticks
+            return interval
+    return ladder[-1]
+
+
+def draw_meter_height_bar(
+    painter: "QtGui.QPainter",
+    project_points,
+    scene_mins,
+    scene_maxs,
+    up_axis: int,
+    meters_per_unit: float,
+    reference_m: float = HEIGHT_REFERENCE_METERS,
+) -> None:
+    """Draw a screen-space meter ruler beside the model with a highlighted
+    reference height.
+
+    ``project_points`` maps an (N,3) world-space array to a list of QPointF
+    screen positions using the widget's current camera, so the ruler stays
+    accurate under zoom/pan/rotation. ``meters_per_unit`` already includes the
+    active scale multiplier, so the readout reflects the scaled in-game height.
+    The ruler sits just left of the model and uses adaptive 0.25 m ticks that
+    get finer as the user zooms in.
+    """
+    if meters_per_unit <= 0.0 or scene_mins is None or scene_maxs is None:
+        return
+    try:
+        ground = float(scene_mins[up_axis])
+        top = float(scene_maxs[up_axis])
+    except Exception:
+        return
+    span_units = top - ground
+    if not math.isfinite(span_units) or span_units <= 1e-6:
+        return
+    units_per_meter = 1.0 / meters_per_unit
+    model_height_m = span_units * meters_per_unit
+    other_axes = [a for a in range(3) if a != up_axis]
+    c0 = float((scene_mins[other_axes[0]] + scene_maxs[other_axes[0]]) * 0.5)
+    c1 = float((scene_mins[other_axes[1]] + scene_maxs[other_axes[1]]) * 0.5)
+
+    def world_point(meters: float) -> list[float]:
+        p = [0.0, 0.0, 0.0]
+        p[up_axis] = ground + meters * units_per_meter
+        p[other_axes[0]] = c0
+        p[other_axes[1]] = c1
+        return p
+
+    # Vertical pixels-per-meter from a 1 m probe, for adaptive tick spacing.
+    probe = project_points(np.array([world_point(0.0), world_point(1.0)], dtype=np.float64))
+    pixels_per_meter = abs(probe[1].y() - probe[0].y()) if len(probe) >= 2 else 0.0
+    interval = _nice_tick_interval_meters(pixels_per_meter)
+    decimals = 0 if interval >= 1.0 else 1 if interval >= 0.5 else 2 if interval >= 0.1 else 3
+
+    axis_top_m = max(model_height_m, reference_m) + interval
+    tick_meters: list[float] = []
+    m = 0.0
+    while m <= axis_top_m + 1e-6:
+        tick_meters.append(round(m, 4))
+        m += interval
+    if reference_m not in tick_meters:
+        tick_meters.append(reference_m)
+    tick_meters = sorted(set(tick_meters))
+
+    world = np.array([world_point(v) for v in tick_meters], dtype=np.float64)
+    screen = project_points(world)
+    if not screen or len(screen) != len(tick_meters):
+        return
+
+    # Place the ruler just left of the model's projected silhouette instead of
+    # at the window edge. Project the bounding-box corners to find its left edge.
+    corners = np.array(
+        [
+            [scene_mins[0], scene_mins[1], scene_mins[2]],
+            [scene_mins[0], scene_mins[1], scene_maxs[2]],
+            [scene_mins[0], scene_maxs[1], scene_mins[2]],
+            [scene_mins[0], scene_maxs[1], scene_maxs[2]],
+            [scene_maxs[0], scene_mins[1], scene_mins[2]],
+            [scene_maxs[0], scene_mins[1], scene_maxs[2]],
+            [scene_maxs[0], scene_maxs[1], scene_mins[2]],
+            [scene_maxs[0], scene_maxs[1], scene_maxs[2]],
+        ],
+        dtype=np.float64,
+    )
+    corner_pts = project_points(corners)
+    try:
+        view_width = float(painter.device().width())
+    except Exception:
+        view_width = 800.0
+    label_room = 58.0
+    model_left = min((pt.x() for pt in corner_pts), default=label_room + 16.0)
+    spine_x = max(label_room, min(model_left - 16.0, view_width - 40.0))
+
+    ys = [pt.y() for pt in screen]
+    top_y, bottom_y = min(ys), max(ys)
+    painter.setPen(QtGui.QPen(QtGui.QColor(200, 205, 215, 200), 1.6))
+    painter.drawLine(QtCore.QPointF(spine_x, top_y), QtCore.QPointF(spine_x, bottom_y))
+
+    base_font = painter.font()
+    tick_font = QtGui.QFont(base_font)
+    tick_font.setPointSize(max(7, base_font.pointSize() - 1))
+    painter.setFont(tick_font)
+
+    def draw_label(y: float, text: str, color: QtGui.QColor) -> None:
+        painter.setPen(color)
+        painter.drawText(
+            QtCore.QRectF(0.0, y - 9.0, spine_x - 12.0, 18.0),
+            int(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter),
+            text,
+        )
+
+    for meters, pt in zip(tick_meters, screen):
+        y = pt.y()
+        if abs(meters - reference_m) < 1e-6:
+            painter.setPen(QtGui.QPen(QtGui.QColor(255, 196, 0, 235), 2.0))
+            painter.drawLine(QtCore.QPointF(spine_x - 10.0, y), QtCore.QPointF(spine_x + 10.0, y))
+            draw_label(y, f"{reference_m:.2f} m (avg)", QtGui.QColor(255, 210, 90))
+        else:
+            painter.setPen(QtGui.QPen(QtGui.QColor(170, 178, 190, 200), 1.4))
+            painter.drawLine(QtCore.QPointF(spine_x - 7.0, y), QtCore.QPointF(spine_x, y))
+            draw_label(y, f"{meters:.{decimals}f} m", QtGui.QColor(205, 210, 220))
+    # Model total-height callout just above the model's top.
+    painter.setPen(QtGui.QColor(120, 220, 140))
+    painter.drawText(
+        QtCore.QRectF(0.0, max(2.0, top_y - 19.0), spine_x - 12.0, 16.0),
+        int(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter),
+        f"≈ {model_height_m:.2f} m",
+    )
+    painter.setFont(base_font)
+
 
 def _truthy_env(name: str) -> bool:
     return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
@@ -899,8 +1051,17 @@ class StaticModelPreviewWidget(QOpenGLWidget):
         self._overlay_error = ""
         self._last_stats_text: str | None = None
         self._vertex_data: np.ndarray | None = None
+        self._height_meters_per_unit = 0.0
+        self._height_up_axis = 1
+        self._height_reference_m = HEIGHT_REFERENCE_METERS
         self.setMinimumSize(520, 340)
         self.setMouseTracking(True)
+
+    def set_height_reference(self, meters_per_unit: float, up_axis: int = 1, reference_m: float = HEIGHT_REFERENCE_METERS) -> None:
+        self._height_meters_per_unit = max(0.0, float(meters_per_unit))
+        self._height_up_axis = int(up_axis)
+        self._height_reference_m = float(reference_m)
+        self.update()
 
     def load_model(self, model_path: Path) -> StaticPreviewModel:
         self.model = load_static_preview_model(model_path)
@@ -1286,6 +1447,16 @@ class StaticModelPreviewWidget(QOpenGLWidget):
         if self.model.warnings:
             painter.setPen(QtGui.QColor(255, 210, 120))
             painter.drawText(12, 44, self.model.warnings[0])
+        if self._height_meters_per_unit > 0.0:
+            draw_meter_height_bar(
+                painter,
+                self._project_np,
+                self._scene_mins,
+                self._scene_maxs,
+                self._height_up_axis,
+                self._height_meters_per_unit,
+                self._height_reference_m,
+            )
 
     def _emit_stats(self) -> None:
         if not self.model:
@@ -2069,6 +2240,11 @@ class MaterialPreviewWidget(QOpenGLWidget):
         self._isolated_bodygroup = ""
         self._scene_center = np.zeros(3, dtype=np.float64)
         self._scene_extent = 1.0
+        self._scene_mins = np.zeros(3, dtype=np.float64)
+        self._scene_maxs = np.ones(3, dtype=np.float64)
+        self._height_meters_per_unit = 0.0
+        self._height_up_axis = 2
+        self._height_reference_m = HEIGHT_REFERENCE_METERS
         self._view_yaw, self._view_pitch = self.VIEW_DIRECTIONS["Front"]
         self._view_zoom = 1.0
         self._view_pan = QtCore.QPointF(0.0, 0.0)
@@ -2598,12 +2774,22 @@ class MaterialPreviewWidget(QOpenGLWidget):
         if not points:
             self._scene_center = np.zeros(3, dtype=np.float64)
             self._scene_extent = 1.0
+            self._scene_mins = np.zeros(3, dtype=np.float64)
+            self._scene_maxs = np.ones(3, dtype=np.float64)
             return
         array = np.vstack(points)
         mins = array.min(axis=0)
         maxs = array.max(axis=0)
+        self._scene_mins = mins
+        self._scene_maxs = maxs
         self._scene_center = (mins + maxs) * 0.5
         self._scene_extent = max(0.2, float(np.max(maxs - mins)))
+
+    def set_height_reference(self, meters_per_unit: float, up_axis: int = 2, reference_m: float = HEIGHT_REFERENCE_METERS) -> None:
+        self._height_meters_per_unit = max(0.0, float(meters_per_unit))
+        self._height_up_axis = int(up_axis)
+        self._height_reference_m = float(reference_m)
+        self.update()
 
     def _projection_view_matrices(self) -> tuple[np.ndarray, np.ndarray]:
         width = max(1, self.width())
@@ -3027,6 +3213,16 @@ class MaterialPreviewWidget(QOpenGLWidget):
             label = self._bone_labels.get(self._hovered_bone_uid, self._hovered_bone_uid)
             suffix = f" | {label}" if label else ""
             painter.drawText(12, y, f"Bone overlay: {len(self._bone_lines):,} bones{suffix}")
+        if self._height_meters_per_unit > 0.0 and self._material_positions:
+            draw_meter_height_bar(
+                painter,
+                lambda world: self._project_np(world)[0],
+                self._scene_mins,
+                self._scene_maxs,
+                self._height_up_axis,
+                self._height_meters_per_unit,
+                self._height_reference_m,
+            )
 
     def _emit_stats(self) -> None:
         if not self.scan:

@@ -57,11 +57,21 @@ ROOT_DIR = bundled_resource_root()
 
 
 try:
-    from model_preview import MaterialPreviewWidget, SkeletonPlanPreviewWidget, StaticModelPreviewWidget
+    from model_preview import (
+        MaterialPreviewWidget,
+        SkeletonPlanPreviewWidget,
+        StaticModelPreviewWidget,
+        HEIGHT_REFERENCE_METERS,
+        MAIN_PREVIEW_UNITS_PER_METER,
+        BLENDER_PREVIEW_METERS_PER_UNIT,
+    )
 except Exception:
     StaticModelPreviewWidget = None  # type: ignore[assignment]
     SkeletonPlanPreviewWidget = None  # type: ignore[assignment]
     MaterialPreviewWidget = None  # type: ignore[assignment]
+    HEIGHT_REFERENCE_METERS = 1.65
+    MAIN_PREVIEW_UNITS_PER_METER = {"pmx": 12.527, "vrm": 1.0}
+    BLENDER_PREVIEW_METERS_PER_UNIT = 1.04776
 
 IconVmdPreviewWidget = None
 try:
@@ -3579,6 +3589,49 @@ class ImporterWindow(QtWidgets.QMainWindow):
             multiplier = 1.0
         return round(multiplier * float(getattr(core, "DEFAULT_BODYGROUP_SCALE_FACTOR", 40.457)), 3)
 
+    def update_main_preview_height_reference(self) -> None:
+        """Feed the main preview a meters-per-unit so it can draw the height bar.
+
+        The main preview shows the raw model (PMX Y-up / VRM real-meter). The
+        readout reflects the current scale factor in real time (issue #79):
+        at each format's default multiplier the firefly_alt reference reads 1.65 m.
+        """
+        widget = getattr(self, "main_model_preview", None)
+        if widget is None or not hasattr(widget, "set_height_reference"):
+            return
+        pmx = self.current_main_pmx_path()
+        fmt = pmx.suffix.lower().lstrip(".") if pmx is not None else "pmx"
+        if fmt not in MAIN_PREVIEW_UNITS_PER_METER:
+            fmt = "pmx"
+        units_per_meter = float(MAIN_PREVIEW_UNITS_PER_METER.get(fmt, 12.527))
+        default_mult = float(MODEL_SCALE_DEFAULTS.get(fmt, 1.0)) or 1.0
+        multiplier = float(self.main_scale_spin.value()) if hasattr(self, "main_scale_spin") else default_mult
+        if multiplier <= 0:
+            multiplier = default_mult
+        meters_per_unit = (1.0 / units_per_meter) * (multiplier / default_mult) if units_per_meter > 0 else 0.0
+        widget.set_height_reference(meters_per_unit, up_axis=1, reference_m=HEIGHT_REFERENCE_METERS)
+
+    def update_material_preview_height_reference(self) -> None:
+        """Feed the Step 5 preview a meters-per-unit for its height bar.
+
+        Step 5 is in Blender space (pre-Step-6 scaling); the readout uses the
+        workspace format's default scale so the bar shows the model's natural
+        in-game height (firefly_alt reference reads 1.65 m).
+        """
+        widget = getattr(self, "material_preview", None)
+        if widget is None or not hasattr(widget, "set_height_reference"):
+            return
+        fmt = "pmx"
+        try:
+            raw = self.material_input_row.value() if hasattr(self, "material_input_row") else ""
+            if raw:
+                fmt = self.workspace_model_format_for_path(Path(clean_path_text(raw)))
+        except Exception:
+            fmt = "pmx"
+        default_mult = float(MODEL_SCALE_DEFAULTS.get(fmt, 1.0)) or 1.0
+        meters_per_unit = float(BLENDER_PREVIEW_METERS_PER_UNIT) * default_mult
+        widget.set_height_reference(meters_per_unit, up_axis=2, reference_m=HEIGHT_REFERENCE_METERS)
+
     def configured_category_pairs(self) -> list[dict[str, object]]:
         """Fast, config-only category pairs so completers exist at startup; the disk scan runs async."""
         configured_categories, scan_roots, loaded_files = load_category_suggestion_config()
@@ -5140,6 +5193,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.main_scale_spin.setDecimals(3)
         self.main_scale_spin.setSingleStep(0.01)
         self.main_scale_spin.setValue(MODEL_SCALE_DEFAULTS["pmx"])
+        # Real-time height bar: re-scale the meter readout as the factor changes.
+        self.main_scale_spin.valueChanged.connect(lambda _value: self.update_main_preview_height_reference())
         self.main_scale_spin.setToolTip(
             "Multiplier on the Step 6 base scale of "
             f"{float(getattr(core, 'DEFAULT_BODYGROUP_SCALE_FACTOR', 40.457))}. "
@@ -9768,6 +9823,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
             return
         try:
             model = self.main_model_preview.load_model(pmx)
+            self.update_main_preview_height_reference()
             self.main_preview_status_label.setText(
                 f"OpenGL preview loaded | {model.vertex_count:,} verts | {model.triangle_count:,} tris | "
                 f"{len(model.bones):,} bones | {model.morph_count:,} morphs | {len(model.materials):,} materials"
@@ -13053,6 +13109,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
             self.material_preview.set_material_data(self.current_material_scan, self.current_material_plan)
             self.material_preview.set_hovered_material(self._hover_material_uid)
             self.material_preview.set_selected_material("")
+            self.update_material_preview_height_reference()
         self.refresh_material_merge_preview()
 
     def update_material_preview_entry(self, uid: str, keep: bool | None = None, proposed_name: str | None = None) -> None:
