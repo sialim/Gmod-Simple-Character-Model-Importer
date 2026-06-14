@@ -1432,6 +1432,28 @@ def workspace_compile_source_copy_dir(qc_dir: Path) -> Path:
     return qc_dir / "0_qc_source"
 
 
+# Only these QC files are kept in the distributed qc_compile_source folder; the
+# others (compile_initial.qc / compile_hbox_probe.qc) are intermediate passes
+# used only during Step 14's multi-stage compile and aren't needed to re-compile
+# the shipped model or player model.
+COMPILE_SOURCE_KEEP_QC = ("compile.qc", "compile_pm.qc")
+
+
+def prune_extra_compile_source_qc(folder: Path) -> None:
+    """Drop every top-level ``*.qc`` in ``folder`` except compile.qc / compile_pm.qc."""
+    keep = {name.casefold() for name in COMPILE_SOURCE_KEEP_QC}
+    try:
+        qc_files = list(folder.glob("*.qc"))
+    except OSError:
+        return
+    for qc in qc_files:
+        if qc.name.casefold() not in keep:
+            try:
+                qc.unlink()
+            except OSError:
+                pass
+
+
 def distribution_compile_source_copy_dir(distribution_output_dir: Path, model: str, author: str) -> Path:
     return distribution_output_dir / f"{model}_{author}_qc_compile_source"
 
@@ -3657,6 +3679,9 @@ def compose(plan_path: Path) -> dict[str, Any]:
         else:
             copytree_clean(source_dir, compile_source_copy_dir)
             generated_files.append(folder_row(compile_source_copy_dir, "qc_compile_source"))
+        # Keep only the re-compilable QCs in the distributed source copy. The
+        # distribution copy below is made from this folder, so it inherits the prune.
+        prune_extra_compile_source_qc(compile_source_copy_dir)
     except Exception as exc:
         errors.append(f"Failed to copy QC compile source folder: {exc}")
     compiled_files, compiled_errors = copy_compiled_outputs(compile_game_dir, addon_dir, author, category, stems)
