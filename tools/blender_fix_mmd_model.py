@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -233,6 +234,118 @@ def clear_custom_normals(stage: str = "") -> int:
     return cleared
 
 
+# Bones whose names contain these tokens are normally treated as the humanoid
+# spine by CATS' Fix Model / Convert to Valve. A bone that matches one of these
+# AND sits far off the body's center axis is not a real spine bone — it is a
+# decoration/physics chain the modeler merely named "spine". Left untouched it
+# hijacks the ValveBiped spine conversion and produces an off-center
+# ValveBiped.Bip01_Spine1 that step 3 cannot repair (GitHub issue #86).
+MISDETECTED_SPINE_TOKENS = ("spine",)
+# Off-center tolerance for the gate above, expressed as a fraction of the
+# armature's vertical extent (with an absolute floor for tiny rigs). Real
+# humanoid spine bones sit on the center axis (offset ~0), so this never touches
+# a correct spine; only sideways accessories exceed it. The 0.075 value sits in
+# a clean, empirically measured gap: across the known-good model corpus the most
+# off-center benign "spine"-named accessory (a ribbon chain) reaches ~0.055 of
+# height, while the spine-hijacking chain from issue #86 starts at ~0.099 — so
+# 0.075 catches the real culprits with margin and leaves every benign accessory
+# (and every correctly centered spine) untouched.
+SPINE_ACCESSORY_OFFCENTER_FRACTION = 0.075
+SPINE_ACCESSORY_OFFCENTER_FLOOR = 0.03
+
+
+def _unique_bone_name(base: str, taken: set[str]) -> str:
+    candidate = base
+    index = 1
+    while candidate in taken or not candidate:
+        candidate = f"{base}.{index:03d}"
+        index += 1
+    taken.add(candidate)
+    return candidate
+
+
+def protect_misdetected_spine_accessories() -> dict[str, object]:
+    """Rename off-center "spine"-named accessory bones before CATS conversion.
+
+    Some models carry decoration/physics chains literally named "...Spine..."
+    that sit far to one side of the body. CATS' Fix Model + Convert to Valve
+    treat them as humanoid spine bones and can map one onto
+    ValveBiped.Bip01_Spine1, leaving the real (centered) spine collapsed and an
+    off-center Spine1 that step 3's spine repair cannot resolve (issue #86).
+
+    We rename such bones (and their matching vertex groups, so weights stay
+    attached) to a neutral name that no longer contains a spine token, before
+    CATS runs, so the real centered spine is used for the conversion instead.
+    The off-center gate means correctly centered spine bones are never affected,
+    so standard models are untouched.
+    """
+    result: dict[str, object] = {"checked": False, "renamed": []}
+    renamed: list[dict[str, object]] = []
+    rename_map: dict[str, str] = {}
+    for armature in armatures():
+        bones = armature.data.bones
+        if not bones:
+            continue
+        result["checked"] = True
+        zs = [coord for bone in bones for coord in (bone.head_local.z, bone.tail_local.z)]
+        height = (max(zs) - min(zs)) if zs else 0.0
+        sorted_x = sorted(bone.head_local.x for bone in bones)
+        center_x = sorted_x[len(sorted_x) // 2] if sorted_x else 0.0
+        tolerance = max(SPINE_ACCESSORY_OFFCENTER_FLOOR, SPINE_ACCESSORY_OFFCENTER_FRACTION * height)
+        taken = {bone.name for bone in bones}
+        targets: list[str] = []
+        for bone in bones:
+            name = bone.name
+            if name.startswith("ValveBiped"):
+                continue
+            low = name.lower()
+            if not any(token in low for token in MISDETECTED_SPINE_TOKENS):
+                continue
+            offset = abs(bone.head_local.x - center_x)
+            if offset <= tolerance:
+                continue
+            base = re.sub(r"(?i)spine", "AccChain", name)
+            if any(token in base.lower() for token in MISDETECTED_SPINE_TOKENS):
+                base = "AccChain_" + re.sub(r"(?i)spine", "", name).strip("_")
+            new_name = _unique_bone_name(base, taken)
+            rename_map[name] = new_name
+            targets.append(name)
+            renamed.append(
+                {
+                    "armature": armature.name,
+                    "old": name,
+                    "new": new_name,
+                    "x_offset": round(offset, 4),
+                    "tolerance": round(tolerance, 4),
+                }
+            )
+        if not targets:
+            continue
+        set_active_object(armature)
+        bpy.ops.object.mode_set(mode="EDIT")
+        try:
+            edit_bones = armature.data.edit_bones
+            for name in targets:
+                edit_bone = edit_bones.get(name)
+                if edit_bone is not None:
+                    edit_bone.name = rename_map[name]
+        finally:
+            ensure_object_mode()
+    if rename_map:
+        for obj in mesh_objects():
+            for old_name, new_name in rename_map.items():
+                group = obj.vertex_groups.get(old_name)
+                if group is not None:
+                    group.name = new_name
+        print(f"Protected {len(renamed)} off-center spine-named accessory bone(s) before CATS conversion:")
+        for entry in renamed:
+            print(f"  {entry['old']} -> {entry['new']} (x offset {entry['x_offset']} > tolerance {entry['tolerance']})")
+    else:
+        print("No off-center spine-named accessory bones detected; spine conversion proceeds normally.")
+    result["renamed"] = renamed
+    return result
+
+
 def fix_armature_twice() -> None:
     for index in range(2):
         print(f"Running CATS Fix Model pass {index + 1}/2.")
@@ -357,6 +470,7 @@ def build_report(
     initial_cleared_custom_normals: int,
     final_cleared_custom_normals: int,
     vrm_spine_merge: dict[str, object] | None = None,
+    spine_accessory_protection: dict[str, object] | None = None,
 ) -> dict[str, object]:
     merged_away = {SPINE2_BONE} if vrm_spine_merge and vrm_spine_merge.get("merged") else set()
     status = valve_bone_status(excluded=merged_away)
@@ -382,6 +496,7 @@ def build_report(
         "custom_normal_meshes_cleared_initial": initial_cleared_custom_normals,
         "custom_normal_meshes_cleared_final": final_cleared_custom_normals,
         "vrm_spine_merge": vrm_spine_merge,
+        "spine_accessory_protection": spine_accessory_protection,
         "valve_bones": status,
         "objects": [
             {
@@ -408,6 +523,7 @@ def main() -> int:
     bpy.ops.wm.open_mainfile(filepath=str(args.input_blend))
     enable_cats()
     make_single_user()
+    spine_accessory_protection = protect_misdetected_spine_accessories()
     if args.clear_custom_normals:
         initial_cleared_custom_normals = clear_custom_normals("before model fix")
     else:
@@ -432,6 +548,7 @@ def main() -> int:
         initial_cleared_custom_normals,
         final_cleared_custom_normals,
         vrm_spine_merge,
+        spine_accessory_protection,
     )
     missing_valve_bones = report["valve_bones"]["missing"]
     if missing_valve_bones:
