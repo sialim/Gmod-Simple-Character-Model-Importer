@@ -19,6 +19,11 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 REFERENCE_FLEX_SCRIPT = ROOT / "reference" / "li_zhiyan_npc" / "3_Flexes" / "Blender_p3.py"
+# Corpus-aggregated morph->flex dictionary (majority vote across released models;
+# entries present in >=2 models, category-consistent). This is the primary,
+# authoritative exact-match source. Kept under tools/ so it is both tracked and
+# bundled with the rest of the pipeline (the reference/ tree is gitignored).
+REFERENCE_FLEX_DICTIONARY = Path(__file__).resolve().parent / "flex_name_dictionary.json"
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 FLEX_NAME_RE = re.compile(r"^[a-z0-9_]+$")
 EPSILON = 1e-7
@@ -121,7 +126,20 @@ def load_reference_mapping() -> tuple[dict[str, str], list[str]]:
                 mapping.update({str(key): str(val) for key, val in value.items()})
             break
     except Exception as exc:
-        message = f"Reference flex mapping unavailable ({REFERENCE_FLEX_SCRIPT}): {exc}; automatic flex names fall back to the built-in {len(FALLBACK_FLEX_MAPPING)}-entry dictionary."
+        message = f"Reference flex mapping unavailable ({REFERENCE_FLEX_SCRIPT}): {exc}; relying on the bundled corpus dictionary and built-in fallback."
+        print(f"Warning: {message}")
+        warnings.append(message)
+    # Authoritative corpus dictionary, applied last so its majority-vote names win.
+    try:
+        data = json.loads(REFERENCE_FLEX_DICTIONARY.read_text(encoding="utf-8"))
+        corpus = data.get("mapping") if isinstance(data, dict) else None
+        if isinstance(corpus, dict) and corpus:
+            mapping.update({str(key): str(val) for key, val in corpus.items()})
+            print(f"Loaded {len(corpus)} flex name mappings from the bundled corpus dictionary.")
+        else:
+            raise ValueError("missing or empty 'mapping' object")
+    except Exception as exc:
+        message = f"Bundled flex dictionary unavailable ({REFERENCE_FLEX_DICTIONARY}): {exc}; automatic flex names use {len(mapping)} fallback/reference entries."
         print(f"Warning: {message}")
         warnings.append(message)
     return mapping, warnings
@@ -165,13 +183,30 @@ def infer_flex_name(original: str, bodygroup: str, mapping: dict[str, str], norm
 
     side = infer_side_suffix(original)
     lower = normalized
+    # Detect the facial region the modeler named explicitly. This prefix is
+    # DECISIVE for which Source flex family the expression belongs to: e.g.
+    # "Mouth_Sad" is a mouth flex even though a bare "Sad" defaults to brows, and
+    # "Mouth_Surprise" is a mouth flex even though a bare "Surprise" is eyes
+    # (GitHub issue: Mouth_Sad01 was wrongly renamed brows_sad). Order matters so
+    # "eyebrow" resolves to brows, not eyes.
     category_hint = ""
-    if lower.startswith("b") and any(hint in lower for hint in ("angry", "anger", "sad", "flat", "happy", "cheer", "serious", "lower", "upper")):
+    if "brow" in lower or "mayu" in lower:
         category_hint = "brows"
-    elif lower.startswith("e") and any(hint in lower for hint in ("blink", "close", "sad", "anger", "surpris", "stare", "calm")):
-        category_hint = "eyes"
-    elif lower.startswith("m") or any(hint in lower for hint in ("mouth", "jaw", "tooth", "teeth", "tongue")):
+    elif any(token in lower for token in ("mouth", "jaw", "lip", "tooth", "teeth", "tongue", "fang")):
         category_hint = "mouth"
+    elif any(token in lower for token in ("eye", "blink", "wink", "pupil")):
+        category_hint = "eyes"
+    elif "nose" in lower:
+        category_hint = "nose"
+    if not category_hint:
+        # Legacy first-letter fallback, preserved so models without an explicit
+        # region token keep their previous (working) categorisation.
+        if lower.startswith("b") and any(hint in lower for hint in ("angry", "anger", "sad", "flat", "happy", "cheer", "serious", "lower", "upper")):
+            category_hint = "brows"
+        elif lower.startswith("e") and any(hint in lower for hint in ("blink", "close", "sad", "anger", "surpris", "stare", "calm")):
+            category_hint = "eyes"
+        elif lower.startswith("m"):
+            category_hint = "mouth"
 
     vowel_map = {
         "a": "mouth_a",
@@ -192,15 +227,29 @@ def infer_flex_name(original: str, bodygroup: str, mapping: dict[str, str], norm
         return f"eye_blink{side}", "eyes", 0.82, warnings
     if "wink" in lower:
         return f"eye_blink_happy{side}", "eyes", 0.80, warnings
-    if "smile" in lower:
-        return f"mouth_smile{side}", "mouth", 0.78, warnings
+    if "smil" in lower:  # smile / smiley / smily
+        cat = category_hint or "mouth"
+        return f"{cat}_smile{side}", cat, 0.78, warnings
     if "grin" in lower or "laugh" in lower:
-        return f"mouth_grin{side}", "mouth", 0.78, warnings
+        cat = category_hint if category_hint in ("mouth", "eyes") else "mouth"
+        return f"{cat}_grin{side}", cat, 0.78, warnings
     if "angry" in lower or "anger" in lower:
-        return f"brows_angry{side}" if category_hint != "mouth" else f"mouth_anger{side}", category_hint or "brows", 0.74, warnings
+        if category_hint == "mouth":
+            return f"mouth_anger{side}", "mouth", 0.74, warnings
+        if category_hint == "eyes":
+            return f"eyes_anger{side}", "eyes", 0.74, warnings
+        return f"brows_angry{side}", "brows", 0.74, warnings
     if "sad" in lower:
-        return f"brows_sad{side}" if category_hint != "eyes" else f"eyes_sad{side}", category_hint or "brows", 0.74, warnings
+        if category_hint == "mouth":
+            return f"mouth_sad{side}", "mouth", 0.74, warnings
+        if category_hint == "eyes":
+            return f"eyes_sad{side}", "eyes", 0.74, warnings
+        return f"brows_sad{side}", "brows", 0.74, warnings
     if "surpris" in lower:
+        if category_hint == "mouth":
+            return f"mouth_surprise{side}", "mouth", 0.74, warnings
+        if category_hint == "brows":
+            return f"brows_surprise{side}", "brows", 0.74, warnings
         return f"eyes_surprised{side}", "eyes", 0.74, warnings
     if "blush" in lower or "face_red" in lower:
         return "misc_blush", "misc", 0.74, warnings

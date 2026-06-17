@@ -65,10 +65,12 @@ FACE_NAME_HINTS = (
     "mouth",
     "lip",
     "brow",
+    "eye",
     "eyebrow",
     "eyelid",
     "cheek",
     "beak",
+    "angulusoris",
 )
 SAFE_BONE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
 SOURCE_BONE_NAME_PATTERN = re.compile(r"^ValveBiped\.Bip01_[A-Za-z0-9_]+$")
@@ -460,6 +462,39 @@ def automatic_plan(armature: bpy.types.Object, limit: int, weight_totals: dict[s
     warnings: list[str] = []
     max_rounds = 20
     round_index = 1
+
+    # Always merge flex-driven facial detail bones (eyes/brows/nose/tongue/teeth/
+    # lips/eyelids/cheeks/mouth-corners under Head1) into Head1 first, regardless
+    # of the bone limit. Source animates the face with flexes, not bones, so these
+    # bones are never needed; left in place they also get mis-detected as
+    # jigglebones in step 14. Eye_L/Eye_R (the Source eye-posing bones) are
+    # protected and stay. Hair/accessory bones under Head1 carry no facial token,
+    # so they are untouched and remain available for jiggle.
+    if HEAD in existing:
+        forced_face = face_source_names(simulated_parents, existing, protected)
+        if forced_face:
+            depths = depth_map_from_parents(simulated_parents, existing)
+            forced_ops: list[dict[str, object]] = []
+            order = 0
+            for source in sorted(forced_face, key=lambda name: (-depths.get(name, 0), natural_key(name))):
+                if source not in existing or source == HEAD:
+                    continue
+                forced_ops.append(
+                    operation(0, order, source, HEAD, "Head face detail", "always merge flex/face detail into Head1", depths.get(source, 0))
+                )
+                order += 1
+            if forced_ops:
+                before = len(existing)
+                simulate_operations(simulated_parents, existing, forced_ops)
+                operations.extend(forced_ops)
+                rounds.append(
+                    {
+                        "round": 0,
+                        "operation_count": len(forced_ops),
+                        "before_count": before,
+                        "after_count": len(existing),
+                    }
+                )
 
     while len(existing) > limit and round_index <= max_rounds:
         round_ops: list[dict[str, object]] = []

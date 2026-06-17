@@ -743,6 +743,30 @@ def essential_ancestor(node: SmdNode, nodes: dict[int, SmdNode]) -> str:
     return ""
 
 
+# Flex-driven facial-detail bone name tokens. Mirrors FACE_NAME_HINTS in
+# blender_sort_bones.py (keep in sync): the face animates via flexes, not bones,
+# so these are never jigglebones. The "lip" token also appears inside "clip"
+# (a real jiggle accessory) — the caller only applies this after excluding
+# jiggle-hinted names, which resolves that overlap.
+FACIAL_FLEX_TOKENS = (
+    "eye", "eyebrow", "eyelid", "brow", "nose", "tongue", "tooth", "teeth",
+    "mouth", "lip", "jaw", "cheek", "beak", "angulusoris", "face",
+)
+
+
+def is_facial_flex_bone(name: str, node: SmdNode, nodes: dict[int, SmdNode]) -> bool:
+    """A flex-driven facial detail bone living under Head1 (never a jigglebone).
+
+    Step 4 normally merges these into Head1; this catches any that survive
+    (manual/legacy runs, or non-merged inputs) so auto-select never turns an
+    eye/brow/nose/tongue/teeth/lip/eyelid/mouth bone into a jigglebone.
+    """
+    lname = lower_name(name)
+    if not any(token in lname for token in FACIAL_FLEX_TOKENS):
+        return False
+    return essential_ancestor(node, nodes) == "ValveBiped.Bip01_Head1"
+
+
 def weighted_stats_from_smds(smds: list[SmdData], nodes: dict[int, SmdNode]) -> dict[str, dict[str, Any]]:
     stats: dict[str, dict[str, Any]] = {
         node.name: {"weighted_vertices": 0, "weight_sum": 0.0, "pos_sum": [0.0, 0.0, 0.0]}
@@ -927,11 +951,11 @@ def classify_jigglebones(nodes: dict[int, SmdNode], stats: dict[str, dict[str, A
         confidence = 0.0
         jiggle_type = "Not Jiggle"
         reason = "no jiggle evidence"
+        hint_hit = any(hint in lname or hint in name for hint in jiggle_hints)
         if is_essential_bone(name):
             reason = "essential Source/twist/eye bone"
             confidence = 1.0
         else:
-            hint_hit = any(hint in lname or hint in name for hint in jiggle_hints)
             near_support = nearest_dist <= near_threshold and weighted < 25 and not hint_hit
             if near_support:
                 reason = f"support/helper near {nearest_name}"
@@ -963,6 +987,15 @@ def classify_jigglebones(nodes: dict[int, SmdNode], stats: dict[str, dict[str, A
                 warnings.append("Low-confidence jiggle classification; verify manually.")
             else:
                 confidence = 0.7
+        # Guard rail: flex-driven facial detail bones under Head1 (eyes/brows/
+        # nose/tongue/teeth/lips/eyelids/mouth) never jiggle. Excluding
+        # jiggle-hinted names (hint_hit) keeps real accessories such as hairclips
+        # ("clip" contains "lip") jiggle-eligible. Step 4 usually merges these
+        # into Head1; this protects manual/legacy runs where they survive.
+        if jiggle_type != "Not Jiggle" and not hint_hit and is_facial_flex_bone(name, node, nodes):
+            jiggle_type = "Not Jiggle"
+            reason = "flex-driven facial detail bone under Head1; never a jigglebone"
+            confidence = 0.95
         direct_children = direct_child_counts.get(node.index, 0)
         if jiggle_type != "Not Jiggle" and direct_children > 4:
             jiggle_type = "Not Jiggle"

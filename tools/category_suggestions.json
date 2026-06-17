@@ -1,28 +1,476 @@
 {
   "version": 1,
-  "description": "Category suggestions shown in the main and QC category fields. Add internal/display pairs under categories.",
+  "description": "Category suggestions for the main and QC (step 14) category fields. 'categories' maps the internal model-path folder name to the English display name; 'translations' optionally maps it to localized names per app language (lang code -> name), shown as a hint in the picker. Derived from the released-model corpus plus popular anime/gacha titles.",
   "scan_roots": [
     "E:/G/Upload"
   ],
   "categories": {
     "SheepyLord": "SheepyLord",
     "aether_gazer": "Aether Gazer",
-    "genshin_impact": "Genshin Impact",
-    "honkai_star_rail": "Honkai: Star Rail",
-    "saekano": "Saekano",
-    "wuthering_waves": "Wuthering Waves",
-    "zenless_zone_zero": "Zenless Zone Zero",
-    "neverness_to_everness": "Neverness to Everness",
+    "alya": "Alya",
     "ananta": "Ananta",
-    "azur_lane": "Azur Lane",
-    "blue_archive": "Blue Archive",
-    "fate_grand_order": "Fate Grand Order",
-    "honkai_impact": "Honkai Impact",
+    "aplaybox": "Aplaybox",
+    "arknight_endfield": "Arknights: Endfield",
     "arknights": "Arknights",
-    "arknights_endfield": "Arknights: Endfield",
+    "asus": "ASUS",
+    "atri_my_dear_moments": "ATRI My Dear Moments",
+    "ave_mujika": "Ave Mujica",
+    "azur_lane": "Azur Lane",
+    "bang_dream": "BanG Dream!",
+    "blend_s": "Blend S",
+    "blue_archive": "Blue Archive",
+    "boarding_school_juliet": "Boarding School Juliet",
+    "bocchi_the_rock": "Bocchi the Rock!",
+    "brown_dust_2": "Brown Dust 2",
+    "chainsaw_man": "Chainsaw Man",
+    "counter_side": "CounterSide",
+    "date_a_live": "Date A Live",
+    "demon_slayer": "Demon Slayer",
+    "depersonalization": "Depersonalization",
+    "duet_night_abyss": "Duet Night Abyss",
+    "epic_seven": "Epic Seven",
+    "fate_grand_order": "Fate/Grand Order",
+    "fate_stay_night": "Fate/stay night",
+    "frieren": "Frieren: Beyond Journey's End",
+    "gakuen_idol_master": "Gakuen iDOL MASTER",
+    "genshin_impact": "Genshin Impact",
+    "girls_frontline": "Girls' Frontline",
+    "girls_frontline_2": "Girls' Frontline 2: Exilium",
+    "goddess_of_victory_nikke": "Goddess of Victory: Nikke",
+    "granblue_fantasy": "Granblue Fantasy",
+    "grok": "Grok",
+    "gyakuryyu_chakai": "Niliu Chahui",
+    "hololive": "Hololive",
+    "honkai_impact": "Honkai Impact",
+    "honkai_star_rail": "Honkai: Star Rail",
+    "hungry_Lamb": "Hungry Lamb",
+    "jujutsu_kaisen": "Jujutsu Kaisen",
+    "kaguya_sama": "Kaguya-sama: Love Is War",
+    "kantai_collection": "Kancolle",
+    "konosuba": "KonoSuba",
+    "limbus_company": "Limbus Company",
+    "love_live": "Love Live!",
+    "lycoris_recoil": "Lycoris Recoil",
+    "miside": "Miside",
+    "my_dress_up_darling": "My Dress-Up Darling",
+    "neverness_to_everness": "Neverness to Everness",
+    "nijisanji": "Nijisanji",
+    "oshi_no_ko": "Oshi no Ko",
+    "path_to_nowhere": "Path to Nowhere",
+    "princess_connect": "Princess Connect! Re:Dive",
+    "punishing_gray_raven": "Punishing: Gray Raven",
+    "re_memento_white_shadows": "Re:memento: White Shadows",
+    "re_zero": "Re:Zero",
+    "reverse_1999": "Reverse: 1999",
+    "riddlejoker": "Riddle Joker",
+    "saekano": "Saekano",
+    "seirei_gensouki": "Seirei Gensouki",
+    "senrenbanka": "Senrenbanka",
+    "silver_palace": "Silver Palace",
+    "snowbreak_containment_zone": "Snowbreak: Containment Zone",
+    "spy_x_family": "Spy x Family",
+    "star_detective_precure": "Star Detective Precure",
+    "strinova": "Strinova",
+    "sword_art_online": "Sword Art Online",
+    "the_idolmaster": "The Idolmaster",
+    "touhou": "Touhou Project",
+    "touhou_project": "Touhou Project",
+    "tower_of_fantasy": "Tower of Fantasy",
+    "umamusume_pretty_derby": "Umamusume: Pretty Derby",
+    "vampire_neighborhood": "Ms. Vampire Who Lives in My Neighborhood",
     "virtual_youtuber": "Virtual YouTuber",
     "vocaloid": "Vocaloid",
-    "touhou_project": "Touhou Project",
-    "duet_night_abyss": "Duet Night Abyss"
+    "vrchat": "VRChat",
+    "vtuber_indie": "Indie VTuber",
+    "wandering_witch": "Wandering Witch",
+    "wuthering_waves": "Wuthering Waves",
+    "zenless_zone_zero": "Zenless Zone Zero"
+  },
+  "translations": {
+    "aether_gazer": {
+      "ja_jp": "エーテルゲイザー",
+      "zh_cn": "深空之眼",
+      "zh_tw": "深空之眼"
+    },
+    "alya": {
+      "ja_jp": "時々ボソッとロシア語でデレる隣のアーリャさん",
+      "ru_ru": "Аля иногда кокетничает со мной по-русски",
+      "zh_tw": "不時輕聲地以俄語遮羞的鄰座艾莉同學"
+    },
+    "ananta": {
+      "zh_cn": "无限大",
+      "zh_tw": "無限大"
+    },
+    "arknight_endfield": {
+      "ja_jp": "アークナイツ：エンドフィールド",
+      "ko_kr": "명일방주: 엔드필드",
+      "zh_cn": "明日方舟：终末地",
+      "zh_tw": "明日方舟：終末地"
+    },
+    "arknights": {
+      "ja_jp": "アークナイツ",
+      "ko_kr": "명일방주",
+      "zh_cn": "明日方舟",
+      "zh_tw": "明日方舟"
+    },
+    "atri_my_dear_moments": {
+      "ja_jp": "ATRI -My Dear Moments-",
+      "ko_kr": "ATRI -My Dear Moments-",
+      "zh_cn": "亚托莉 -我挚爱的时光-",
+      "zh_tw": "ATRI -My Dear Moments-"
+    },
+    "azur_lane": {
+      "ja_jp": "アズールレーン",
+      "ko_kr": "벽람항로",
+      "zh_cn": "碧蓝航线",
+      "zh_tw": "碧藍航線"
+    },
+    "blend_s": {
+      "ja_jp": "ブレンド・S",
+      "zh_tw": "Blend・S"
+    },
+    "blue_archive": {
+      "ja_jp": "ブルーアーカイブ",
+      "ko_kr": "블루 아카이브",
+      "zh_cn": "蔚蓝档案",
+      "zh_tw": "蔚藍檔案"
+    },
+    "boarding_school_juliet": {
+      "ja_jp": "寄宿学校のジュリエット",
+      "ko_kr": "기숙학교의 줄리엣",
+      "zh_cn": "寄宿学校的朱丽叶",
+      "zh_tw": "寄宿學校的茱麗葉"
+    },
+    "bocchi_the_rock": {
+      "ja_jp": "ぼっち・ざ・ろっく！",
+      "ko_kr": "봇치 더 록!",
+      "zh_cn": "孤独摇滚！",
+      "zh_tw": "孤獨搖滾！"
+    },
+    "brown_dust_2": {
+      "ja_jp": "ブラウンダスト2",
+      "ko_kr": "브라운더스트2",
+      "zh_cn": "棕色尘埃2",
+      "zh_tw": "棕色塵埃2"
+    },
+    "chainsaw_man": {
+      "ja_jp": "チェンソーマン",
+      "ko_kr": "체인소 맨",
+      "ru_ru": "Человек бензопила",
+      "zh_cn": "电锯人",
+      "zh_tw": "鏈鋸人"
+    },
+    "counter_side": {
+      "ja_jp": "カウンターサイド",
+      "ko_kr": "카운터사이드"
+    },
+    "date_a_live": {
+      "ja_jp": "デート・ア・ライブ",
+      "ko_kr": "데이트 어 라이브",
+      "zh_cn": "约会大作战",
+      "zh_tw": "約會大作戰"
+    },
+    "demon_slayer": {
+      "ja_jp": "鬼滅の刃",
+      "ko_kr": "귀멸의 칼날",
+      "ru_ru": "Клинок, рассекающий демонов",
+      "zh_cn": "鬼灭之刃",
+      "zh_tw": "鬼滅之刃"
+    },
+    "depersonalization": {
+      "zh_cn": "人格解体",
+      "zh_tw": "人格解體"
+    },
+    "duet_night_abyss": {
+      "zh_cn": "二重螺旋",
+      "zh_tw": "二重螺旋"
+    },
+    "epic_seven": {
+      "ja_jp": "エピックセブン",
+      "ko_kr": "에픽세븐",
+      "zh_cn": "第七史诗",
+      "zh_tw": "第七史詩"
+    },
+    "frieren": {
+      "es_es": "Frieren: Más allá del final del viaje",
+      "ja_jp": "葬送のフリーレン",
+      "ko_kr": "장송의 프리렌",
+      "ru_ru": "Фрирен, провожающая в последний путь",
+      "zh_cn": "葬送的芙莉莲",
+      "zh_tw": "葬送的芙莉蓮"
+    },
+    "gakuen_idol_master": {
+      "ja_jp": "学園アイドルマスター",
+      "ko_kr": "학원 아이돌마스터",
+      "zh_cn": "学园偶像大师",
+      "zh_tw": "學園偶像大師"
+    },
+    "genshin_impact": {
+      "ja_jp": "原神",
+      "ko_kr": "원신",
+      "zh_cn": "原神",
+      "zh_tw": "原神"
+    },
+    "girls_frontline": {
+      "ja_jp": "ドールズフロントライン",
+      "ko_kr": "소녀전선",
+      "zh_cn": "少女前线",
+      "zh_tw": "少女前線"
+    },
+    "girls_frontline_2": {
+      "ja_jp": "ドールズフロントライン2: Exilium",
+      "ko_kr": "소녀전선2: 망명",
+      "zh_cn": "少女前线2：追放",
+      "zh_tw": "少女前線2：追放"
+    },
+    "goddess_of_victory_nikke": {
+      "ja_jp": "勝利の女神：NIKKE",
+      "ko_kr": "승리의 여신: 니케",
+      "zh_cn": "胜利女神：NIKKE",
+      "zh_tw": "勝利女神：妮姬"
+    },
+    "granblue_fantasy": {
+      "ja_jp": "グランブルーファンタジー",
+      "ko_kr": "그랑블루 판타지",
+      "zh_cn": "碧蓝幻想",
+      "zh_tw": "碧藍幻想"
+    },
+    "gyakuryyu_chakai": {
+      "zh_cn": "逆流茶会",
+      "zh_tw": "逆流茶會"
+    },
+    "hololive": {
+      "ja_jp": "ホロライブ"
+    },
+    "honkai_impact": {
+      "ja_jp": "崩壊3rd",
+      "ko_kr": "붕괴3rd",
+      "zh_cn": "崩坏3",
+      "zh_tw": "崩壞3rd"
+    },
+    "honkai_star_rail": {
+      "ja_jp": "崩壊：スターレイル",
+      "ko_kr": "붕괴: 스타레일",
+      "zh_cn": "崩坏：星穹铁道",
+      "zh_tw": "崩壞：星穹鐵道"
+    },
+    "hungry_Lamb": {
+      "zh_cn": "饥饿的羔羊：售卖少女的村庄",
+      "zh_tw": "餓殍：明末千里行"
+    },
+    "jujutsu_kaisen": {
+      "ja_jp": "呪術廻戦",
+      "ko_kr": "주술회전",
+      "ru_ru": "Магическая битва",
+      "zh_cn": "咒术回战",
+      "zh_tw": "咒術迴戰"
+    },
+    "kaguya_sama": {
+      "ja_jp": "かぐや様は告らせたい",
+      "ko_kr": "카구야 님은 고백받고 싶어",
+      "ru_ru": "Госпожа Кагуя: в любви как на войне",
+      "zh_cn": "辉夜大小姐想让我告白",
+      "zh_tw": "輝夜姬想讓人告白"
+    },
+    "kantai_collection": {
+      "ja_jp": "艦隊これくしょん -艦これ-",
+      "ko_kr": "칸코레",
+      "zh_cn": "舰队Collection",
+      "zh_tw": "艦隊Collection"
+    },
+    "konosuba": {
+      "ja_jp": "この素晴らしい世界に祝福を！",
+      "ko_kr": "이 멋진 세계에 축복을!",
+      "zh_cn": "为美好的世界献上祝福！",
+      "zh_tw": "為美好的世界獻上祝福！"
+    },
+    "limbus_company": {
+      "ko_kr": "림버스 컴퍼니",
+      "zh_cn": "边狱公司",
+      "zh_tw": "邊獄公司"
+    },
+    "love_live": {
+      "ja_jp": "ラブライブ！",
+      "ko_kr": "러브 라이브!",
+      "zh_tw": "LoveLive!"
+    },
+    "lycoris_recoil": {
+      "ja_jp": "リコリス・リコイル",
+      "ko_kr": "리코리스 리코일",
+      "zh_cn": "莉可丽丝",
+      "zh_tw": "莉可麗絲"
+    },
+    "miside": {
+      "ja_jp": "MiSide",
+      "zh_cn": "米塔",
+      "zh_tw": "MiSide 米塔"
+    },
+    "my_dress_up_darling": {
+      "ja_jp": "その着せ替え人形は恋をする",
+      "ko_kr": "그 비스크 돌은 사랑을 한다",
+      "ru_ru": "Любовь с иголочки",
+      "zh_cn": "更衣人偶坠入爱河",
+      "zh_tw": "戀上換裝娃娃"
+    },
+    "neverness_to_everness": {
+      "zh_cn": "异环",
+      "zh_tw": "異環",
+      "ja_jp": "ネバーネス・トゥ・エバーネス",
+      "ko_kr": "이환 NTE"
+    },
+    "nijisanji": {
+      "ja_jp": "にじさんじ"
+    },
+    "oshi_no_ko": {
+      "ja_jp": "【推しの子】",
+      "ko_kr": "최애의 아이",
+      "zh_cn": "【我推的孩子】",
+      "zh_tw": "【我推的孩子】"
+    },
+    "path_to_nowhere": {
+      "zh_cn": "无期迷途",
+      "zh_tw": "無期迷途"
+    },
+    "princess_connect": {
+      "ja_jp": "プリンセスコネクト！Re:Dive",
+      "ko_kr": "프린세스 커넥트! Re:Dive",
+      "zh_cn": "公主连结Re:Dive",
+      "zh_tw": "超異域公主連結！Re:Dive"
+    },
+    "punishing_gray_raven": {
+      "ja_jp": "パニシング：グレイレイヴン",
+      "ko_kr": "퍼니싱: 그레이 레이븐",
+      "zh_cn": "战双帕弥什",
+      "zh_tw": "戰雙帕彌什"
+    },
+    "re_zero": {
+      "ja_jp": "Re:ゼロから始める異世界生活",
+      "ko_kr": "Re:제로부터 시작하는 이세계 생활",
+      "zh_cn": "Re：从零开始的异世界生活",
+      "zh_tw": "Re:從零開始的異世界生活"
+    },
+    "reverse_1999": {
+      "ja_jp": "リバース：1999",
+      "ko_kr": "리버스: 1999",
+      "zh_cn": "重返未来：1999",
+      "zh_tw": "重返未來：1999"
+    },
+    "riddlejoker": {
+      "ko_kr": "리들 조커"
+    },
+    "saekano": {
+      "ja_jp": "冴えない彼女の育てかた",
+      "ko_kr": "시원찮은 그녀를 위한 육성방법",
+      "zh_cn": "路人女主的养成方法",
+      "zh_tw": "不起眼女主角培育法"
+    },
+    "seirei_gensouki": {
+      "ja_jp": "精霊幻想記",
+      "ko_kr": "정령환상기",
+      "zh_cn": "精灵幻想记",
+      "zh_tw": "精靈幻想記"
+    },
+    "senrenbanka": {
+      "ja_jp": "千恋＊万花",
+      "ko_kr": "천연만화",
+      "zh_cn": "千恋＊万花",
+      "zh_tw": "千戀＊萬花"
+    },
+    "silver_palace": {
+      "zh_cn": "白银之城",
+      "zh_tw": "白銀之城"
+    },
+    "snowbreak_containment_zone": {
+      "ja_jp": "スノウブレイク：禁域降臨",
+      "zh_cn": "尘白禁区",
+      "zh_tw": "塵白禁區"
+    },
+    "spy_x_family": {
+      "ja_jp": "SPY×FAMILY",
+      "ko_kr": "스파이 패밀리",
+      "ru_ru": "Семья шпиона",
+      "zh_cn": "间谍过家家",
+      "zh_tw": "SPY×FAMILY 間諜家家酒"
+    },
+    "star_detective_precure": {
+      "ja_jp": "名探偵プリキュア！",
+      "ko_kr": "명탐정 프리큐어!",
+      "zh_tw": "名偵探光之美少女"
+    },
+    "strinova": {
+      "ja_jp": "ストリノヴァ",
+      "ko_kr": "스트리노바",
+      "zh_cn": "卡拉彼丘",
+      "zh_tw": "卡拉彼丘"
+    },
+    "sword_art_online": {
+      "ja_jp": "ソードアート・オンライン",
+      "ko_kr": "소드 아트 온라인",
+      "zh_cn": "刀剑神域",
+      "zh_tw": "刀劍神域"
+    },
+    "the_idolmaster": {
+      "ja_jp": "アイドルマスター",
+      "ko_kr": "아이돌마스터",
+      "zh_cn": "偶像大师",
+      "zh_tw": "偶像大師"
+    },
+    "touhou": {
+      "ja_jp": "東方Project",
+      "ko_kr": "동방 프로젝트",
+      "zh_cn": "东方Project",
+      "zh_tw": "東方Project"
+    },
+    "touhou_project": {
+      "ja_jp": "東方Project",
+      "ko_kr": "동방 프로젝트",
+      "zh_cn": "东方Project",
+      "zh_tw": "東方Project"
+    },
+    "tower_of_fantasy": {
+      "ja_jp": "幻塔",
+      "ko_kr": "타워 오브 판타지",
+      "zh_cn": "幻塔",
+      "zh_tw": "幻塔"
+    },
+    "umamusume_pretty_derby": {
+      "ja_jp": "ウマ娘 プリティーダービー",
+      "ko_kr": "우마무스메 프리티 더비",
+      "zh_cn": "赛马娘 Pretty Derby",
+      "zh_tw": "賽馬娘 Pretty Derby"
+    },
+    "vampire_neighborhood": {
+      "ja_jp": "となりの吸血鬼さん",
+      "ko_kr": "이웃집 흡혈귀 씨",
+      "zh_cn": "邻家索菲",
+      "zh_tw": "住在隔壁的吸血鬼小妹"
+    },
+    "virtual_youtuber": {
+      "ja_jp": "バーチャルYouTuber",
+      "zh_cn": "虚拟YouTuber"
+    },
+    "vocaloid": {
+      "ja_jp": "ボーカロイド",
+      "ko_kr": "보컬로이드",
+      "zh_tw": "VOCALOID"
+    },
+    "wandering_witch": {
+      "ja_jp": "魔女の旅々",
+      "ko_kr": "마녀의 여행",
+      "zh_cn": "魔女之旅",
+      "zh_tw": "魔女之旅"
+    },
+    "wuthering_waves": {
+      "ja_jp": "鳴潮",
+      "ko_kr": "명조: 워더링 웨이브",
+      "zh_cn": "鸣潮",
+      "zh_tw": "鳴潮"
+    },
+    "zenless_zone_zero": {
+      "ja_jp": "ゼンレスゾーンゼロ",
+      "ko_kr": "젠레스 존 제로",
+      "zh_cn": "绝区零",
+      "zh_tw": "絕區零"
+    }
   }
 }

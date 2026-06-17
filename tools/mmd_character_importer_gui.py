@@ -468,7 +468,7 @@ def display_from_internal_text(text: str, fallback: str = "") -> str:
 def scan_known_category_pairs() -> tuple[list[dict[str, object]], list[Path], list[Path]]:
     """Scan configured roots for lua/autorun category hints. Disk-heavy; run off the GUI thread."""
 
-    configured_categories, scan_roots, loaded_files = load_category_suggestion_config()
+    configured_categories, configured_translations, scan_roots, loaded_files = load_category_suggestion_config()
     counts: dict[tuple[str, str], int] = {}
     model_re = re.compile(r'models[/\\]+sheepylord[/\\]+([^/"\\]+)[/\\]', re.IGNORECASE)
     category_re = re.compile(r'local\s+Category\s*=\s*"([^"]+)"', re.IGNORECASE)
@@ -510,7 +510,7 @@ def scan_known_category_pairs() -> tuple[list[dict[str, object]], list[Path], li
             internals = {
                 match.group(1).strip()
                 for match in model_re.finditer(text)
-                if re.fullmatch(r"[A-Za-z_]+", match.group(1).strip() or "")
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", match.group(1).strip() or "")
             }
             for internal in internals:
                 readable = (
@@ -528,7 +528,12 @@ def scan_known_category_pairs() -> tuple[list[dict[str, object]], list[Path], li
             continue
         current = best_by_internal.get(internal)
         if current is None or count > int(current.get("count", 0)):
-            best_by_internal[internal] = {"internal": internal, "display": display, "count": count}
+            best_by_internal[internal] = {
+                "internal": internal,
+                "display": display,
+                "count": count,
+                "translations": configured_translations.get(internal, {}),
+            }
     pairs = sorted(
         best_by_internal.values(),
         key=lambda item: (str(item.get("display") or "").casefold(), str(item.get("internal") or "").casefold()),
@@ -621,8 +626,28 @@ def category_config_entries(raw_categories: object) -> Iterable[tuple[str, str]]
             yield internal, display
 
 
-def load_category_suggestion_config() -> tuple[dict[str, str], list[Path], list[Path]]:
+def load_category_translations(raw: object) -> dict[str, dict[str, str]]:
+    """Read the optional per-category localized-name map: {internal: {lang: name}}."""
+    out: dict[str, dict[str, str]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for internal, langs in raw.items():
+        key = str(internal or "").strip()
+        if not key or not isinstance(langs, dict):
+            continue
+        names = {
+            str(lang or "").strip(): str(name or "").strip()
+            for lang, name in langs.items()
+            if str(lang or "").strip() and str(name or "").strip()
+        }
+        if names:
+            out.setdefault(key, {}).update(names)
+    return out
+
+
+def load_category_suggestion_config() -> tuple[dict[str, str], dict[str, dict[str, str]], list[Path], list[Path]]:
     categories: dict[str, str] = {}
+    translations: dict[str, dict[str, str]] = {}
     scan_roots: list[Path] = []
     loaded_files: list[Path] = []
     for path in category_suggestion_file_paths():
@@ -644,8 +669,10 @@ def load_category_suggestion_config() -> tuple[dict[str, str], list[Path], list[
                 if text:
                     scan_roots.append(Path(text))
         for internal, display in category_config_entries(data.get("categories", {})):
-            if re.fullmatch(r"[A-Za-z_]+", internal or "") and display:
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", internal or "") and display:
                 categories[internal] = display
+        for internal, names in load_category_translations(data.get("translations", {})).items():
+            translations.setdefault(internal, {}).update(names)
     for internal, display in DEFAULT_CATEGORY_SUGGESTIONS.items():
         categories.setdefault(internal, display)
     env_scan_root = str(os.environ.get(CATEGORY_SCAN_ROOT_ENV) or "").strip()
@@ -661,7 +688,7 @@ def load_category_suggestion_config() -> tuple[dict[str, str], list[Path], list[
             continue
         seen_roots.add(key)
         deduped_scan_roots.append(root)
-    return categories, deduped_scan_roots, loaded_files
+    return categories, translations, deduped_scan_roots, loaded_files
 
 
 def importer_icon_path() -> Path | None:
@@ -3660,11 +3687,19 @@ class ImporterWindow(QtWidgets.QMainWindow):
 
     def configured_category_pairs(self) -> list[dict[str, object]]:
         """Fast, config-only category pairs so completers exist at startup; the disk scan runs async."""
-        configured_categories, scan_roots, loaded_files = load_category_suggestion_config()
+        configured_categories, configured_translations, scan_roots, loaded_files = load_category_suggestion_config()
         self.category_suggestion_sources = [str(path) for path in loaded_files]
         self.category_scan_roots = scan_roots
         return sorted(
-            ({"internal": internal, "display": display, "count": 1} for internal, display in configured_categories.items()),
+            (
+                {
+                    "internal": internal,
+                    "display": display,
+                    "count": 1,
+                    "translations": configured_translations.get(internal, {}),
+                }
+                for internal, display in configured_categories.items()
+            ),
             key=lambda item: (str(item.get("display") or "").casefold(), str(item.get("internal") or "").casefold()),
         )
 
@@ -3710,14 +3745,35 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 return str(item.get("display") or "")
         return ""
 
+    def category_translation_for(self, item: dict[str, object]) -> str:
+        """Localized category name for the current app language (blank for English or when unset/same)."""
+        lang = str(getattr(self, "language_code", "en_us") or "en_us")
+        if lang == "en_us":
+            return ""
+        translations = item.get("translations")
+        if not isinstance(translations, dict):
+            return ""
+        name = str(translations.get(lang) or "").strip()
+        display = str(item.get("display") or "").strip()
+        return name if name and name != display else ""
+
     def category_completion_text(self, item: dict[str, object], display_first: bool = False) -> str:
         internal = str(item.get("internal") or "")
         display = str(item.get("display") or "")
         count = int(item.get("count", 0) or 0)
-        suffix = f" ({count})" if count > 1 else ""
+        # Show the localized name in the user's app language as a non-ASCII-bracketed
+        # hint (e.g. "Genshin Impact 〔原神〕"). The brackets keep it strippable in
+        # parse_completion_pair so selecting the item still fills the clean
+        # internal/display pair, and it doubles as a searchable alias.
+        annotation = ""
+        translation = self.category_translation_for(item)
+        if translation:
+            annotation += f" 〔{translation}〕"
+        if count > 1:
+            annotation += f" ({count})"
         if display_first:
-            return f"{display}{CATEGORY_COMPLETER_SEPARATOR}{internal}{suffix}"
-        return f"{internal}{CATEGORY_COMPLETER_SEPARATOR}{display}{suffix}"
+            return f"{display}{CATEGORY_COMPLETER_SEPARATOR}{internal}{annotation}"
+        return f"{internal}{CATEGORY_COMPLETER_SEPARATOR}{display}{annotation}"
 
     def install_category_completers(self, internal_edit: QtWidgets.QLineEdit, display_edit: QtWidgets.QLineEdit) -> None:
         if not self.known_category_pairs:
@@ -3734,25 +3790,31 @@ class ImporterWindow(QtWidgets.QMainWindow):
 
         normalizing_completion = {"active": False}
 
+        def strip_completion_annotation(value: str) -> str:
+            # Drop the localized-name hint "〔...〕" and the trailing "(count)".
+            value = re.sub(r"\s*〔[^〕]*〕", "", str(value or ""))
+            value = re.sub(r"\s+\(\d+\)$", "", value)
+            return value.strip()
+
         def parse_completion_pair(text: str, display_first: bool = False) -> tuple[str, str] | None:
             parts = text.split(CATEGORY_COMPLETER_SEPARATOR, 1)
-            main_text = parts[0].strip()
+            main_text = strip_completion_annotation(parts[0])
             other_text = parts[1].strip() if len(parts) > 1 else ""
             if len(parts) > 1:
                 if display_first:
                     display_value = sanitize_category_display_name_text(main_text).strip()
-                    internal_value = re.sub(r"\s+\(\d+\)$", "", other_text).strip()
+                    internal_value = strip_completion_annotation(other_text)
                 else:
                     internal_value = main_text
-                    display_value = sanitize_category_display_name_text(re.sub(r"\s+\(\d+\)$", "", other_text)).strip()
+                    display_value = sanitize_category_display_name_text(strip_completion_annotation(other_text)).strip()
                 if internal_value and display_value:
                     return internal_value, display_value
 
             # Qt can insert the completer's visible label before the activated
             # signal runs. If another validator has already stripped punctuation,
             # recover from strings like "Arknights Endfield arknight_endfield".
-            collapsed = re.sub(r"\s+", " ", sanitize_category_display_name_text(text)).strip().casefold()
-            raw = str(text or "").strip().casefold()
+            collapsed = re.sub(r"\s+", " ", sanitize_category_display_name_text(strip_completion_annotation(text))).strip().casefold()
+            raw = strip_completion_annotation(text).casefold()
             for item in self.known_category_pairs:
                 internal = str(item.get("internal") or "").strip()
                 display = sanitize_category_display_name_text(item.get("display") or "").strip()

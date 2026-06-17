@@ -192,9 +192,12 @@ def find_named_mesh(name: str) -> bpy.types.Object | None:
 # bug). The detection grid stays tight because uniform scaling preserves exact
 # coincidence, so true duplicates always share a bucket.
 COINCIDENT_DETECT_THRESHOLD = 1.0e-6      # detection grid (exact duplicates share a bucket)
-COINCIDENT_OFFSET_FRACTION = 1.5e-4       # separation as a fraction of the model's largest extent
-COINCIDENT_MIN_OFFSET = 5.0e-4            # absolute floor in Source units
-
+# Separation nudge. Reduced to 10% of the original calibration (1.5e-4 / 5.0e-4):
+# the larger nudge separated the duplicates but left a visible slit on the model
+# in game. At ~10% it is still ~150x a float32 ULP at this scale and within the
+# community 0.001-0.01 Source-unit range, so flexes stay split without a seam.
+COINCIDENT_OFFSET_FRACTION = 1.5e-5       # separation as a fraction of the model's largest extent
+COINCIDENT_MIN_OFFSET = 5.0e-5            # absolute floor in Source units
 
 def model_extent_reference() -> float:
     """Largest world-space bounding-box dimension across the export meshes.
