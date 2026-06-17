@@ -29,6 +29,11 @@ FLEX_NAME_RE = re.compile(r"^[a-z0-9_]+$")
 EPSILON = 1e-7
 MAX_SOURCE_FLEXES_EXCLUSIVE = 95
 TARGET_SOURCE_FLEXES = MAX_SOURCE_FLEXES_EXCLUSIVE - 1
+# A flex counts as "matched" (confidently renamed to a recognized Source flex
+# name) at or above this confidence; below it the original name was kept or a
+# generic fallback was generated. Matches the low-confidence cutoff used when
+# flagging names in collect_flexes().
+MATCHED_CONFIDENCE_THRESHOLD = 0.60
 
 
 FALLBACK_FLEX_MAPPING = {
@@ -460,6 +465,64 @@ def object_report(obj: bpy.types.Object) -> dict[str, object]:
     }
 
 
+def flex_match_sort_key(entry: dict[str, object]) -> tuple[int, list[object]]:
+    """Output ordering: matched (confidently named) flexes first, then unmatched,
+    each group alphabetical (natural) by the final flex name."""
+    try:
+        confidence = float(entry.get("confidence", 0.0) or 0.0)
+    except Exception:
+        confidence = 0.0
+    matched_rank = 0 if confidence >= MATCHED_CONFIDENCE_THRESHOLD else 1
+    name = str(entry.get("final_name") or entry.get("original_name") or "")
+    return (matched_rank, natural_key(name))
+
+
+def sort_and_renumber_flexes(flexes: list[dict[str, object]]) -> None:
+    """Reorder flexes (matched-alphabetical first, then unmatched-alphabetical)
+    and reassign sequential uids so the plan, table, and exported flex order all
+    follow the same order. Safe at analyze time: uids are not yet cross-referenced
+    (merge source_flexes are populated later from the plan)."""
+    flexes.sort(key=flex_match_sort_key)
+    for new_index, entry in enumerate(flexes, start=1):
+        entry["uid"] = f"flex_{new_index:03d}"
+
+
+def reorder_shape_keys_to_plan(flexes: list[dict[str, object]]) -> list[str]:
+    """Reorder each mesh's shape keys to follow the (sorted) plan order so the
+    exported model's flex list matches step 7's output. Basis stays first."""
+    warnings: list[str] = []
+    rank: dict[str, int] = {}
+    for index, entry in enumerate(flexes):
+        final_name = str(entry.get("final_name") or "").strip()
+        if final_name and final_name not in rank:
+            rank[final_name] = index
+    fallback_rank = len(flexes) + 1
+    for obj in mesh_objects():
+        keys = obj.data.shape_keys
+        if keys is None or len(keys.key_blocks) <= 1:
+            continue
+        desired = sorted(
+            (key.name for key in keys.key_blocks[1:]),
+            key=lambda name: (rank.get(name, fallback_rank), natural_key(name)),
+        )
+        try:
+            ensure_object_mode()
+            bpy.context.view_layer.objects.active = obj
+            obj.select_set(True)
+            blocks = obj.data.shape_keys.key_blocks
+            for name in desired:
+                idx = blocks.find(name)
+                if idx <= 0:  # skip missing (-1) and basis (0)
+                    continue
+                obj.active_shape_key_index = idx
+                bpy.ops.object.shape_key_move(type="BOTTOM")
+        except Exception as exc:
+            warnings.append(f"Could not reorder shape keys on {obj.name}: {exc}")
+        finally:
+            ensure_object_mode()
+    return warnings
+
+
 def collect_flexes() -> tuple[list[dict[str, object]], list[str]]:
     mapping, mapping_warnings = load_reference_mapping()
     normalized_mapping = {normalized_name(key): value for key, value in mapping.items()}
@@ -670,6 +733,7 @@ def analyze_scene(input_blend: Path) -> tuple[dict[str, object], dict[str, objec
     prune_report = prune_shapekeys()
     bodygroups = [object_report(obj) for obj in sorted(mesh_objects(), key=bodygroup_processing_key)]
     flexes, mapping_warnings = collect_flexes()
+    sort_and_renumber_flexes(flexes)
     preview = collect_flex_preview(flexes)
     auto_removed = auto_mark_excess_flexes_for_removal(flexes)
     warnings: list[str] = list(mapping_warnings)
@@ -969,6 +1033,8 @@ def apply_plan(input_blend: Path, plan: dict[str, object], output_blend: Path, r
                     "delta_scale": delta_scale,
                 }
             )
+
+    warnings.extend(reorder_shape_keys_to_plan(flexes))
 
     after_groups = {obj.name: object_report(obj) for obj in mesh_objects()}
     validation_errors: list[str] = []
