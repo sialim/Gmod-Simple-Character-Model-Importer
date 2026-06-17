@@ -3500,6 +3500,83 @@ def merge_additional_group_weights(
     return {"moved_total": moved_total, "groups": moved_groups}
 
 
+def remove_merged_group_bones(
+    armature: bpy.types.Object,
+    additional_groups: list[dict[str, object]],
+) -> list[str]:
+    """Delete each additional collision group's non-target bones so a group becomes
+    one clean bone — the target — instead of leaving the merged bones (e.g.
+    Skirt007_R parented to Skirt006_R) dangling in the skeleton.
+
+    Must run AFTER `merge_additional_group_weights`: only bones that no render mesh
+    weights any more are removed (a safety net so geometry is never orphaned).
+    Surviving children of a removed bone are reparented up to the nearest surviving
+    ancestor first, then the bones are deleted in edit mode. The targets, default
+    target bones, and any bone outside a group are never touched.
+    """
+    targets: set[str] = set()
+    candidates: set[str] = set()
+    for group in additional_groups:
+        if not isinstance(group, dict):
+            continue
+        target = str(group.get("target_bone") or group.get("owner_bone") or group.get("bone") or "")
+        if not target:
+            continue
+        targets.add(target)
+        bones = [str(name) for name in group.get("bones", []) if str(name)] if isinstance(group.get("bones"), list) else []
+        for bone_name in bones:
+            if bone_name and bone_name != target:
+                candidates.add(bone_name)
+    candidates = {name for name in candidates - targets if name in armature.data.bones}
+    if not candidates:
+        return []
+    still_weighted: set[str] = set()
+    for mesh_obj in mesh_objects(include_physics=False):
+        names = {vg.name for vg in mesh_obj.vertex_groups}
+        still_weighted |= candidates & names
+    to_remove = candidates - still_weighted
+    if still_weighted:
+        log_progress(
+            f"Keeping {len(still_weighted)} grouped bone(s) that still carry render weights: "
+            f"{', '.join(sorted(still_weighted))}."
+        )
+    if not to_remove:
+        return []
+    parent_of = {bone.name: (bone.parent.name if bone.parent else None) for bone in armature.data.bones}
+
+    def nearest_surviving_ancestor(name: str) -> str | None:
+        parent = parent_of.get(name)
+        while parent is not None and parent in to_remove:
+            parent = parent_of.get(parent)
+        return parent
+
+    reparent = {
+        name: nearest_surviving_ancestor(name)
+        for name in parent_of
+        if name not in to_remove and parent_of.get(name) in to_remove
+    }
+    ensure_object_mode()
+    bpy.context.view_layer.objects.active = armature
+    bpy.ops.object.mode_set(mode="EDIT")
+    removed: list[str] = []
+    try:
+        edit_bones = armature.data.edit_bones
+        for child, new_parent in reparent.items():
+            child_bone = edit_bones.get(child)
+            if child_bone is None:
+                continue
+            child_bone.use_connect = False
+            child_bone.parent = edit_bones.get(new_parent) if new_parent else None
+        for name in list(to_remove):
+            bone = edit_bones.get(name)
+            if bone is not None:
+                edit_bones.remove(bone)
+                removed.append(name)
+    finally:
+        bpy.ops.object.mode_set(mode="OBJECT")
+    return sorted(removed)
+
+
 def apply_scene(
     input_blend: Path,
     plan_path: Path,
@@ -3564,6 +3641,19 @@ def apply_scene(
         log_progress(
             f"Merged grouped collision bone weights into targets "
             f"({group_weight_merge['moved_total']} render vertices across {len(group_weight_merge['groups'])} group(s))."
+        )
+    # After the weights are on the targets, delete the now-empty grouped bones so a
+    # group is a single clean bone (e.g. Skirt007_R is removed, not left parented to
+    # Skirt006_R). Done before Physics.smd export so its skeleton matches the render
+    # skeleton the later steps will produce from this same blend.
+    removed_group_bones = (
+        remove_merged_group_bones(armature, additional_groups) if armature is not None else []
+    )
+    if removed_group_bones:
+        group_weight_merge["removed_bones"] = removed_group_bones
+        log_progress(
+            f"Removed {len(removed_group_bones)} merged group bone(s) from the armature: "
+            f"{', '.join(removed_group_bones)}."
         )
     final_validation = validate_physics_object(physics, armature, parts, target_bones=target_bones)
     smd_info: dict[str, object] = {}
