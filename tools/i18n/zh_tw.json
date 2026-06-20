@@ -4201,6 +4201,7 @@
     "import_to_gmod": "3. 將模型導入 GMod",
     "intro": "一鍵導入會運行從 PMX 導入到 QC 編譯和插件打包的默認流程。某個步驟需要手動修正時，可以打開高級步驟頁。",
     "language": "語言",
+    "game": "遊戲",
     "mmd_folder": "MMD 模型文件夾",
     "mmd_folder_hint": "包含所選 PMX 和貼圖文件的文件夾",
     "model_preview": "模型預覽",

@@ -4046,6 +4046,7 @@
     "import_to_gmod": "3. GMod으로 모델 가져오기",
     "intro": "원클릭 가져오기는 PMX 가져오기부터 QC 컴파일 및 애드온 패키징까지 기본 워크플로를 실행합니다. 단계에 주의가 필요할 때 수동 수정을 위해 고급 탭을 계속 사용할 수 있습니다.",
     "language": "언어",
+    "game": "게임",
     "mmd_folder": "MMD 모델 폴더",
     "mmd_folder_hint": "선택한 PMX 및 텍스처 파일이 포함된 폴더",
     "model_preview": "모델 미리보기",

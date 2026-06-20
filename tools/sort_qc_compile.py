@@ -47,6 +47,7 @@ BAD_OPEN_BRACE_RE = re.compile(r"\((?P<line>\d+)\):\s*-\s*bad command\s+\{", re.
 
 ESSENTIAL_EXACT = {"ZArmTwist_L", "ZArmTwist_R", "ZHandTwist_L", "ZHandTwist_R", "Eye_L", "Eye_R"}
 GENDER_CHOICES = ("female", "male")
+GAME_CHOICES = ("gmod", "l4d2")
 GENDER_ANIMATION_INCLUDES = {
     "female": {
         # Playermodel QC needs ONLY the standard GMod player animation packs.
@@ -94,6 +95,11 @@ NPC_ANIMATION_INCLUDES = GENDER_ANIMATION_INCLUDES["female"]["npc"]
 def normalize_gender(value: object) -> str:
     text = str(value or "").strip().lower()
     return text if text in GENDER_CHOICES else "female"
+
+
+def normalize_game(value: object) -> str:
+    text = str(value or "").strip().lower()
+    return text if text in GAME_CHOICES else "gmod"
 
 
 def gendered_reference_name(plan: dict, anims_dir: Path, warnings: list | None = None) -> str:
@@ -488,6 +494,67 @@ def detect_gmod(explicit_root: str = "", explicit_studiomdl: str = "") -> dict[s
             hit["checked"] = checked
             return hit
     return {"install_root": "", "game_dir": "", "studiomdl_path": "", "source": "not_found", "checked": checked}
+
+
+def validate_l4d2_root(root: Path) -> dict[str, str] | None:
+    # The install root is the "Left 4 Dead 2" folder (holds bin/studiomdl.exe);
+    # the game dir is its "left4dead2" subfolder (holds gameinfo.txt).
+    if root.name.lower() == "left4dead2" and (root / "gameinfo.txt").exists():
+        install_root = root.parent
+        game_dir = root
+    else:
+        install_root = root
+        game_dir = root / "left4dead2"
+    studiomdl = install_root / "bin" / "studiomdl.exe"
+    if studiomdl.exists() and (game_dir / "gameinfo.txt").exists():
+        return {"install_root": str(install_root), "game_dir": str(game_dir), "studiomdl_path": str(studiomdl)}
+    return None
+
+
+def detect_l4d2(explicit_root: str = "", explicit_studiomdl: str = "") -> dict[str, Any]:
+    candidates: list[Path] = []
+    if explicit_studiomdl:
+        exe = Path(explicit_studiomdl)
+        if exe.exists():
+            hit = validate_l4d2_root(exe.parent.parent)
+            if hit:
+                hit["source"] = "explicit_studiomdl"
+                return hit
+    for raw in [explicit_root, os.environ.get("L4D2_PATH", ""), os.environ.get("LEFT4DEAD2_PATH", "")]:
+        if raw:
+            candidates.append(Path(raw))
+    env_studiomdl = os.environ.get("STUDIOMDL", "")
+    if env_studiomdl:
+        exe = Path(env_studiomdl)
+        if exe.exists():
+            candidates.append(exe.parent.parent)
+    for library in steam_library_roots():
+        candidates.append(library / "steamapps" / "common" / "Left 4 Dead 2")
+    seen: set[str] = set()
+    checked: list[str] = []
+    for candidate in candidates:
+        try:
+            candidate = candidate.resolve()
+        except Exception:
+            pass
+        key = str(candidate).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        checked.append(str(candidate))
+        hit = validate_l4d2_root(candidate)
+        if hit:
+            hit["source"] = "detected"
+            hit["checked"] = checked
+            return hit
+    return {"install_root": "", "game_dir": "", "studiomdl_path": "", "source": "not_found", "checked": checked}
+
+
+def detect_game(game: str, explicit_root: str = "", explicit_studiomdl: str = "") -> dict[str, Any]:
+    """Detect the Source install (studiomdl + game dir) for the target game."""
+    if normalize_game(game) == "l4d2":
+        return detect_l4d2(explicit_root, explicit_studiomdl)
+    return detect_gmod(explicit_root, explicit_studiomdl)
 
 
 def find_vtfcmd() -> Path | None:
@@ -1300,7 +1367,7 @@ def load_smds(smd_files: list[str]) -> tuple[list[SmdData], dict[int, SmdNode]]:
     return smds, nodes
 
 
-def analyze(input_path: Path, author: str = "", category: str = "", model_name: str = "", gmod_root: str = "", studiomdl_path: str = "", gender: str = "female") -> dict[str, Any]:
+def analyze(input_path: Path, author: str = "", category: str = "", model_name: str = "", gmod_root: str = "", studiomdl_path: str = "", gender: str = "female", game: str = "gmod") -> dict[str, Any]:
     paths = qc_paths_for_input(input_path)
     qc_dir = paths["qc_dir"]
     qc_dir.mkdir(parents=True, exist_ok=True)
@@ -1345,9 +1412,11 @@ def analyze(input_path: Path, author: str = "", category: str = "", model_name: 
     texture_map = build_texture_map(texture_manifest)
     materials, model_preview = build_preview(smds, texture_map)
     bones_preview = bone_preview(nodes)
-    gmod = detect_gmod(gmod_root, studiomdl_path)
+    game = normalize_game(game)
+    gmod = detect_game(game, gmod_root, studiomdl_path)
     if not gmod.get("studiomdl_path"):
-        warnings.append("Garry's Mod StudioMDL was not detected; compile will require manual selection.")
+        game_label = "Left 4 Dead 2" if game == "l4d2" else "Garry's Mod"
+        warnings.append(f"{game_label} StudioMDL was not detected; compile will require manual selection.")
     physics_globals, physics_rows, physics_collision_text_lines = physics_plan_from_qc_lines(collision_qc_block({"inputs": discovered}))
 
     workspace_name = Path(discovered["workspace_root"]).name
@@ -1383,6 +1452,7 @@ def analyze(input_path: Path, author: str = "", category: str = "", model_name: 
         "character_category": safe_category,
         "model_name": default_model,
         "gender": normalize_gender(gender),
+        "game": game,
         "display_name": display_from_identifier(strip_model_hash_suffix(default_model), "Mmd Model"),
         "category_readable": category_display_from_identifier(safe_category, "Sheepy Lord"),
         "gmod": gmod,
@@ -4131,6 +4201,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--character-category", default="")
     parser.add_argument("--model-name", default="")
     parser.add_argument("--gender", choices=GENDER_CHOICES, default="female")
+    parser.add_argument("--game", choices=GAME_CHOICES, default="gmod")
     parser.add_argument("--gmod-root", default="")
     parser.add_argument("--studiomdl", default="")
     return parser.parse_args()
@@ -4145,7 +4216,7 @@ def main() -> int:
                 pass
     args = parse_args()
     if args.mode == "analyze":
-        result = analyze(args.input, args.author, args.character_category, args.model_name, args.gmod_root, args.studiomdl, args.gender)
+        result = analyze(args.input, args.author, args.character_category, args.model_name, args.gmod_root, args.studiomdl, args.gender, args.game)
         if args.analysis_json and Path(result["paths"]["analysis"]) != args.analysis_json:
             shutil.copyfile(result["paths"]["analysis"], args.analysis_json)
         if Path(result["paths"]["plan"]) != args.plan_json:

@@ -1,0 +1,7 @@
+{
+ "_comment": "Auto-rename dictionary mapping CATS-translated MMD morph names to Source flex names. Aggregated by majority vote from the released-model corpus (entries appearing in >=2 models; category-consistent). Used by tools/blender_sort_flexes.py. Regenerate when the corpus grows.",
+ "mapping": {
+  "Ah": "jaw_drop",
+  "Blink": "blink"
+ }
+}

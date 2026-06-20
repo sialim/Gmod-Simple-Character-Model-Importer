@@ -3264,11 +3264,24 @@ def fix_spine_blend(
     )
 
 
+# Per-game bone budget mirror of blender_sort_bones.GAME_BONE_LIMITS. Used to
+# resolve the limit for callers (e.g. the full auto-port) that do not pass one,
+# so L4D2 mode merges down to 126 while GMod stays at 254.
+SORT_BONES_GAME_LIMITS = {"gmod": 254, "l4d2": 126}
+
+
+def _resolve_sort_bones_limit(limit: int | None, game: str) -> int:
+    if limit is not None:
+        return int(limit)
+    return SORT_BONES_GAME_LIMITS.get(game, 254)
+
+
 def analyze_sort_bones_blend(
     input_blend: Path,
-    limit: int = 254,
+    limit: int | None = None,
     progress: ProgressCallback | None = None,
     cancel_check: CancelCheck | None = None,
+    game: str = "gmod",
 ) -> SortBonesAnalysisResult:
     input_blend = input_blend.resolve()
     if not input_blend.exists():
@@ -3299,8 +3312,11 @@ def analyze_sort_bones_blend(
         "--plan-json",
         str(plan_path),
         "--limit",
-        str(int(limit)),
+        str(_resolve_sort_bones_limit(limit, game)),
     ]
+    # Only L4D2 adds --game so the GMod command line stays byte-identical.
+    if game != "gmod":
+        command += ["--game", game]
     emit(progress, f"Starting Blender sort bones analysis: {input_blend}")
     started = time.monotonic()
     run_process_streamed(
@@ -3333,9 +3349,10 @@ def sort_bones_blend(
     input_blend: Path,
     plan: dict[str, object] | Path,
     output_blend: Path | None = None,
-    limit: int = 254,
+    limit: int | None = None,
     progress: ProgressCallback | None = None,
     cancel_check: CancelCheck | None = None,
+    game: str = "gmod",
 ) -> SortBonesResult:
     input_blend = input_blend.resolve()
     if not input_blend.exists():
@@ -3378,8 +3395,11 @@ def sort_bones_blend(
         "--report-json",
         str(report_path),
         "--limit",
-        str(int(limit)),
+        str(_resolve_sort_bones_limit(limit, game)),
     ]
+    # Only L4D2 adds --game so the GMod command line stays byte-identical.
+    if game != "gmod":
+        command += ["--game", game]
     emit(progress, f"Starting Blender sort bones step: {input_blend}")
     started = time.monotonic()
     run_process_streamed(
@@ -5061,6 +5081,7 @@ def analyze_qc(
     progress: ProgressCallback | None = None,
     cancel_check: CancelCheck | None = None,
     gender: str = "female",
+    game: str = "gmod",
 ) -> QcAnalysisResult:
     input_path = input_path.resolve()
     final_dir, qc_dir, analysis_path, plan_path, report_path, files_path, log_path = qc_paths_for_step9_input(input_path)
@@ -5091,6 +5112,9 @@ def analyze_qc(
         command.extend(["--studiomdl", studiomdl_path])
     if str(gender or "").strip().lower() == "male":
         command.extend(["--gender", "male"])
+    # Only L4D2 adds --game so the GMod analyze command stays byte-identical.
+    if str(game or "").strip().lower() == "l4d2":
+        command.extend(["--game", "l4d2"])
     emit(progress, f"Starting Step 14 QC analysis: {final_dir}")
     started = time.monotonic()
     run_process_streamed(command, progress=progress, log_path=log_path, cancel_check=cancel_check)
@@ -5356,15 +5380,17 @@ def main(argv: list[str] | None = None) -> int:
     spine_fix_parser.add_argument("--plan-json", type=Path, required=True)
     spine_fix_parser.add_argument("--output-blend", type=Path)
 
-    sort_analyze_parser = subparsers.add_parser("sort-bones-analyze", help="analyze and propose bone merges for Source's 254 bone limit")
+    sort_analyze_parser = subparsers.add_parser("sort-bones-analyze", help="analyze and propose bone merges for the Source bone limit")
     sort_analyze_parser.add_argument("spine_fixed_blend", type=Path)
-    sort_analyze_parser.add_argument("--limit", type=int, default=254)
+    sort_analyze_parser.add_argument("--limit", type=int, default=None)
+    sort_analyze_parser.add_argument("--game", choices=("gmod", "l4d2"), default="gmod")
 
     sort_parser = subparsers.add_parser("sort-bones", help="apply a proposed bone merge plan")
     sort_parser.add_argument("spine_fixed_blend", type=Path)
     sort_parser.add_argument("--plan-json", type=Path, required=True)
     sort_parser.add_argument("--output-blend", type=Path)
-    sort_parser.add_argument("--limit", type=int, default=254)
+    sort_parser.add_argument("--limit", type=int, default=None)
+    sort_parser.add_argument("--game", choices=("gmod", "l4d2"), default="gmod")
 
     material_scan_parser = subparsers.add_parser("materials-scan", help="scan materials and propose cleanup/combine plan")
     material_scan_parser.add_argument("bones_sorted_blend", type=Path)
@@ -5573,7 +5599,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     if args.command == "sort-bones-analyze":
-        result = analyze_sort_bones_blend(args.spine_fixed_blend, args.limit, progress=print_progress)
+        result = analyze_sort_bones_blend(args.spine_fixed_blend, args.limit, progress=print_progress, game=args.game)
         print(
             json.dumps(
                 {
@@ -5589,7 +5615,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     if args.command == "sort-bones":
-        result = sort_bones_blend(args.spine_fixed_blend, args.plan_json, args.output_blend, args.limit, progress=print_progress)
+        result = sort_bones_blend(args.spine_fixed_blend, args.plan_json, args.output_blend, args.limit, progress=print_progress, game=args.game)
         print(
             json.dumps(
                 {

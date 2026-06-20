@@ -18,6 +18,10 @@ import numpy as np
 
 
 DEFAULT_LIMIT = 254
+# Per-game bone budget. GMod/Source tolerate 254; L4D2 survivors are compiled
+# against a tighter budget, so L4D2 mode merges down to 126. When --limit is not
+# given explicitly the game's value here is used (GMod stays at 254).
+GAME_BONE_LIMITS = {"gmod": 254, "l4d2": 126}
 VALVEBIPED_PREFIX = "ValveBiped"
 HEAD = "ValveBiped.Bip01_Head1"
 PELVIS = "ValveBiped.Bip01_Pelvis"
@@ -89,7 +93,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plan-json", type=Path, required=True)
     parser.add_argument("--output-blend", type=Path)
     parser.add_argument("--report-json", type=Path)
-    parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
+    parser.add_argument("--game", choices=tuple(GAME_BONE_LIMITS), default="gmod")
+    # Default None so the per-game limit applies when --limit is omitted; an
+    # explicit --limit always overrides the game default.
+    parser.add_argument("--limit", type=int, default=None)
     return parser.parse_args(argv)
 
 
@@ -1107,7 +1114,8 @@ def main() -> int:
     args = parse_args()
     if not args.input_blend.exists():
         raise FileNotFoundError(args.input_blend)
-    limit = max(1, int(args.limit or DEFAULT_LIMIT))
+    game_limit = GAME_BONE_LIMITS.get(args.game, DEFAULT_LIMIT)
+    limit = max(1, int(args.limit if args.limit is not None else game_limit))
     started = time.monotonic()
     print("Starting MMD Character Importer Blender step 4.")
     print(f"Opening spine-fixed blend: {args.input_blend}")

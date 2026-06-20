@@ -4046,6 +4046,7 @@
     "import_to_gmod": "3. Importar modelo a GMod",
     "intro": "La importación con un solo clic ejecuta el flujo de trabajo predeterminado desde la importación de PMX hasta la compilación de QC y el empaquetado de complementos. Las pestañas avanzadas permanecen disponibles para la corrección manual cuando un paso necesita atención.",
     "language": "Idioma",
+    "game": "Juego",
     "mmd_folder": "Carpeta modelo MMD",
     "mmd_folder_hint": "Carpeta que contiene los archivos PMX y de textura seleccionados",
     "model_preview": "Vista previa del modelo",

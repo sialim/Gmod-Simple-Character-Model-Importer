@@ -4201,6 +4201,7 @@
     "import_to_gmod": "3. 将模型导入 GMod",
     "intro": "一键导入会运行从 PMX 导入到 Garry's Mod 的默认流程。某个步骤需要手动修正时，可以打开高级步骤页。",
     "language": "语言",
+    "game": "游戏",
     "mmd_folder": "MMD 模型文件夹",
     "mmd_folder_hint": "包含所选 PMX 和贴图文件的文件夹",
     "model_preview": "模型预览",
