@@ -64,6 +64,19 @@ BLENDER_ICON_SCRIPT = TOOLS_DIR / "blender_render_icon.py"
 ICON_PROCESSOR_SCRIPT = TOOLS_DIR / "sort_icons_and_arts.py"
 QC_PROCESSOR_SCRIPT = TOOLS_DIR / "sort_qc_compile.py"
 RELEASE_PROCESSOR_SCRIPT = TOOLS_DIR / "sort_release_description.py"
+# Bundled L4D2 survivor reference-pose skeletons (one .smd per survivor, the
+# survivor's bind pose on the ValveBiped core, decoration bones excluded). In
+# L4D2 mode Step 9 swaps these in as the proportion-trick reference so the
+# proportion delta aligns the MMD body to the selected survivor.
+L4D2_REFERENCE_SKELETON_DIR = TOOLS_DIR / "l4d2_reference_skeletons"
+# Survivor code (compiled .mdl stem) -> in-game character display name.
+L4D2_SURVIVORS = {
+    "producer": "Rochelle",
+    "coach": "Coach",
+    "gambler": "Nick",
+    "mechanic": "Ellis",
+}
+DEFAULT_L4D2_SURVIVOR = "producer"
 DEFAULT_ICON_VMD = ROOT / "reference" / "ref_motion" / "bad_bad_water.vmd"
 WARNING_KEYWORDS_PATH = ROOT / "reference" / "keywords" / "Warning_Keyword.txt"
 BLENDER_LTS_INDEX_URL = "https://download.blender.org/release/Blender4.5/"
@@ -3829,6 +3842,7 @@ def analyze_flexes_blend(
     input_blend: Path,
     progress: ProgressCallback | None = None,
     cancel_check: CancelCheck | None = None,
+    game: str = "gmod",
 ) -> FlexAnalysisResult:
     input_blend = input_blend.resolve()
     if not input_blend.exists():
@@ -3858,6 +3872,9 @@ def analyze_flexes_blend(
         "--plan-json",
         str(plan_path),
     ]
+    # Only L4D2 adds --game so the GMod flex-analyze command stays byte-identical.
+    if game != "gmod":
+        command += ["--game", game]
     emit(progress, f"Starting Blender flex analysis: {input_blend}")
     started = time.monotonic()
     run_process_streamed(command, progress=progress, log_path=log_path, cancel_check=cancel_check)
@@ -4385,11 +4402,18 @@ def validate_manual_bodygroups_blend(
     )
 
 
+def l4d2_reference_skeleton_path(survivor: str) -> Path:
+    survivor = survivor if survivor in L4D2_SURVIVORS else DEFAULT_L4D2_SURVIVOR
+    return L4D2_REFERENCE_SKELETON_DIR / f"{survivor}.smd"
+
+
 def run_proportion_export(
     input_blend: Path,
     remove_zero_weight_bones: bool = True,
     progress: ProgressCallback | None = None,
     cancel_check: CancelCheck | None = None,
+    game: str = "gmod",
+    survivor: str = DEFAULT_L4D2_SURVIVOR,
 ) -> ProportionResult:
     input_blend = input_blend.resolve()
     if not input_blend.exists():
@@ -4455,6 +4479,21 @@ def run_proportion_export(
         raise RuntimeError(f"Blender completed but did not write {files_path}")
     report = json.loads(report_path.read_text(encoding="utf-8"))
     files = json.loads(files_path.read_text(encoding="utf-8"))
+    if str(game or "").strip().lower() == "l4d2":
+        # Retarget the proportion reference to the selected survivor: the
+        # proportion-trick output (proportions.smd) stays the MMD body on the
+        # ValveBiped skeleton, but the reference pose that Step 14 subtracts
+        # becomes the survivor's bind pose, so the delta aligns the model to that
+        # survivor. Overwrite both gender references (gender is replaced by the
+        # survivor choice in L4D2 mode).
+        reference_smd = l4d2_reference_skeleton_path(survivor)
+        anims_dir = final_dir / "anims"
+        if reference_smd.exists() and anims_dir.exists():
+            for target_name in ("reference_female.smd", "reference_male.smd"):
+                shutil.copyfile(reference_smd, anims_dir / target_name)
+            emit(progress, f"Applied L4D2 proportion reference for survivor '{survivor}'.")
+        else:
+            emit(progress, f"WARNING: L4D2 reference skeleton not applied (missing {reference_smd} or {anims_dir}).")
     emit(progress, f"Blender proportion export finished in {time.monotonic() - started:.1f}s")
     return ProportionResult(
         input_blend=input_blend,
@@ -5082,6 +5121,7 @@ def analyze_qc(
     cancel_check: CancelCheck | None = None,
     gender: str = "female",
     game: str = "gmod",
+    survivor: str = DEFAULT_L4D2_SURVIVOR,
 ) -> QcAnalysisResult:
     input_path = input_path.resolve()
     final_dir, qc_dir, analysis_path, plan_path, report_path, files_path, log_path = qc_paths_for_step9_input(input_path)
@@ -5112,9 +5152,9 @@ def analyze_qc(
         command.extend(["--studiomdl", studiomdl_path])
     if str(gender or "").strip().lower() == "male":
         command.extend(["--gender", "male"])
-    # Only L4D2 adds --game so the GMod analyze command stays byte-identical.
+    # Only L4D2 adds --game/--survivor so the GMod analyze command stays byte-identical.
     if str(game or "").strip().lower() == "l4d2":
-        command.extend(["--game", "l4d2"])
+        command.extend(["--game", "l4d2", "--survivor", str(survivor or DEFAULT_L4D2_SURVIVOR)])
     emit(progress, f"Starting Step 14 QC analysis: {final_dir}")
     started = time.monotonic()
     run_process_streamed(command, progress=progress, log_path=log_path, cancel_check=cancel_check)
@@ -5431,6 +5471,7 @@ def main(argv: list[str] | None = None) -> int:
 
     flex_analyze_parser = subparsers.add_parser("flexes-analyze", help="analyze and propose facial/body flex sorting")
     flex_analyze_parser.add_argument("bodygroups_sorted_blend", type=Path)
+    flex_analyze_parser.add_argument("--game", choices=("gmod", "l4d2"), default="gmod")
 
     flex_apply_parser = subparsers.add_parser("flexes-apply", help="apply a flex sorting plan")
     flex_apply_parser.add_argument("bodygroups_sorted_blend", type=Path)
@@ -5459,6 +5500,8 @@ def main(argv: list[str] | None = None) -> int:
     proportion_parser.add_argument("collision_sorted_blend", type=Path)
     proportion_parser.add_argument("--remove-zero-weight-bones", dest="remove_zero_weight_bones", action="store_true", default=True)
     proportion_parser.add_argument("--keep-zero-weight-bones", dest="remove_zero_weight_bones", action="store_false")
+    proportion_parser.add_argument("--game", choices=("gmod", "l4d2"), default="gmod")
+    proportion_parser.add_argument("--survivor", choices=tuple(L4D2_SURVIVORS), default=DEFAULT_L4D2_SURVIVOR)
 
     carms_parser = subparsers.add_parser("carms-run", help="create c_arms SMD files from the proportion export")
     carms_parser.add_argument("proportion_export_dir", type=Path)
@@ -5746,7 +5789,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     if args.command == "flexes-analyze":
-        result = analyze_flexes_blend(args.bodygroups_sorted_blend, progress=print_progress)
+        result = analyze_flexes_blend(args.bodygroups_sorted_blend, progress=print_progress, game=args.game)
         print(
             json.dumps(
                 {
@@ -5865,7 +5908,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     if args.command == "proportion-run":
-        result = run_proportion_export(args.collision_sorted_blend, remove_zero_weight_bones=args.remove_zero_weight_bones, progress=print_progress)
+        result = run_proportion_export(args.collision_sorted_blend, remove_zero_weight_bones=args.remove_zero_weight_bones, progress=print_progress, game=args.game, survivor=args.survivor)
         print(
             json.dumps(
                 {

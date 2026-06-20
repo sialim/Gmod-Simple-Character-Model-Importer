@@ -24,6 +24,25 @@ REFERENCE_FLEX_SCRIPT = ROOT / "reference" / "li_zhiyan_npc" / "3_Flexes" / "Ble
 # authoritative exact-match source. Kept under tools/ so it is both tracked and
 # bundled with the rest of the pipeline (the reference/ tree is gitignored).
 REFERENCE_FLEX_DICTIONARY = Path(__file__).resolve().parent / "flex_name_dictionary.json"
+L4D2_REFERENCE_FLEX_DICTIONARY = Path(__file__).resolve().parent / "flex_name_dictionary_l4d2.json"
+# The 52 FACS flex controllers an L4D2 survivor exposes (verified identical across
+# the official coach/gambler/mechanic/producer survivors). In L4D2 mode a morph is
+# kept only if it maps to one of these; everything else is dropped as redundant.
+KNOWN_L4D2_FLEX_CONTROLLERS = frozenset({
+    "right_lid_raiser", "left_lid_raiser", "right_lid_tightener", "left_lid_tightener",
+    "right_lid_droop", "left_lid_droop", "right_lid_closer", "left_lid_closer",
+    "half_closed", "blink", "right_lid_squinter", "left_lid_squinter",
+    "right_inner_raiser", "left_inner_raiser", "right_outer_raiser", "left_outer_raiser",
+    "right_lowerer", "left_lowerer", "right_cheek_raiser", "left_cheek_raiser",
+    "right_wrinkler", "left_wrinkler", "dilator", "right_upper_raiser", "left_upper_raiser",
+    "right_corner_puller", "left_corner_puller", "right_corner_depressor", "left_corner_depressor",
+    "chin_raiser", "right_part", "left_part", "right_puckerer", "left_puckerer",
+    "right_funneler", "left_funneler", "right_stretcher", "left_stretcher",
+    "bite", "presser", "tightener", "jaw_clencher", "jaw_drop",
+    "right_mouth_drop", "left_mouth_drop", "right_cheek_puffer", "left_cheek_puffer",
+    "mouth_sideways", "jaw_sideways", "lower_lip", "eyes_updown", "eyes_rightleft",
+})
+GAME_CHOICES = ("gmod", "l4d2")
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 FLEX_NAME_RE = re.compile(r"^[a-z0-9_]+$")
 EPSILON = 1e-7
@@ -75,6 +94,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-blend", type=Path)
     parser.add_argument("--report-json", type=Path)
     parser.add_argument("--flexes-json", type=Path)
+    parser.add_argument("--game", choices=GAME_CHOICES, default="gmod")
     return parser.parse_args(argv)
 
 
@@ -116,7 +136,28 @@ def unique_name(base: str, used: set[str], fallback: str) -> str:
     return candidate
 
 
-def load_reference_mapping() -> tuple[dict[str, str], list[str]]:
+def load_l4d2_mapping() -> tuple[dict[str, str], list[str]]:
+    """L4D2 morph->FACS-controller mapping. Only the dedicated L4D2 dictionary is
+    used (the GMod fallback/corpus carry GMod-style names, not FACS controllers)."""
+    warnings: list[str] = []
+    try:
+        data = json.loads(L4D2_REFERENCE_FLEX_DICTIONARY.read_text(encoding="utf-8"))
+        mapping = data.get("mapping") if isinstance(data, dict) else None
+        if not isinstance(mapping, dict) or not mapping:
+            raise ValueError("missing or empty 'mapping' object")
+        clean = {str(k): str(v) for k, v in mapping.items()}
+        print(f"Loaded {len(clean)} L4D2 flex controller mappings.")
+        return clean, warnings
+    except Exception as exc:
+        message = f"L4D2 flex dictionary unavailable ({L4D2_REFERENCE_FLEX_DICTIONARY}): {exc}; no morphs will map to L4D2 controllers."
+        print(f"Warning: {message}")
+        warnings.append(message)
+        return {}, warnings
+
+
+def load_reference_mapping(game: str = "gmod") -> tuple[dict[str, str], list[str]]:
+    if game == "l4d2":
+        return load_l4d2_mapping()
     mapping = dict(FALLBACK_FLEX_MAPPING)
     warnings: list[str] = []
     try:
@@ -523,10 +564,29 @@ def reorder_shape_keys_to_plan(flexes: list[dict[str, object]]) -> list[str]:
     return warnings
 
 
-def collect_flexes() -> tuple[list[dict[str, object]], list[str]]:
-    mapping, mapping_warnings = load_reference_mapping()
+def l4d2_category_for(controller: str) -> str:
+    if "lid" in controller or "blink" in controller or controller.startswith("eyes_") or "squinter" in controller:
+        return "eyes"
+    if "inner_raiser" in controller or "outer_raiser" in controller or "lowerer" in controller:
+        return "brows"
+    return "mouth"
+
+
+def resolve_l4d2_controller(original: str, mapping: dict[str, str], normalized_mapping: dict[str, str]) -> tuple[str, float]:
+    """Map an MMD morph to its L4D2 FACS controller via exact then normalized match."""
+    if original in mapping:
+        return mapping[original], 1.0
+    norm = normalized_name(original)
+    if norm in normalized_mapping:
+        return normalized_mapping[norm], 0.92
+    return "", 0.0
+
+
+def collect_flexes(game: str = "gmod") -> tuple[list[dict[str, object]], list[str]]:
+    mapping, mapping_warnings = load_reference_mapping(game)
     normalized_mapping = {normalized_name(key): value for key, value in mapping.items()}
     used_names: set[str] = set()
+    used_l4d2_controllers: set[str] = set()
     flexes: list[dict[str, object]] = []
     index = 1
     for obj in sorted(mesh_objects(), key=bodygroup_processing_key):
@@ -538,18 +598,42 @@ def collect_flexes() -> tuple[list[dict[str, object]], list[str]]:
             max_delta = shape_key_max_delta(obj, key.name)
             if max_delta <= EPSILON:
                 continue
-            base_name, category, confidence, warnings = infer_flex_name(key.name, obj.name, mapping, normalized_mapping)
             fallback = "face_flex_%03d" % index if "face" in obj.name.lower() else "body_flex_%03d" % index
-            final_name = unique_name(base_name, used_names, fallback)
-            if confidence < 0.60:
-                warnings.append("Low-confidence automatic name mapping.")
+            if game == "l4d2":
+                # L4D2 keeps only morphs that map to a free FACS controller; every
+                # other morph (and duplicates of a taken controller) is dropped.
+                controller, confidence = resolve_l4d2_controller(key.name, mapping, normalized_mapping)
+                warnings = []
+                if controller in KNOWN_L4D2_FLEX_CONTROLLERS and controller not in used_l4d2_controllers:
+                    used_l4d2_controllers.add(controller)
+                    final_name = controller
+                    category = l4d2_category_for(controller)
+                    enabled = True
+                    action = "keep"
+                else:
+                    enabled = False
+                    action = "remove"
+                    final_name = flex_output_name(key.name) or ("removed_flex_%03d" % index)
+                    category = "face" if "face" in obj.name.lower() else "body"
+                    confidence = 0.0
+                    if controller in used_l4d2_controllers:
+                        warnings.append(f"Duplicate of L4D2 flex controller '{controller}'; removed as redundant.")
+                    else:
+                        warnings.append("No L4D2 facial flex controller maps to this morph; removed as redundant.")
+            else:
+                base_name, category, confidence, warnings = infer_flex_name(key.name, obj.name, mapping, normalized_mapping)
+                final_name = unique_name(base_name, used_names, fallback)
+                enabled = True
+                action = "keep"
+                if confidence < 0.60:
+                    warnings.append("Low-confidence automatic name mapping.")
             if obj.name.lower() != "face" and "face" not in obj.name.lower():
                 warnings.append("Body flex exists outside Face bodygroup.")
             flexes.append(
                 {
                     "uid": f"flex_{index:03d}",
-                    "enabled": True,
-                    "action": "keep",
+                    "enabled": enabled,
+                    "action": action,
                     "final_name": final_name,
                     "original_name": key.name,
                     "bodygroup": obj.name,
@@ -729,10 +813,10 @@ def collect_flex_preview(flexes: list[dict[str, object]], max_triangles: int = 5
     }
 
 
-def analyze_scene(input_blend: Path) -> tuple[dict[str, object], dict[str, object]]:
+def analyze_scene(input_blend: Path, game: str = "gmod") -> tuple[dict[str, object], dict[str, object]]:
     prune_report = prune_shapekeys()
     bodygroups = [object_report(obj) for obj in sorted(mesh_objects(), key=bodygroup_processing_key)]
-    flexes, mapping_warnings = collect_flexes()
+    flexes, mapping_warnings = collect_flexes(game)
     sort_and_renumber_flexes(flexes)
     preview = collect_flex_preview(flexes)
     auto_removed = auto_mark_excess_flexes_for_removal(flexes)
@@ -1111,7 +1195,7 @@ def main() -> int:
         if not args.analysis_json:
             raise RuntimeError("--analysis-json is required in analyze mode")
         print("Analyzing flexes")
-        analysis, plan = analyze_scene(args.input_blend)
+        analysis, plan = analyze_scene(args.input_blend, args.game)
         analysis["elapsed_seconds"] = round(time.monotonic() - started, 3)
         write_json(args.analysis_json, analysis)
         write_json(args.plan_json, plan)

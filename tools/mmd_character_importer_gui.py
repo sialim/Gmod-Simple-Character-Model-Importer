@@ -107,6 +107,17 @@ GAME_OPTIONS = [
 GAME_CODES = {code for code, _display, _icon in GAME_OPTIONS}
 # Per-game Step 4 bone budget; mirrors blender_sort_bones.GAME_BONE_LIMITS.
 GAME_BONE_LIMITS = {"gmod": 254, "l4d2": 126}
+# L4D2 survivors the model can be ported onto. In L4D2 mode this dropdown
+# replaces the gender selector; the choice drives the Step 9 proportion target.
+# (code = compiled survivor .mdl stem; default Rochelle/producer.)
+L4D2_SURVIVOR_OPTIONS = [
+    ("producer", "Rochelle (Producer)"),
+    ("coach", "Coach"),
+    ("gambler", "Nick (Gambler)"),
+    ("mechanic", "Ellis (Mechanic)"),
+]
+L4D2_SURVIVOR_CODES = {code for code, _display in L4D2_SURVIVOR_OPTIONS}
+DEFAULT_L4D2_SURVIVOR = "producer"
 CATEGORY_SUGGESTIONS_FILE = ROOT_DIR / "tools" / "category_suggestions.json"
 LOCAL_CATEGORY_SUGGESTIONS_FILE = (
     Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "MMDCharacterImporter" / "category_suggestions.json"
@@ -716,6 +727,11 @@ def game_icon(icon_path: Path) -> "QtGui.QIcon":
 def normalize_game_code(value: object) -> str:
     code = str(value or "").strip().lower()
     return code if code in GAME_CODES else "gmod"
+
+
+def normalize_survivor_code(value: object) -> str:
+    code = str(value or "").strip().lower()
+    return code if code in L4D2_SURVIVOR_CODES else DEFAULT_L4D2_SURVIVOR
 
 
 SPINE_CHAIN_TARGETS = [
@@ -1710,9 +1726,10 @@ class FlexAnalyzeWorker(QtCore.QThread):
     done = QtCore.Signal(dict)
     failed = QtCore.Signal(str)
 
-    def __init__(self, input_blend: str) -> None:
+    def __init__(self, input_blend: str, game: str = "gmod") -> None:
         super().__init__()
         self.input_blend = input_blend
+        self.game = game
         self.cancel_requested = False
 
     def cancel(self) -> None:
@@ -1730,6 +1747,7 @@ class FlexAnalyzeWorker(QtCore.QThread):
                 Path(self.input_blend),
                 progress=self._log,
                 cancel_check=self._cancelled,
+                game=self.game,
             )
             self.done.emit(
                 {
@@ -1995,10 +2013,12 @@ class ProportionRunWorker(QtCore.QThread):
     done = QtCore.Signal(dict)
     failed = QtCore.Signal(str)
 
-    def __init__(self, input_blend: str, remove_zero_weight_bones: bool = True) -> None:
+    def __init__(self, input_blend: str, remove_zero_weight_bones: bool = True, game: str = "gmod", survivor: str = "producer") -> None:
         super().__init__()
         self.input_blend = input_blend
         self.remove_zero_weight_bones = bool(remove_zero_weight_bones)
+        self.game = game
+        self.survivor = survivor
         self.cancel_requested = False
 
     def cancel(self) -> None:
@@ -2017,6 +2037,8 @@ class ProportionRunWorker(QtCore.QThread):
                 remove_zero_weight_bones=self.remove_zero_weight_bones,
                 progress=self._log,
                 cancel_check=self._cancelled,
+                game=self.game,
+                survivor=self.survivor,
             )
             self.done.emit(
                 {
@@ -2428,7 +2450,7 @@ class QcAnalyzeWorker(QtCore.QThread):
     done = QtCore.Signal(dict)
     failed = QtCore.Signal(str)
 
-    def __init__(self, input_path: str, author: str, category: str, model_name: str, gmod_root: str, studiomdl: str, gender: str = "female", game: str = "gmod") -> None:
+    def __init__(self, input_path: str, author: str, category: str, model_name: str, gmod_root: str, studiomdl: str, gender: str = "female", game: str = "gmod", survivor: str = "producer") -> None:
         super().__init__()
         self.input_path = input_path
         self.author = author
@@ -2438,6 +2460,7 @@ class QcAnalyzeWorker(QtCore.QThread):
         self.studiomdl = studiomdl
         self.gender = gender
         self.game = game
+        self.survivor = survivor
         self.cancel_requested = False
 
     def cancel(self) -> None:
@@ -2462,6 +2485,7 @@ class QcAnalyzeWorker(QtCore.QThread):
                 cancel_check=self._cancelled,
                 gender=self.gender,
                 game=self.game,
+                survivor=self.survivor,
             )
             self.done.emit(
                 {
@@ -2590,6 +2614,7 @@ class FullImportWorker(QtCore.QThread):
         gender: str = "female",
         bodygroup_scale_factor: float = float(getattr(core, "DEFAULT_BODYGROUP_SCALE_FACTOR", 40.457)),
         game: str = "gmod",
+        survivor: str = "producer",
     ) -> None:
         super().__init__()
         self.pmx_path = Path(pmx_path)
@@ -2606,6 +2631,7 @@ class FullImportWorker(QtCore.QThread):
         self.collision_quality = str(collision_quality or "balanced")
         self.gender = "male" if str(gender or "").strip().lower() == "male" else "female"
         self.game = normalize_game_code(game)
+        self.survivor = normalize_survivor_code(survivor)
         self.bodygroup_scale_factor = float(bodygroup_scale_factor or getattr(core, "DEFAULT_BODYGROUP_SCALE_FACTOR", 40.457))
         self.cancel_requested = False
         self.step_results: dict[int, dict[str, object]] = {}
@@ -2807,7 +2833,7 @@ class FullImportWorker(QtCore.QThread):
             self.step_results[6] = {"blend": str(body_result.output_blend), "report": str(body_result.report_path), "dir": str(body_result.bodygroup_dir)}
 
             self._stage(7, "Sort Flexes", str(body_result.output_blend))
-            flex_analysis = core.analyze_flexes_blend(body_result.output_blend, progress=self._log, cancel_check=self._cancelled)
+            flex_analysis = core.analyze_flexes_blend(body_result.output_blend, progress=self._log, cancel_check=self._cancelled, game=self.game)
             flex_result = core.sort_flexes_blend(body_result.output_blend, flex_analysis.plan, progress=self._log, cancel_check=self._cancelled)
             self._require_clean_report(7, flex_result.report, "flex sort")
             self._write_marker(7, flex_result.flex_dir, outputs={"blend": str(flex_result.output_blend), "flexes_json": str(flex_result.flexes_json_path)}, report_path=flex_result.report_path)
@@ -2832,7 +2858,7 @@ class FullImportWorker(QtCore.QThread):
             self.step_results[8] = {"blend": str(collision_result.output_blend), "report": str(collision_result.report_path), "dir": str(collision_result.collision_dir)}
 
             self._stage(9, "Export Proportion Trick", str(collision_result.output_blend))
-            proportion_result = core.run_proportion_export(collision_result.output_blend, remove_zero_weight_bones=True, progress=self._log, cancel_check=self._cancelled)
+            proportion_result = core.run_proportion_export(collision_result.output_blend, remove_zero_weight_bones=True, progress=self._log, cancel_check=self._cancelled, game=self.game, survivor=self.survivor)
             self._require_clean_report(9, proportion_result.report, "proportion export")
             self._write_marker(9, proportion_result.proportion_dir, outputs={"final_dir": str(proportion_result.final_dir), "files": str(proportion_result.files_path)}, report_path=proportion_result.report_path)
             self.step_results[9] = {"final_dir": str(proportion_result.final_dir), "report": str(proportion_result.report_path), "dir": str(proportion_result.proportion_dir)}
@@ -2887,11 +2913,13 @@ class FullImportWorker(QtCore.QThread):
                 cancel_check=self._cancelled,
                 gender=self.gender,
                 game=self.game,
+                survivor=self.survivor,
             )
             qc_plan = qc_analysis.plan
             qc_plan["author"] = "sheepylord"
             qc_plan["gender"] = self.gender
             qc_plan["game"] = self.game
+            qc_plan["survivor"] = self.survivor
             qc_plan["auto_porting"] = True
             qc_plan["character_category"] = self.character_category
             if self.model_name:
@@ -3307,6 +3335,12 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self._texture_folder_scan_cache: dict[str, list[Path]] = {}
         self.gender_combos: list[QtWidgets.QComboBox] = []
         self.game_combos: list[QtWidgets.QComboBox] = []
+        self.survivor_combos: list[QtWidgets.QComboBox] = []
+        # Per-placement (gender_combo, survivor_combo, label) so L4D2 mode can
+        # swap the gender selector for the survivor selector in place.
+        self.character_selectors: list[tuple[QtWidgets.QComboBox, QtWidgets.QComboBox, QtWidgets.QLabel]] = []
+        # Widgets shown only in L4D2 mode (e.g. the Step 9 survivor row).
+        self._l4d2_only_widgets: list[QtWidgets.QWidget] = []
         # Ordered membership per additional CoACD collision group; the first
         # bone in each list is the group's merge target.
         self._collision_group_members: dict[int, list[str]] = {}
@@ -3320,6 +3354,9 @@ class ImporterWindow(QtWidgets.QMainWindow):
         # Target game for porting ("gmod" | "l4d2"). Threads through the pipeline
         # like `gender`; defaults to gmod so the GMod path is unchanged.
         self.selected_game = normalize_game_code(self.settings_store.value("selected_game", "gmod", str))
+        # Selected L4D2 survivor (replaces the gender choice in L4D2 mode); drives
+        # the Step 9 proportion target. Default Rochelle (producer).
+        self.selected_survivor = normalize_survivor_code(self.settings_store.value("selected_survivor", DEFAULT_L4D2_SURVIVOR, str))
         self.i18n_fallback = self.load_i18n_catalog("en_us")
         self.i18n_catalog = self.load_i18n_catalog(self.language_code)
         self._i18n_exact_map: dict[str, str] = {}
@@ -3686,7 +3723,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.save_settings()
 
     def apply_game_dependent_defaults(self) -> None:
-        """React to a game switch: retarget the Step 4 bone-limit spinbox.
+        """React to a game switch: retarget the Step 4 bone-limit spinbox and
+        swap the gender selector for the L4D2 survivor selector.
 
         Only adjusts the spinbox ceiling/value when the user is still on the
         previous game's default, so a deliberate custom limit is preserved.
@@ -3702,6 +3740,75 @@ class ImporterWindow(QtWidgets.QMainWindow):
                     spin.setValue(game_limit)
             finally:
                 del blocker
+        self._refresh_character_selectors()
+
+    def _make_survivor_combo(self) -> QtWidgets.QComboBox:
+        combo = QtWidgets.QComboBox()
+        for code, display in L4D2_SURVIVOR_OPTIONS:
+            combo.addItem(display, code)
+        combo.setToolTip(
+            "L4D2 survivor whose skeleton/proportions the model is aligned to "
+            "in Step 9. Replaces the animation gender in L4D2 mode."
+        )
+        index = combo.findData(self.selected_survivor)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+        combo.currentIndexChanged.connect(lambda _index, source=combo: self.on_survivor_combo_changed(source))
+        self.survivor_combos.append(combo)
+        return combo
+
+    def current_selected_survivor(self) -> str:
+        for combo in getattr(self, "survivor_combos", []):
+            return normalize_survivor_code(combo.currentData())
+        return normalize_survivor_code(getattr(self, "selected_survivor", DEFAULT_L4D2_SURVIVOR))
+
+    def set_selected_survivor(self, survivor: str) -> None:
+        survivor = normalize_survivor_code(survivor)
+        self.selected_survivor = survivor
+        for combo in getattr(self, "survivor_combos", []):
+            blocker = QtCore.QSignalBlocker(combo)
+            try:
+                index = combo.findData(survivor)
+                if index >= 0:
+                    combo.setCurrentIndex(index)
+            finally:
+                del blocker
+
+    def on_survivor_combo_changed(self, source: QtWidgets.QComboBox) -> None:
+        self.set_selected_survivor(str(source.currentData() or DEFAULT_L4D2_SURVIVOR))
+        self.settings_store.setValue("selected_survivor", self.selected_survivor)
+        self.save_settings()
+
+    def _make_character_field(self, label: QtWidgets.QLabel) -> QtWidgets.QWidget:
+        """A form field holding both the gender and L4D2-survivor selectors; only
+        one is shown depending on the selected game (survivor in L4D2 mode)."""
+        if not hasattr(self, "survivor_combos"):
+            self.survivor_combos: list[QtWidgets.QComboBox] = []
+        container = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        gender = self._make_gender_combo()
+        survivor = self._make_survivor_combo()
+        layout.addWidget(gender)
+        layout.addWidget(survivor)
+        layout.addStretch(1)
+        self.character_selectors.append((gender, survivor, label))
+        return container
+
+    def _refresh_character_selectors(self) -> None:
+        l4d2 = self.selected_game == "l4d2"
+        translate = getattr(self, "translate_static_text", None)
+        def _label(text: str) -> str:
+            return translate(text) if callable(translate) else text
+        for gender, survivor, label in getattr(self, "character_selectors", []):
+            gender.setVisible(not l4d2)
+            survivor.setVisible(l4d2)
+            if isinstance(label, QtWidgets.QLabel):
+                # Route through the i18n exact-map so the existing gender-label
+                # translation is preserved (new survivor label falls back to English).
+                label.setText(_label("Survivor character") if l4d2 else _label("Animation gender"))
+        for widget in getattr(self, "_l4d2_only_widgets", []):
+            widget.setVisible(l4d2)
 
     def apply_main_scale_default_for_selected(self) -> None:
         """Track the selected model's format and reset the scale to its default on change."""
@@ -4261,6 +4368,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.apply_preview_i18n()
         self.apply_main_i18n()
         self.apply_workflow_i18n()
+        # Re-assert the gender/survivor label swap after i18n re-sets label text.
+        self._refresh_character_selectors()
 
     def apply_preview_i18n(self) -> None:
         texts = {
@@ -5394,7 +5503,6 @@ class ImporterWindow(QtWidgets.QMainWindow):
         )
         self.main_clear_custom_normals_hint.setObjectName("fieldHint")
         self.main_clear_custom_normals_hint.setWordWrap(True)
-        self.main_gender_combo = self._make_gender_combo()
         self.main_scale_spin = QtWidgets.QDoubleSpinBox()
         self.main_scale_spin.setRange(0.01, 10.0)
         self.main_scale_spin.setDecimals(3)
@@ -5429,7 +5537,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         form.addRow(self.main_form_labels["category_display"], self.main_category_display_edit)
         form.addRow(self.main_form_labels["character_internal"], self.main_model_name_edit)
         form.addRow(self.main_form_labels["character_display"], self.main_model_display_edit)
-        form.addRow(self.main_form_labels["gender"], self.main_gender_combo)
+        form.addRow(self.main_form_labels["gender"], self._make_character_field(self.main_form_labels["gender"]))
         form.addRow(self.main_form_labels["model_scale"], self.main_scale_spin)
         form.addRow(self.main_form_labels["rtx_vertex_limit"], self.main_rtx_bodygroup_limit_check)
         main_clear_custom_normals_box = QtWidgets.QWidget()
@@ -5757,8 +5865,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
         workspace_row.addWidget(self.workspace_browse_button, 0)
         workspace_layout = QtWidgets.QFormLayout()
         workspace_layout.addRow("Workspace", workspace_row)
-        self.import_gender_combo = self._make_gender_combo()
-        workspace_layout.addRow("Animation gender", self.import_gender_combo)
+        self.import_character_label = QtWidgets.QLabel("Animation gender")
+        workspace_layout.addRow(self.import_character_label, self._make_character_field(self.import_character_label))
         layout.addLayout(workspace_layout)
 
         self.preflight_group = QtWidgets.QGroupBox("Preflight")
@@ -7987,6 +8095,11 @@ class ImporterWindow(QtWidgets.QMainWindow):
         )
         settings.addRow("Output folder", self._output_folder_row(self.proportion_output_edit))
         settings.addRow("Export cleanup", self.proportion_remove_zero_weight_check)
+        # L4D2-only: the survivor whose skeleton/proportions the model aligns to.
+        self.proportion_survivor_label = QtWidgets.QLabel("Survivor character")
+        self.proportion_survivor_combo = self._make_survivor_combo()
+        settings.addRow(self.proportion_survivor_label, self.proportion_survivor_combo)
+        self._l4d2_only_widgets.extend([self.proportion_survivor_label, self.proportion_survivor_combo])
         self.detect_collision_blend_button = QtWidgets.QPushButton("Detect Step 8 Output")
         self.detect_collision_blend_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogContentsView))
         settings.addRow("", self.detect_collision_blend_button)
@@ -9014,8 +9127,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
         settings.addRow("Character category display name", self.qc_category_display_edit)
         settings.addRow("Model internal name", self.qc_model_name_edit)
         settings.addRow("Model display name", self.qc_model_display_edit)
-        self.qc_gender_combo = self._make_gender_combo()
-        settings.addRow("Animation gender", self.qc_gender_combo)
+        self.qc_character_label = QtWidgets.QLabel("Animation gender")
+        settings.addRow(self.qc_character_label, self._make_character_field(self.qc_character_label))
         settings.addRow("Jiggle direction", self.qc_invert_jiggle_check)
         settings.addRow("GMod addons install", self.qc_copy_to_gmod_addons_check)
         settings.addRow("MCI metadata JSON", self.qc_include_mci_metadata_check)
@@ -9698,6 +9811,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
                     self.main_language_combo.setCurrentIndex(language_index)
                 finally:
                     del blocker
+        self.set_selected_survivor(self.settings_store.value("selected_survivor", self.selected_survivor, str))
         self.set_selected_game(self.settings_store.value("selected_game", self.selected_game, str))
         source = str(self.settings_store.value("source_dir", "", str) or "")
         if not source:
@@ -9972,6 +10086,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
             return
         self.settings_store.setValue("ui_language", self.language_code)
         self.settings_store.setValue("selected_game", self.selected_game)
+        self.settings_store.setValue("selected_survivor", self.selected_survivor)
         if hasattr(self, "main_source_row"):
             self.settings_store.setValue("main_source_dir", self.main_source_row.value())
         if hasattr(self, "main_pmx_combo"):
@@ -11141,6 +11256,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
             gender=self.current_character_gender(),
             bodygroup_scale_factor=self.main_effective_bodygroup_scale(),
             game=self.selected_game,
+            survivor=self.current_selected_survivor(),
         )
         self.worker.log.connect(self.append_main_log)
         self.worker.progress.connect(self.set_main_progress)
@@ -15291,7 +15407,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.flex_remove_button.setEnabled(False)
         self.detect_bodygroup_blend_button.setEnabled(False)
         self.flex_cancel_button.setEnabled(True)
-        self.worker = FlexAnalyzeWorker(str(input_blend))
+        self.worker = FlexAnalyzeWorker(str(input_blend), self.selected_game)
         self.worker.log.connect(self.append_flex_log)
         self.worker.done.connect(self.flex_analyze_done)
         self.worker.failed.connect(self.flex_failed)
@@ -17623,6 +17739,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.worker = ProportionRunWorker(
             str(input_blend),
             remove_zero_weight_bones=self.proportion_remove_zero_weight_check.isChecked(),
+            game=self.selected_game,
+            survivor=self.current_selected_survivor(),
         )
         self.worker.log.connect(self.append_proportion_log)
         self.worker.done.connect(self.proportion_done)
@@ -21165,6 +21283,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
             studiomdl,
             gender=self.current_character_gender(),
             game=self.selected_game,
+            survivor=self.current_selected_survivor(),
         )
         self.worker.log.connect(self.append_qc_log)
         self.worker.done.connect(self.qc_analyze_done)
@@ -21634,6 +21753,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         )
         plan["gender"] = self.current_character_gender()
         plan["game"] = self.selected_game
+        plan["survivor"] = self.current_selected_survivor()
         plan["invert_jiggle_direction"] = bool(self.qc_invert_jiggle_check.isChecked()) if hasattr(self, "qc_invert_jiggle_check") else False
         plan["copy_to_gmod_addons"] = (
             bool(self.qc_copy_to_gmod_addons_check.isChecked()) if hasattr(self, "qc_copy_to_gmod_addons_check") else False
