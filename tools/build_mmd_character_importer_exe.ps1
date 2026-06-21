@@ -23,7 +23,12 @@ param(
     [string]$Name = "GmodSimpleMMDCharacterImporter",
     [switch]$UseUPX,
     [switch]$Console,
-    [switch]$OneDir
+    [switch]$OneDir,
+    # When set, do NOT bundle the ~380 MB Blender zip even if it is present at the repo root. The
+    # resulting "without Blender" binary stays small and the app prompts the user to download or
+    # browse to Blender on first run. Use tools/build_mmd_character_importer_exe_no_blender.ps1 for
+    # a named no-Blender release.
+    [switch]$NoBlender
 )
 
 $ErrorActionPreference = "Stop"
@@ -275,9 +280,13 @@ try {
     # If the optional Blender zip is present, verify it against
     # build_assets_manifest.json before baking it into the release exe so a
     # truncated/corrupted local download cannot ship silently.
+    # Skipped entirely for -NoBlender builds (the lean "without Blender" variant).
     $BlenderZipName = "blender-4.5.10-windows-x64.zip"
     $BlenderZipPath = Resolve-ProjectPath $BlenderZipName
-    if (Test-Path -LiteralPath $BlenderZipPath -PathType Leaf) {
+    if ($NoBlender) {
+        Write-Host "Building WITHOUT bundled Blender (-NoBlender): the app will prompt to download or browse to Blender on first run."
+    }
+    elseif (Test-Path -LiteralPath $BlenderZipPath -PathType Leaf) {
         $AssetManifestPath = Resolve-ProjectPath "build_assets_manifest.json"
         if (-not (Test-Path -LiteralPath $AssetManifestPath -PathType Leaf)) {
             throw "Cannot verify $BlenderZipName before bundling: build_assets_manifest.json was not found at the repo root."
@@ -298,7 +307,9 @@ try {
         }
         Write-Host "Verified $BlenderZipName against build_assets_manifest.json."
     }
-    Add-DataIfExists $BlenderZipName "."
+    if (-not $NoBlender) {
+        Add-DataIfExists $BlenderZipName "."
+    }
     Add-RequiredData "steps.txt" "."
     Add-RequiredData "Translation Templates Write.txt" "."
     Add-RequiredData "README.md" "."
@@ -531,7 +542,8 @@ try {
             name = "Blender"
             path = "blender-4.5.10-windows-x64.zip"
             required = $false
-            role = "Portable Blender 4.5 setup source (optional; app can auto-download the official Blender 4.5 zip when omitted)"
+            bundled = (-not [bool]$NoBlender)
+            role = "Portable Blender 4.5 setup source. When bundled, extracted on first run; when NOT bundled (-NoBlender build), the app prompts the user to download the official Blender 4.5.10 zip or browse to a local copy on first run."
         },
         [ordered]@{
             name = "VTFCmd"
@@ -594,7 +606,7 @@ try {
         "Launch: $ReleaseTarget",
         "",
         $(if ($OneDir) { "Do not move or delete the _internal folder; it contains the Blender scripts, plugins, templates, icons, localization, and reference assets required by the workflow." } else { "This is a one-file build. The Blender scripts, plugins, templates, icons, localization, and reference assets are embedded in the executable and extracted temporarily at runtime." }),
-        "Bundled external tools: Blender 4.5 zip and VTFCmd.",
+        $(if ($NoBlender) { "Bundled external tools: VTFCmd. Blender is NOT bundled - on first run the app prompts you to download the official Blender 4.5.10 zip (~380 MB) or browse to a copy you already have." } else { "Bundled external tools: Blender 4.5 zip and VTFCmd." }),
         "Runtime requirement: Garry's Mod must be installed so StudioMDL and gmad are available.",
         "Dependency manifest: $([System.IO.Path]::GetFileName($ManifestPath))"
     )

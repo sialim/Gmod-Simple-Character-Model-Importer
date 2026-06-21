@@ -89,6 +89,15 @@ DEFAULT_L4D2_SURVIVOR = "producer"
 DEFAULT_ICON_VMD = ROOT / "reference" / "ref_motion" / "bad_bad_water.vmd"
 WARNING_KEYWORDS_PATH = ROOT / "reference" / "keywords" / "Warning_Keyword.txt"
 BLENDER_LTS_INDEX_URL = "https://download.blender.org/release/Blender4.5/"
+# Pinned official Blender 4.5.10 zip used by the "without Blender" build's first-run download
+# prompt. sha256/size mirror build_assets_manifest.json (the same file the build script verifies the
+# bundled zip against), so a downloaded or browsed zip can be checksum-validated at runtime.
+# NOTE: use the direct download.blender.org mirror, NOT www.blender.org/download/... -- the latter
+# serves an HTML landing page (text/html), not the zip, so it would fail the checksum.
+BLENDER_DOWNLOAD_URL = "https://download.blender.org/release/Blender4.5/blender-4.5.10-windows-x64.zip"
+EXPECTED_BLENDER_ZIP_NAME = "blender-4.5.10-windows-x64.zip"
+EXPECTED_BLENDER_SHA256 = "ef6d846b8015f47ade6df3f9322ce17419080a5d922fa562b6c966064fe30dce"
+EXPECTED_BLENDER_SIZE_BYTES = 398911842
 APP_DIR_NAME = "MMDCharacterImporter"
 ProgressCallback = Callable[[str], None]
 CancelCheck = Callable[[], bool]
@@ -1211,12 +1220,127 @@ def valid_zip(path: Path) -> bool:
         return False
 
 
+def blender_is_bundled() -> bool:
+    """Lightweight check for whether THIS build ships the portable Blender zip (the "with Blender"
+    variant). Existence is enough for the first-run decision; blender_zip_path() still validates the
+    archive before extracting."""
+    try:
+        return BUNDLED_BLENDER_ZIP.exists() and BUNDLED_BLENDER_ZIP.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def provisioned_blender_zip_path() -> Path:
+    """Where a user-downloaded/-browsed Blender zip is stored so the normal setup flow extracts it
+    (the "without Blender" build provisions Blender here on first run)."""
+    return app_local_dir() / "downloads" / EXPECTED_BLENDER_ZIP_NAME
+
+
+def managed_blender_is_installed() -> bool:
+    """True when a managed portable Blender 4.5.x is already extracted + verified from a prior run."""
+    try:
+        return setup_state_is_current(read_setup_state()) is not None
+    except Exception:
+        return False
+
+
+def blender_needs_provisioning() -> bool:
+    """True only for the "without Blender" build before Blender has been supplied: not bundled, not
+    already installed, and no provisioned zip waiting to extract. The GUI uses this to decide whether
+    to show the first-run download/browse prompt. All checks are cheap (no full-archive CRC)."""
+    if blender_is_bundled():
+        return False
+    if managed_blender_is_installed():
+        return False
+    try:
+        provisioned = provisioned_blender_zip_path()
+        return not (provisioned.exists() and provisioned.stat().st_size > 0)
+    except OSError:
+        return True
+
+
+def hash_file_sha256(
+    path: Path, progress: ProgressCallback | None = None, cancel_check: CancelCheck | None = None
+) -> str:
+    digest = hashlib.sha256()
+    total = path.stat().st_size if path.exists() else 0
+    read = 0
+    last = 0.0
+    with path.open("rb") as handle:
+        while True:
+            if cancel_check and cancel_check():
+                raise RuntimeError("operation was cancelled")
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            read += len(chunk)
+            now = time.monotonic()
+            if now - last > 1.5:
+                if total:
+                    emit(progress, f"Verifying checksum: {read / 1024 / 1024:.0f} / {total / 1024 / 1024:.0f} MB")
+                last = now
+    return digest.hexdigest()
+
+
+def verify_blender_zip_checksum(
+    path: Path, progress: ProgressCallback | None = None, cancel_check: CancelCheck | None = None
+) -> tuple[bool, str]:
+    """Return (matches_expected_sha256, actual_sha256_lowercase) for a Blender zip."""
+    actual = hash_file_sha256(path, progress, cancel_check=cancel_check).lower()
+    return (actual == EXPECTED_BLENDER_SHA256.lower(), actual)
+
+
+def download_blender_zip(
+    target: Path | None = None, progress: ProgressCallback | None = None, cancel_check: CancelCheck | None = None
+) -> Path:
+    """Download the pinned official Blender 4.5.10 zip to the provisioned location."""
+    target = target or provisioned_blender_zip_path()
+    download_file(BLENDER_DOWNLOAD_URL, target, progress, cancel_check=cancel_check)
+    return target
+
+
+def install_provisioned_blender_zip(
+    source_zip: Path, progress: ProgressCallback | None = None, cancel_check: CancelCheck | None = None
+) -> Path:
+    """Place a user-supplied (browsed) Blender zip at the provisioned location so the normal setup
+    flow extracts it. Copies only when the source is not already the provisioned file."""
+    source_zip = source_zip.resolve()
+    target = provisioned_blender_zip_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if source_zip == target.resolve():
+        return target
+    emit(progress, f"Copying Blender zip into place ({source_zip.name})...")
+    tmp = target.with_name(target.name + ".part")
+    if tmp.exists():
+        tmp.unlink()
+    try:
+        shutil.copyfile(source_zip, tmp)
+        if cancel_check and cancel_check():
+            raise RuntimeError("operation was cancelled")
+        tmp.replace(target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+    return target
+
+
 def blender_zip_path(progress: ProgressCallback | None = None, cancel_check: CancelCheck | None = None) -> Path:
     if BUNDLED_BLENDER_ZIP.exists() and valid_zip(BUNDLED_BLENDER_ZIP):
         emit(progress, f"Using bundled Blender zip: {BUNDLED_BLENDER_ZIP}")
         return BUNDLED_BLENDER_ZIP
     if BUNDLED_BLENDER_ZIP.exists():
         emit(progress, f"WARNING: Bundled Blender zip is invalid and will be ignored: {BUNDLED_BLENDER_ZIP}")
+
+    # A zip the user downloaded/browsed via the first-run prompt (the "without Blender" build). It is
+    # preferred over the auto-download fallback so the user's chosen/verified zip is what gets used.
+    provisioned = provisioned_blender_zip_path()
+    if provisioned.exists() and valid_zip(provisioned):
+        emit(progress, f"Using provisioned Blender zip: {provisioned}")
+        return provisioned
+    if provisioned.exists():
+        emit(progress, f"WARNING: Provisioned Blender zip is invalid and will be ignored: {provisioned}")
 
     downloads = app_local_dir() / "downloads"
     try:

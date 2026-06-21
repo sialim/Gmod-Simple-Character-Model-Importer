@@ -816,6 +816,194 @@ def enable_crash_logging() -> Path | None:
         return None
 
 
+class BlenderProvisionWorker(QtCore.QThread):
+    """Downloads the pinned Blender zip, or copies a user-browsed zip into place, then verifies its
+    checksum. Used by the first-run BlenderSetupDialog (the "without Blender" build)."""
+
+    progress = QtCore.Signal(str)
+    done = QtCore.Signal(bool, str, str)  # checksum_ok, actual_sha256, zip_path
+    failed = QtCore.Signal(str)
+
+    def __init__(self, mode: str, source: str = "") -> None:
+        super().__init__()
+        self.mode = mode  # "download" | "browse"
+        self.source = source
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def run(self) -> None:
+        try:
+            if self.mode == "download":
+                target = core.download_blender_zip(progress=self.progress.emit, cancel_check=self._cancelled)
+            else:
+                target = core.install_provisioned_blender_zip(
+                    Path(self.source), progress=self.progress.emit, cancel_check=self._cancelled
+                )
+            self.progress.emit("Verifying checksum...")
+            ok, actual = core.verify_blender_zip_checksum(
+                target, progress=self.progress.emit, cancel_check=self._cancelled
+            )
+            self.done.emit(ok, actual, str(target))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class BlenderSetupDialog(QtWidgets.QDialog):
+    """First-run prompt shown when Blender is not bundled (the "without Blender" build): the user can
+    download the official Blender 4.5.10 zip or browse to a local copy. A checksum mismatch warns but
+    can be overridden."""
+
+    def __init__(self, owner: "ImporterWindow") -> None:
+        super().__init__(owner)
+        self._owner = owner
+        self.worker: BlenderProvisionWorker | None = None
+        self.setModal(True)
+        self.setWindowTitle(owner._t("blender_setup.title", "Blender setup required"))
+        self.resize(600, 240)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        intro = QtWidgets.QLabel(
+            owner._t(
+                "blender_setup.intro",
+                "This build does not include Blender, which is required to process models.\n\n"
+                "Download Blender 4.5.10 now (~380 MB) from blender.org, or browse to a "
+                "blender-4.5.10-windows-x64.zip you have already downloaded.",
+            )
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        self.status = QtWidgets.QLabel("")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+
+        self.bar = QtWidgets.QProgressBar()
+        self.bar.setRange(0, 0)
+        self.bar.setVisible(False)
+        layout.addWidget(self.bar)
+        layout.addStretch(1)
+
+        buttons = QtWidgets.QHBoxLayout()
+        self.download_btn = QtWidgets.QPushButton(owner._t("blender_setup.download", "Download Blender"))
+        self.browse_btn = QtWidgets.QPushButton(owner._t("blender_setup.browse", "Browse to zip..."))
+        self.cancel_btn = QtWidgets.QPushButton(owner._t("blender_setup.cancel", "Cancel"))
+        buttons.addWidget(self.download_btn)
+        buttons.addWidget(self.browse_btn)
+        buttons.addStretch(1)
+        buttons.addWidget(self.cancel_btn)
+        layout.addLayout(buttons)
+
+        self.download_btn.clicked.connect(self._on_download)
+        self.browse_btn.clicked.connect(self._on_browse)
+        self.cancel_btn.clicked.connect(self._on_cancel)
+
+    def _t(self, key: str, default: str) -> str:
+        return self._owner._t(key, default)
+
+    def _set_busy(self, busy: bool) -> None:
+        self.download_btn.setEnabled(not busy)
+        self.browse_btn.setEnabled(not busy)
+        self.bar.setVisible(busy)
+        self.cancel_btn.setText(self._t("blender_setup.stop", "Stop") if busy else self._t("blender_setup.cancel", "Cancel"))
+
+    def _on_download(self) -> None:
+        self._start("download", "")
+
+    def _on_browse(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            self._t("blender_setup.pick", "Select Blender zip"),
+            str(Path.home()),
+            "Blender zip (blender-4.5*.zip *.zip)",
+        )
+        if path:
+            self._start("browse", path)
+
+    def _start(self, mode: str, source: str) -> None:
+        self._set_busy(True)
+        self.status.setText(self._t("blender_setup.working", "Working..."))
+        self.worker = BlenderProvisionWorker(mode, source)
+        self.worker.progress.connect(self.status.setText)
+        self.worker.done.connect(self._on_done)
+        self.worker.failed.connect(self._on_failed)
+        self.worker.start()
+
+    def _on_failed(self, message: str) -> None:
+        self._set_busy(False)
+        if "cancel" in message.lower():
+            self.status.setText(self._t("blender_setup.cancelled", "Cancelled."))
+            return
+        self.status.setText("")
+        QtWidgets.QMessageBox.critical(
+            self,
+            self._t("blender_setup.title", "Blender setup"),
+            self._t("blender_setup.error", "Blender setup failed:") + f"\n\n{message}",
+        )
+
+    def _on_done(self, ok: bool, actual: str, zip_path: str) -> None:
+        self._set_busy(False)
+        if ok:
+            self.status.setText(self._t("blender_setup.verified", "Checksum verified."))
+            QtWidgets.QMessageBox.information(
+                self,
+                self._t("blender_setup.title", "Blender setup"),
+                self._t(
+                    "blender_setup.ready",
+                    "Blender is ready. It will finish setting up the first time you run a step.",
+                ),
+            )
+            self.accept()
+            return
+        # Checksum mismatch: warn, but let the user insist on using it.
+        warn = (
+            self._t(
+                "blender_setup.mismatch",
+                "WARNING: this Blender zip does not match the expected official 4.5.10 checksum. "
+                "It may be corrupted or a different version.",
+            )
+            + f"\n\nExpected SHA-256:\n{core.EXPECTED_BLENDER_SHA256}\n\nActual SHA-256:\n{actual}\n\n"
+            + self._t("blender_setup.use_anyway_q", "Use it anyway?")
+        )
+        choice = QtWidgets.QMessageBox.warning(
+            self,
+            self._t("blender_setup.mismatch_title", "Checksum mismatch"),
+            warn,
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if choice == QtWidgets.QMessageBox.StandardButton.Yes:
+            self.accept()
+            return
+        # Declined: discard the provisioned zip so it is not used, let the user retry.
+        try:
+            candidate = Path(zip_path)
+            if candidate.exists() and candidate == core.provisioned_blender_zip_path():
+                candidate.unlink()
+        except Exception:
+            pass
+        self.status.setText(self._t("blender_setup.discarded", "Discarded. Choose Download or Browse to try again."))
+
+    def _on_cancel(self) -> None:
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.cancel()
+            self.status.setText(self._t("blender_setup.stopping", "Stopping..."))
+            return
+        self.reject()
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.cancel()
+            self.status.setText(self._t("blender_setup.stopping", "Stopping..."))
+            event.ignore()
+            return
+        event.accept()
+
+
 class CategoryScanWorker(QtCore.QThread):
     done = QtCore.Signal(object)
 
@@ -3555,7 +3743,25 @@ class ImporterWindow(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(500, self.populate_main_pmx_files)
         QtCore.QTimer.singleShot(700, self.refresh_workspace_cache_size)
         QtCore.QTimer.singleShot(900, self.start_category_scan)
+        # First-run Blender prompt for the "without Blender" build (no-op when Blender is bundled or
+        # already provisioned/installed). Shown after the window has painted and the other startup
+        # tasks have kicked off.
+        QtCore.QTimer.singleShot(1100, self.maybe_prompt_blender_setup)
         QtCore.QTimer.singleShot(1600, self.start_update_check)
+
+    def maybe_prompt_blender_setup(self) -> None:
+        """If this build does not bundle Blender and none has been provisioned yet, prompt the user
+        to download it (from blender.org) or browse to a local zip. Built into BOTH builds; a no-op
+        when Blender is bundled. Never allowed to crash startup."""
+        try:
+            if not core.blender_needs_provisioning():
+                return
+        except Exception:
+            return
+        try:
+            BlenderSetupDialog(self).exec()
+        except Exception:
+            pass
 
     def apply_startup_geometry(self) -> None:
         app = QtWidgets.QApplication.instance()
