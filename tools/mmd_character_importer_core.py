@@ -4576,7 +4576,7 @@ def run_proportion_export(
             )
             report["l4d2_polygon_budget"] = decimation
         except Exception as exc:
-            emit(progress, f"WARNING: L4D2 polygon-budget decimation failed ({exc}); shipping full-resolution meshes.")
+            emit(progress, f"WARNING: L4D2 polygon-budget decimation did not complete ({exc}); some bodygroups may ship at full resolution and could be unstable in game.")
     return ProportionResult(
         input_blend=input_blend,
         proportion_dir=proportion_dir,

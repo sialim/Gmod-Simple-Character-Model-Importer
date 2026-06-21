@@ -89,8 +89,23 @@ def smd_triangle_count(path: Path) -> int:
     return vertex_lines // 3
 
 
-def reset_scene() -> None:
-    bpy.ops.wm.read_factory_settings(use_empty=True)
+def clear_scene_objects() -> None:
+    """Delete every object and purge orphaned datablocks, leaving a clean scene WITHOUT a factory
+    reset. (``read_factory_settings`` fires Source Tools' load handler before its ``vs`` scene
+    property is re-registered, spamming harmless-but-alarming "'Scene' object has no attribute 'vs'"
+    errors into the build log; deleting objects avoids that and keeps the addon registered.)"""
+    for obj in list(bpy.data.objects):
+        try:
+            bpy.data.objects.remove(obj, do_unlink=True)
+        except Exception:
+            pass
+    for collection in (bpy.data.meshes, bpy.data.armatures, bpy.data.actions, bpy.data.materials, bpy.data.images):
+        for block in list(collection):
+            if block.users == 0:
+                try:
+                    collection.remove(block)
+                except Exception:
+                    pass
 
 
 def import_smd(path: Path) -> list[bpy.types.Object]:
@@ -101,6 +116,15 @@ def import_smd(path: Path) -> list[bpy.types.Object]:
 
 def decimate_object(obj: bpy.types.Object, ratio: float) -> int:
     """Collapse-decimate one mesh to `ratio` of its faces. Returns resulting tri count."""
+    if bpy.context.mode != "OBJECT":
+        bpy.ops.object.mode_set(mode="OBJECT")
+    # Force any armature the mesh is bound to into rest pose so the (deform) armature modifier is an
+    # exact identity while we apply the (generative) decimate -- otherwise applying decimate while a
+    # deform modifier precedes it can bake a pose into the geometry. SMD import is already at rest,
+    # so this is belt-and-suspenders.
+    for mod in obj.modifiers:
+        if mod.type == "ARMATURE" and mod.object is not None and mod.object.type == "ARMATURE":
+            mod.object.data.pose_position = "REST"
     bpy.context.view_layer.objects.active = obj
     bpy.ops.object.select_all(action="DESELECT")
     obj.select_set(True)
@@ -108,6 +132,12 @@ def decimate_object(obj: bpy.types.Object, ratio: float) -> int:
     mod.decimate_type = "COLLAPSE"
     mod.ratio = max(0.01, min(1.0, ratio))
     mod.use_collapse_triangulate = True
+    # Apply decimate as the FIRST modifier so it operates on the undeformed base mesh with no
+    # "modifier was not first" ambiguity; the armature modifier (if any) stays on top.
+    try:
+        bpy.ops.object.modifier_move_to_index(modifier=mod.name, index=0)
+    except Exception:
+        pass
     bpy.ops.object.modifier_apply(modifier=mod.name)
     return len(obj.data.polygons)
 
@@ -208,9 +238,12 @@ def plan_ratios(meshes: dict[str, int], fixed_tris: int, per_mesh: int, total: i
     model (decimatable + fixed VTA meshes) <= total."""
     # Per-mesh cap first.
     capped = {name: min(tris, per_mesh) for name, tris in meshes.items()}
-    budget_for_decimatable = max(1, total - fixed_tris)
+    budget_for_decimatable = total - fixed_tris
     sum_capped = sum(capped.values())
-    if sum_capped > budget_for_decimatable:
+    # Only scale down to meet the TOTAL budget when there is a sane positive budget left after the
+    # fixed (VTA-locked) meshes. If the fixed meshes alone already meet/exceed the total, the body
+    # bodygroups are not the offender -- don't crush them to ~nothing; just apply the per-mesh caps.
+    if budget_for_decimatable > 0 and sum_capped > budget_for_decimatable:
         scale = budget_for_decimatable / sum_capped
         capped = {name: max(1, int(t * scale)) for name, t in capped.items()}
     ratios: dict[str, float] = {}
@@ -258,6 +291,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
 
     results: list[dict[str, object]] = []
     scratch = export_dir / "_decimate_scratch"
+    clear_scene_objects()  # drop the --factory-startup default cube/camera/light up front
     for stem, smd in decimatable.items():
         orig = dec_tris[stem]
         ratio = ratios[stem]
@@ -265,24 +299,27 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             results.append({"mesh": stem, "tris_before": orig, "tris_after": orig, "ratio": 1.0, "decimated": False})
             log(f"  keep (under budget): {stem} = {orig} tris")
             continue
-        reset_scene()
-        if not enable_source_tools():
-            raise RuntimeError("Source Tools unavailable after scene reset.")
-        objs = import_smd(smd)
-        mesh_objs = [o for o in objs if o.type == "MESH" and o.name not in HELPER_MESH_NAMES]
-        if not mesh_objs:
-            log(f"  WARNING: no mesh imported from {smd.name}; skipping.")
-            results.append({"mesh": stem, "tris_before": orig, "tris_after": orig, "ratio": 1.0, "decimated": False, "warning": "no mesh"})
-            continue
-        after_total = 0
-        relimited = 0
-        for mo in mesh_objs:
-            after_total += decimate_object(mo, ratio)
-            relimited += limit_object_weights(mo, max_influences=3)
-        export_single_smd(smd, scratch)
-        new_tris = smd_triangle_count(smd)
-        results.append({"mesh": stem, "tris_before": orig, "tris_after": new_tris, "ratio": round(ratio, 4), "decimated": True, "reweighted_verts": relimited})
-        log(f"  decimated: {stem} {orig} -> {new_tris} tris (ratio {ratio:.3f}); re-limited {relimited} vert(s) to <=3 bones")
+        # Isolate each mesh: a failure on one bodygroup must NOT abort decimation of the others.
+        # The original SMD on disk is only overwritten by export_single_smd's final write, so on any
+        # exception the mesh keeps its full-resolution SMD and the rest of the loop continues.
+        try:
+            clear_scene_objects()  # clean scene before each import (removes the previous mesh)
+            objs = import_smd(smd)
+            mesh_objs = [o for o in objs if o.type == "MESH" and o.name not in HELPER_MESH_NAMES]
+            if not mesh_objs:
+                raise RuntimeError(f"no mesh imported from {smd.name}")
+            after_total = 0
+            relimited = 0
+            for mo in mesh_objs:
+                after_total += decimate_object(mo, ratio)
+                relimited += limit_object_weights(mo, max_influences=3)
+            export_single_smd(smd, scratch)
+            new_tris = smd_triangle_count(smd)
+            results.append({"mesh": stem, "tris_before": orig, "tris_after": new_tris, "ratio": round(ratio, 4), "decimated": True, "reweighted_verts": relimited})
+            log(f"  decimated: {stem} {orig} -> {new_tris} tris (ratio {ratio:.3f}); re-limited {relimited} vert(s) to <=3 bones")
+        except Exception as exc:
+            log(f"  WARNING: failed to decimate {stem} ({exc}); keeping it at FULL resolution ({orig} tris).")
+            results.append({"mesh": stem, "tris_before": orig, "tris_after": orig, "ratio": 1.0, "decimated": False, "error": str(exc)})
 
     if scratch.exists():
         try:
@@ -293,12 +330,25 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             pass
 
     total_after = sum(int(r["tris_after"]) for r in results) + fixed_tris
+    # COLLAPSE decimation hits its triangle target approximately (and re-triangulation can shift the
+    # count), and a mesh that failed to decimate stays full-resolution -- so the achieved total can
+    # still exceed the budget. Surface that rather than silently claiming success.
+    over_budget = total_after > args.total_tris
+    failed = [r["mesh"] for r in results if r.get("error")]
+    if fixed_tris >= args.total_tris:
+        log(f"  NOTE: VTA-locked meshes alone ({fixed_tris} tris) meet/exceed the total budget ({args.total_tris}); only per-mesh caps were applied to the body bodygroups.")
+    if over_budget:
+        log(f"  WARNING: post-decimation total {total_after} still exceeds the budget {args.total_tris}; consider a lower --total-tris.")
+    if failed:
+        log(f"  WARNING: {len(failed)} mesh(es) could not be decimated and shipped at full resolution: {failed}")
     report = {
         "export_dir": str(export_dir),
         "per_mesh_tris": args.per_mesh_tris,
         "total_tris_budget": args.total_tris,
         "total_tris_before": total_before,
         "total_tris_after": total_after,
+        "over_budget": over_budget,
+        "failed_meshes": failed,
         "fixed_vta_meshes": fixed_tris_by,
         "meshes": results,
         "ok": True,
