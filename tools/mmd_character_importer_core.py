@@ -57,6 +57,7 @@ BLENDER_SORT_BODYGROUPS_SCRIPT = TOOLS_DIR / "blender_sort_bodygroups.py"
 BLENDER_SORT_FLEXES_SCRIPT = TOOLS_DIR / "blender_sort_flexes.py"
 BLENDER_SORT_COLLISION_SCRIPT = TOOLS_DIR / "blender_sort_collision.py"
 BLENDER_PROPORTION_SCRIPT = TOOLS_DIR / "blender_export_proportion_trick.py"
+BLENDER_DECIMATE_L4D2_SCRIPT = TOOLS_DIR / "blender_decimate_l4d2.py"
 BLENDER_CARMS_SCRIPT = TOOLS_DIR / "blender_sort_carms.py"
 BLENDER_VRD_SCRIPT = TOOLS_DIR / "blender_sort_vrd.py"
 TEXTURE_PROCESSOR_SCRIPT = TOOLS_DIR / "sort_param_textures.py"
@@ -64,9 +65,39 @@ BLENDER_ICON_SCRIPT = TOOLS_DIR / "blender_render_icon.py"
 ICON_PROCESSOR_SCRIPT = TOOLS_DIR / "sort_icons_and_arts.py"
 QC_PROCESSOR_SCRIPT = TOOLS_DIR / "sort_qc_compile.py"
 RELEASE_PROCESSOR_SCRIPT = TOOLS_DIR / "sort_release_description.py"
+# Per-survivor proportion reference skeletons (one .smd per survivor). Each is the
+# survivor's bind pose expressed in the proportion-trick TEMPLATE convention (the same
+# convention as proportions.smd) with ONLY the essential ValveBiped bones — generated
+# offline by tools/build_l4d2_reference_skeletons.py from the base-game survivor .mdls.
+# In L4D2 mode Step 9 swaps the selected survivor's .smd in as the proportion-trick
+# reference so the subtract delta aligns the MMD body to that survivor without the
+# convention mismatch that distorted the earlier raw-.mdl reference.
+L4D2_REFERENCE_SKELETON_DIR = TOOLS_DIR / "l4d2_reference_skeletons"
+# Survivor code (compiled .mdl stem) -> in-game character display name. The 4 L4D2
+# survivors plus the 4 returning L4D1 survivors.
+L4D2_SURVIVORS = {
+    "producer": "Rochelle",
+    "coach": "Coach",
+    "gambler": "Nick",
+    "mechanic": "Ellis",
+    "namvet": "Bill",
+    "teenangst": "Zoey",
+    "biker": "Francis",
+    "manager": "Louis",
+}
+DEFAULT_L4D2_SURVIVOR = "producer"
 DEFAULT_ICON_VMD = ROOT / "reference" / "ref_motion" / "bad_bad_water.vmd"
 WARNING_KEYWORDS_PATH = ROOT / "reference" / "keywords" / "Warning_Keyword.txt"
 BLENDER_LTS_INDEX_URL = "https://download.blender.org/release/Blender4.5/"
+# Pinned official Blender 4.5.10 zip used by the "without Blender" build's first-run download
+# prompt. sha256/size mirror build_assets_manifest.json (the same file the build script verifies the
+# bundled zip against), so a downloaded or browsed zip can be checksum-validated at runtime.
+# NOTE: use the direct download.blender.org mirror, NOT www.blender.org/download/... -- the latter
+# serves an HTML landing page (text/html), not the zip, so it would fail the checksum.
+BLENDER_DOWNLOAD_URL = "https://download.blender.org/release/Blender4.5/blender-4.5.10-windows-x64.zip"
+EXPECTED_BLENDER_ZIP_NAME = "blender-4.5.10-windows-x64.zip"
+EXPECTED_BLENDER_SHA256 = "ef6d846b8015f47ade6df3f9322ce17419080a5d922fa562b6c966064fe30dce"
+EXPECTED_BLENDER_SIZE_BYTES = 398911842
 APP_DIR_NAME = "MMDCharacterImporter"
 ProgressCallback = Callable[[str], None]
 CancelCheck = Callable[[], bool]
@@ -1189,12 +1220,127 @@ def valid_zip(path: Path) -> bool:
         return False
 
 
+def blender_is_bundled() -> bool:
+    """Lightweight check for whether THIS build ships the portable Blender zip (the "with Blender"
+    variant). Existence is enough for the first-run decision; blender_zip_path() still validates the
+    archive before extracting."""
+    try:
+        return BUNDLED_BLENDER_ZIP.exists() and BUNDLED_BLENDER_ZIP.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def provisioned_blender_zip_path() -> Path:
+    """Where a user-downloaded/-browsed Blender zip is stored so the normal setup flow extracts it
+    (the "without Blender" build provisions Blender here on first run)."""
+    return app_local_dir() / "downloads" / EXPECTED_BLENDER_ZIP_NAME
+
+
+def managed_blender_is_installed() -> bool:
+    """True when a managed portable Blender 4.5.x is already extracted + verified from a prior run."""
+    try:
+        return setup_state_is_current(read_setup_state()) is not None
+    except Exception:
+        return False
+
+
+def blender_needs_provisioning() -> bool:
+    """True only for the "without Blender" build before Blender has been supplied: not bundled, not
+    already installed, and no provisioned zip waiting to extract. The GUI uses this to decide whether
+    to show the first-run download/browse prompt. All checks are cheap (no full-archive CRC)."""
+    if blender_is_bundled():
+        return False
+    if managed_blender_is_installed():
+        return False
+    try:
+        provisioned = provisioned_blender_zip_path()
+        return not (provisioned.exists() and provisioned.stat().st_size > 0)
+    except OSError:
+        return True
+
+
+def hash_file_sha256(
+    path: Path, progress: ProgressCallback | None = None, cancel_check: CancelCheck | None = None
+) -> str:
+    digest = hashlib.sha256()
+    total = path.stat().st_size if path.exists() else 0
+    read = 0
+    last = 0.0
+    with path.open("rb") as handle:
+        while True:
+            if cancel_check and cancel_check():
+                raise RuntimeError("operation was cancelled")
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            read += len(chunk)
+            now = time.monotonic()
+            if now - last > 1.5:
+                if total:
+                    emit(progress, f"Verifying checksum: {read / 1024 / 1024:.0f} / {total / 1024 / 1024:.0f} MB")
+                last = now
+    return digest.hexdigest()
+
+
+def verify_blender_zip_checksum(
+    path: Path, progress: ProgressCallback | None = None, cancel_check: CancelCheck | None = None
+) -> tuple[bool, str]:
+    """Return (matches_expected_sha256, actual_sha256_lowercase) for a Blender zip."""
+    actual = hash_file_sha256(path, progress, cancel_check=cancel_check).lower()
+    return (actual == EXPECTED_BLENDER_SHA256.lower(), actual)
+
+
+def download_blender_zip(
+    target: Path | None = None, progress: ProgressCallback | None = None, cancel_check: CancelCheck | None = None
+) -> Path:
+    """Download the pinned official Blender 4.5.10 zip to the provisioned location."""
+    target = target or provisioned_blender_zip_path()
+    download_file(BLENDER_DOWNLOAD_URL, target, progress, cancel_check=cancel_check)
+    return target
+
+
+def install_provisioned_blender_zip(
+    source_zip: Path, progress: ProgressCallback | None = None, cancel_check: CancelCheck | None = None
+) -> Path:
+    """Place a user-supplied (browsed) Blender zip at the provisioned location so the normal setup
+    flow extracts it. Copies only when the source is not already the provisioned file."""
+    source_zip = source_zip.resolve()
+    target = provisioned_blender_zip_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if source_zip == target.resolve():
+        return target
+    emit(progress, f"Copying Blender zip into place ({source_zip.name})...")
+    tmp = target.with_name(target.name + ".part")
+    if tmp.exists():
+        tmp.unlink()
+    try:
+        shutil.copyfile(source_zip, tmp)
+        if cancel_check and cancel_check():
+            raise RuntimeError("operation was cancelled")
+        tmp.replace(target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+    return target
+
+
 def blender_zip_path(progress: ProgressCallback | None = None, cancel_check: CancelCheck | None = None) -> Path:
     if BUNDLED_BLENDER_ZIP.exists() and valid_zip(BUNDLED_BLENDER_ZIP):
         emit(progress, f"Using bundled Blender zip: {BUNDLED_BLENDER_ZIP}")
         return BUNDLED_BLENDER_ZIP
     if BUNDLED_BLENDER_ZIP.exists():
         emit(progress, f"WARNING: Bundled Blender zip is invalid and will be ignored: {BUNDLED_BLENDER_ZIP}")
+
+    # A zip the user downloaded/browsed via the first-run prompt (the "without Blender" build). It is
+    # preferred over the auto-download fallback so the user's chosen/verified zip is what gets used.
+    provisioned = provisioned_blender_zip_path()
+    if provisioned.exists() and valid_zip(provisioned):
+        emit(progress, f"Using provisioned Blender zip: {provisioned}")
+        return provisioned
+    if provisioned.exists():
+        emit(progress, f"WARNING: Provisioned Blender zip is invalid and will be ignored: {provisioned}")
 
     downloads = app_local_dir() / "downloads"
     try:
@@ -3264,11 +3410,24 @@ def fix_spine_blend(
     )
 
 
+# Per-game bone budget mirror of blender_sort_bones.GAME_BONE_LIMITS. Used to
+# resolve the limit for callers (e.g. the full auto-port) that do not pass one,
+# so L4D2 mode merges down to 126 while GMod stays at 254.
+SORT_BONES_GAME_LIMITS = {"gmod": 254, "l4d2": 126}
+
+
+def _resolve_sort_bones_limit(limit: int | None, game: str) -> int:
+    if limit is not None:
+        return int(limit)
+    return SORT_BONES_GAME_LIMITS.get(game, 254)
+
+
 def analyze_sort_bones_blend(
     input_blend: Path,
-    limit: int = 254,
+    limit: int | None = None,
     progress: ProgressCallback | None = None,
     cancel_check: CancelCheck | None = None,
+    game: str = "gmod",
 ) -> SortBonesAnalysisResult:
     input_blend = input_blend.resolve()
     if not input_blend.exists():
@@ -3299,8 +3458,11 @@ def analyze_sort_bones_blend(
         "--plan-json",
         str(plan_path),
         "--limit",
-        str(int(limit)),
+        str(_resolve_sort_bones_limit(limit, game)),
     ]
+    # Only L4D2 adds --game so the GMod command line stays byte-identical.
+    if game != "gmod":
+        command += ["--game", game]
     emit(progress, f"Starting Blender sort bones analysis: {input_blend}")
     started = time.monotonic()
     run_process_streamed(
@@ -3333,9 +3495,10 @@ def sort_bones_blend(
     input_blend: Path,
     plan: dict[str, object] | Path,
     output_blend: Path | None = None,
-    limit: int = 254,
+    limit: int | None = None,
     progress: ProgressCallback | None = None,
     cancel_check: CancelCheck | None = None,
+    game: str = "gmod",
 ) -> SortBonesResult:
     input_blend = input_blend.resolve()
     if not input_blend.exists():
@@ -3378,8 +3541,11 @@ def sort_bones_blend(
         "--report-json",
         str(report_path),
         "--limit",
-        str(int(limit)),
+        str(_resolve_sort_bones_limit(limit, game)),
     ]
+    # Only L4D2 adds --game so the GMod command line stays byte-identical.
+    if game != "gmod":
+        command += ["--game", game]
     emit(progress, f"Starting Blender sort bones step: {input_blend}")
     started = time.monotonic()
     run_process_streamed(
@@ -3809,6 +3975,7 @@ def analyze_flexes_blend(
     input_blend: Path,
     progress: ProgressCallback | None = None,
     cancel_check: CancelCheck | None = None,
+    game: str = "gmod",
 ) -> FlexAnalysisResult:
     input_blend = input_blend.resolve()
     if not input_blend.exists():
@@ -3838,6 +4005,9 @@ def analyze_flexes_blend(
         "--plan-json",
         str(plan_path),
     ]
+    # Only L4D2 adds --game so the GMod flex-analyze command stays byte-identical.
+    if game != "gmod":
+        command += ["--game", game]
     emit(progress, f"Starting Blender flex analysis: {input_blend}")
     started = time.monotonic()
     run_process_streamed(command, progress=progress, log_path=log_path, cancel_check=cancel_check)
@@ -4365,11 +4535,76 @@ def validate_manual_bodygroups_blend(
     )
 
 
+def l4d2_reference_skeleton_path(survivor: str) -> Path:
+    survivor = survivor if survivor in L4D2_SURVIVORS else DEFAULT_L4D2_SURVIVOR
+    return L4D2_REFERENCE_SKELETON_DIR / f"{survivor}.smd"
+
+
+# L4D2 polygon budget (triangles). Derived from working vs broken survivor ports: a single
+# bodygroup mesh above ~30k tris renders as an exploding spray in game, and the whole model is
+# unstable above the base-game envelope. Working community ports keep every mesh well under
+# ~27.7k tris and the whole model under ~76k tris; the broken model had a 32.7k-tri mesh and
+# ~100k tris total. These caps (with margin) bring an over-budget L4D2 model back inside the
+# proven-safe envelope. GMod is never decimated (the budget only runs for L4D2).
+L4D2_PER_MESH_TRIS_BUDGET = 25000
+L4D2_TOTAL_TRIS_BUDGET = 70000
+
+
+def run_l4d2_polygon_budget(
+    final_dir: Path,
+    blender_exe: Path,
+    per_mesh_tris: int = L4D2_PER_MESH_TRIS_BUDGET,
+    total_tris: int = L4D2_TOTAL_TRIS_BUDGET,
+    progress: ProgressCallback | None = None,
+    cancel_check: CancelCheck | None = None,
+) -> dict:
+    """L4D2 only: decimate the Step 9 export's bodygroup SMDs to the triangle budget.
+
+    Runs AFTER the proportion export is finished, on the exported SMD files. Meshes that have a
+    paired ``.vta`` (vertex animation / flexes) and the Physics collision SMD are left untouched
+    (the script handles that); decimation re-imposes the <=3-bones-per-vertex limit afterwards.
+    """
+    if not BLENDER_DECIMATE_L4D2_SCRIPT.exists():
+        raise FileNotFoundError(BLENDER_DECIMATE_L4D2_SCRIPT)
+    report_path = final_dir.parent / "l4d2_decimation_report.json"
+    log_path = final_dir.parent / "blender_decimate_l4d2.log"
+    command = [
+        str(blender_exe),
+        "--background",
+        "--factory-startup",
+        "--python-exit-code",
+        "1",
+        "--python",
+        str(BLENDER_DECIMATE_L4D2_SCRIPT),
+        "--",
+        "--export-dir",
+        str(final_dir),
+        "--per-mesh-tris",
+        str(int(per_mesh_tris)),
+        "--total-tris",
+        str(int(total_tris)),
+        "--report-json",
+        str(report_path),
+    ]
+    emit(progress, f"L4D2 polygon budget: decimating bodygroups to <= {per_mesh_tris} tris/mesh, {total_tris} tris total.")
+    run_process_streamed(command, progress=progress, log_path=log_path, cancel_check=cancel_check)
+    if report_path.exists():
+        try:
+            rep = json.loads(report_path.read_text(encoding="utf-8"))
+            emit(progress, f"L4D2 polygon budget: total tris {rep.get('total_tris_before')} -> {rep.get('total_tris_after')} (budget {total_tris}).")
+            return rep
+        except Exception:
+            return {}
+    return {}
+
+
 def run_proportion_export(
     input_blend: Path,
     remove_zero_weight_bones: bool = True,
     progress: ProgressCallback | None = None,
     cancel_check: CancelCheck | None = None,
+    game: str = "gmod",
+    survivor: str = DEFAULT_L4D2_SURVIVOR,
 ) -> ProportionResult:
     input_blend = input_blend.resolve()
     if not input_blend.exists():
@@ -4422,6 +4657,21 @@ def run_proportion_export(
     ]
     if remove_zero_weight_bones:
         command.append("--remove-zero-weight-bones")
+    if str(game or "").strip().lower() == "l4d2":
+        # L4D2: process the model against the selected survivor's skeleton instead of the
+        # built-in GMod ValveBiped armature, so the compiled model lives in the survivor's
+        # bone convention (matching the included survivor animations). Step 9 swaps the
+        # bundled survivor skeleton in for the template proportions/reference armatures.
+        reference_smd = l4d2_reference_skeleton_path(survivor)
+        if reference_smd.exists():
+            command.extend(["--game", "l4d2", "--survivor-reference-smd", str(reference_smd)])
+            emit(progress, f"L4D2 proportion base = survivor '{survivor}' skeleton ({reference_smd.name}).")
+        else:
+            emit(
+                progress,
+                f"NOTE: no bundled L4D2 skeleton for survivor '{survivor}'; falling back to the "
+                "built-in GMod proportion armature (convention-correct, not survivor-specific).",
+            )
     emit(progress, f"Starting Blender proportion export: {input_blend}")
     started = time.monotonic()
     run_process_streamed(command, progress=progress, log_path=log_path, cancel_check=cancel_check)
@@ -4435,7 +4685,22 @@ def run_proportion_export(
         raise RuntimeError(f"Blender completed but did not write {files_path}")
     report = json.loads(report_path.read_text(encoding="utf-8"))
     files = json.loads(files_path.read_text(encoding="utf-8"))
+    # For L4D2 the survivor skeleton is swapped in as the proportion base armature INSIDE the
+    # Blender step (see --survivor-reference-smd above), so proportions.smd AND the reference
+    # SMDs are already exported in the survivor's bone convention. No post-export reference
+    # overwrite is needed (and doing one would reintroduce a convention mismatch).
     emit(progress, f"Blender proportion export finished in {time.monotonic() - started:.1f}s")
+    # L4D2 only: now that the export is finished, decimate over-budget bodygroup SMDs to L4D2's
+    # safe polygon envelope (a single mesh above ~30k tris / the model above ~76k tris explodes in
+    # game). VTA-flexed meshes and the Physics SMD are left untouched. GMod is never decimated.
+    if str(game or "").strip().lower() == "l4d2":
+        try:
+            decimation = run_l4d2_polygon_budget(
+                final_dir, setup.blender_exe, progress=progress, cancel_check=cancel_check
+            )
+            report["l4d2_polygon_budget"] = decimation
+        except Exception as exc:
+            emit(progress, f"WARNING: L4D2 polygon-budget decimation did not complete ({exc}); some bodygroups may ship at full resolution and could be unstable in game.")
     return ProportionResult(
         input_blend=input_blend,
         proportion_dir=proportion_dir,
@@ -4751,6 +5016,7 @@ def analyze_textures(
     progress: ProgressCallback | None = None,
     cancel_check: CancelCheck | None = None,
     scheme: str = "legacy",
+    game: str = "gmod",
 ) -> TextureAnalysisResult:
     input_path = input_path.resolve()
     texture_dir, analysis_path, plan_path, report_path, manifest_path, log_path = texture_paths_for_material_input(input_path)
@@ -4773,6 +5039,9 @@ def analyze_textures(
     # it entirely so the subprocess command stays byte-identical to before.
     if str(scheme or "legacy").strip().lower() != "legacy":
         command += ["--scheme", str(scheme).strip().lower()]
+    # Only L4D2 passes --game (clamps textures to 2048px); GMod stays byte-identical.
+    if str(game or "gmod").strip().lower() == "l4d2":
+        command += ["--game", "l4d2"]
     emit(progress, f"Starting Step 12 texture analysis: {input_path}")
     started = time.monotonic()
     run_process_streamed(command, progress=progress, log_path=log_path, cancel_check=cancel_check)
@@ -4802,6 +5071,7 @@ def process_textures(
     plan: dict[str, object] | Path,
     progress: ProgressCallback | None = None,
     cancel_check: CancelCheck | None = None,
+    game: str = "gmod",
 ) -> TextureProcessResult:
     input_path = input_path.resolve()
     texture_dir, analysis_path, default_plan_path, report_path, manifest_path, log_path = texture_paths_for_material_input(input_path)
@@ -4829,6 +5099,9 @@ def process_textures(
         "--manifest-json",
         str(manifest_path),
     ]
+    # Only L4D2 passes --game (clamps textures to 2048px); GMod stays byte-identical.
+    if str(game or "gmod").strip().lower() == "l4d2":
+        command += ["--game", "l4d2"]
     emit(progress, f"Starting Step 12 texture processing: {input_path}")
     started = time.monotonic()
     run_process_streamed(command, progress=progress, log_path=log_path, cancel_check=cancel_check)
@@ -5061,6 +5334,8 @@ def analyze_qc(
     progress: ProgressCallback | None = None,
     cancel_check: CancelCheck | None = None,
     gender: str = "female",
+    game: str = "gmod",
+    survivor: str = DEFAULT_L4D2_SURVIVOR,
 ) -> QcAnalysisResult:
     input_path = input_path.resolve()
     final_dir, qc_dir, analysis_path, plan_path, report_path, files_path, log_path = qc_paths_for_step9_input(input_path)
@@ -5091,6 +5366,9 @@ def analyze_qc(
         command.extend(["--studiomdl", studiomdl_path])
     if str(gender or "").strip().lower() == "male":
         command.extend(["--gender", "male"])
+    # Only L4D2 adds --game/--survivor so the GMod analyze command stays byte-identical.
+    if str(game or "").strip().lower() == "l4d2":
+        command.extend(["--game", "l4d2", "--survivor", str(survivor or DEFAULT_L4D2_SURVIVOR)])
     emit(progress, f"Starting Step 14 QC analysis: {final_dir}")
     started = time.monotonic()
     run_process_streamed(command, progress=progress, log_path=log_path, cancel_check=cancel_check)
@@ -5356,15 +5634,17 @@ def main(argv: list[str] | None = None) -> int:
     spine_fix_parser.add_argument("--plan-json", type=Path, required=True)
     spine_fix_parser.add_argument("--output-blend", type=Path)
 
-    sort_analyze_parser = subparsers.add_parser("sort-bones-analyze", help="analyze and propose bone merges for Source's 254 bone limit")
+    sort_analyze_parser = subparsers.add_parser("sort-bones-analyze", help="analyze and propose bone merges for the Source bone limit")
     sort_analyze_parser.add_argument("spine_fixed_blend", type=Path)
-    sort_analyze_parser.add_argument("--limit", type=int, default=254)
+    sort_analyze_parser.add_argument("--limit", type=int, default=None)
+    sort_analyze_parser.add_argument("--game", choices=("gmod", "l4d2"), default="gmod")
 
     sort_parser = subparsers.add_parser("sort-bones", help="apply a proposed bone merge plan")
     sort_parser.add_argument("spine_fixed_blend", type=Path)
     sort_parser.add_argument("--plan-json", type=Path, required=True)
     sort_parser.add_argument("--output-blend", type=Path)
-    sort_parser.add_argument("--limit", type=int, default=254)
+    sort_parser.add_argument("--limit", type=int, default=None)
+    sort_parser.add_argument("--game", choices=("gmod", "l4d2"), default="gmod")
 
     material_scan_parser = subparsers.add_parser("materials-scan", help="scan materials and propose cleanup/combine plan")
     material_scan_parser.add_argument("bones_sorted_blend", type=Path)
@@ -5405,6 +5685,7 @@ def main(argv: list[str] | None = None) -> int:
 
     flex_analyze_parser = subparsers.add_parser("flexes-analyze", help="analyze and propose facial/body flex sorting")
     flex_analyze_parser.add_argument("bodygroups_sorted_blend", type=Path)
+    flex_analyze_parser.add_argument("--game", choices=("gmod", "l4d2"), default="gmod")
 
     flex_apply_parser = subparsers.add_parser("flexes-apply", help="apply a flex sorting plan")
     flex_apply_parser.add_argument("bodygroups_sorted_blend", type=Path)
@@ -5433,6 +5714,8 @@ def main(argv: list[str] | None = None) -> int:
     proportion_parser.add_argument("collision_sorted_blend", type=Path)
     proportion_parser.add_argument("--remove-zero-weight-bones", dest="remove_zero_weight_bones", action="store_true", default=True)
     proportion_parser.add_argument("--keep-zero-weight-bones", dest="remove_zero_weight_bones", action="store_false")
+    proportion_parser.add_argument("--game", choices=("gmod", "l4d2"), default="gmod")
+    proportion_parser.add_argument("--survivor", choices=tuple(L4D2_SURVIVORS), default=DEFAULT_L4D2_SURVIVOR)
 
     carms_parser = subparsers.add_parser("carms-run", help="create c_arms SMD files from the proportion export")
     carms_parser.add_argument("proportion_export_dir", type=Path)
@@ -5573,7 +5856,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     if args.command == "sort-bones-analyze":
-        result = analyze_sort_bones_blend(args.spine_fixed_blend, args.limit, progress=print_progress)
+        result = analyze_sort_bones_blend(args.spine_fixed_blend, args.limit, progress=print_progress, game=args.game)
         print(
             json.dumps(
                 {
@@ -5589,7 +5872,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     if args.command == "sort-bones":
-        result = sort_bones_blend(args.spine_fixed_blend, args.plan_json, args.output_blend, args.limit, progress=print_progress)
+        result = sort_bones_blend(args.spine_fixed_blend, args.plan_json, args.output_blend, args.limit, progress=print_progress, game=args.game)
         print(
             json.dumps(
                 {
@@ -5720,7 +6003,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     if args.command == "flexes-analyze":
-        result = analyze_flexes_blend(args.bodygroups_sorted_blend, progress=print_progress)
+        result = analyze_flexes_blend(args.bodygroups_sorted_blend, progress=print_progress, game=args.game)
         print(
             json.dumps(
                 {
@@ -5839,7 +6122,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     if args.command == "proportion-run":
-        result = run_proportion_export(args.collision_sorted_blend, remove_zero_weight_bones=args.remove_zero_weight_bones, progress=print_progress)
+        result = run_proportion_export(args.collision_sorted_blend, remove_zero_weight_bones=args.remove_zero_weight_bones, progress=print_progress, game=args.game, survivor=args.survivor)
         print(
             json.dumps(
                 {

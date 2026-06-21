@@ -26,6 +26,18 @@ PROTECTED_EXTRA_BONES = {"ZArmTwist_L", "ZArmTwist_R", "ZHandTwist_L", "ZHandTwi
 # $definebone parent-repair (which can add a few bones) still fits under 256.
 SOURCE_MAX_BONES = 256
 SOURCE_BONE_LIMIT_TARGET = 248
+# L4D2's studiomdl aborts above 128 bones. The survivor swap adds the survivor's functional
+# weapon/attachment bones on top of the MMD cloth, so after the proportion trick the model can
+# exceed 128. Merge the lowest-impact MMD cloth leaf bones down to this budget (a couple under
+# the hard 128 limit, since ValveBiped + weapon/attachment bones are protected from merging).
+L4D2_MAX_BONES = 128
+L4D2_PROPORTION_BONE_TARGET = 126
+# Source hardware skinning binds at most 3 bones per vertex. GMod's studiomdl truncates
+# over-weighted vertices and renormalizes them cleanly, but L4D2's older studiomdl truncates to
+# 3 WITHOUT renormalizing, so the 4th+ weight is silently dropped, the vertex is left
+# under-weighted, and it collapses toward the origin -- the whole bodygroup then renders as
+# exploding triangles in game. MMD meshes routinely exceed this (PMX BDEF4 = up to 4 weights).
+L4D2_MAX_VERTEX_BONE_INFLUENCES = 3
 PHYSICS_MERGE_DISTANCE = 1.0
 NONESSENTIAL_EXPORT_ROLL_OFFSET_RADIANS = math.pi
 EXPECTED_PROPORTION_ANIMS = {
@@ -196,8 +208,9 @@ COINCIDENT_DETECT_THRESHOLD = 1.0e-6      # detection grid (exact duplicates sha
 # the larger nudge separated the duplicates but left a visible slit on the model
 # in game. At ~10% it is still ~150x a float32 ULP at this scale and within the
 # community 0.001-0.01 Source-unit range, so flexes stay split without a seam.
-COINCIDENT_OFFSET_FRACTION = 1.2e-5       # separation as a fraction of the model's largest extent
-COINCIDENT_MIN_OFFSET = 4.0e-5            # absolute floor in Source units
+# Reduced the threshold so the nudge does not appear in game.
+COINCIDENT_OFFSET_FRACTION = 2.4e-6       # separation as a fraction of the model's largest extent
+COINCIDENT_MIN_OFFSET = 8.0e-6            # absolute floor in Source units
 
 def model_extent_reference() -> float:
     """Largest world-space bounding-box dimension across the export meshes.
@@ -569,6 +582,124 @@ def enforce_source_bone_limit(armature: bpy.types.Object, target: int = SOURCE_B
     }
 
 
+def limit_vertex_bone_influences(
+    armature: bpy.types.Object,
+    meshes: list[bpy.types.Object],
+    max_influences: int = L4D2_MAX_VERTEX_BONE_INFLUENCES,
+) -> dict[str, object]:
+    """L4D2: enforce Source's max-3-bones-per-vertex skinning limit on every export mesh.
+
+    Mirrors the Blender Source Tools pre-export fix the community recommends for the
+    "Too many bone influences per vertex" / exploding-mesh failure:
+
+      1. Delete every vertex group that does not name a real bone in the export skeleton
+         (mmd_tools leaves junk groups such as ``mmd_vertex_*`` for UV/material morphs, and
+         a removed bone can leave an orphaned group). These deform nothing, but if left in
+         place they would occupy one of the 3 precious influence slots and could push a real
+         bone out when the weakest weights are stripped.
+      2. Keep only each vertex's ``max_influences`` strongest *bone* weights, dropping the rest.
+      3. Renormalize the surviving weights to sum 1.0.
+
+    Run on the raw-export meshes BEFORE the proportion trick. Every later step only folds
+    weights together (the bone-limit merge, via additive transfer) or rebinds the mesh without
+    repainting it -- neither raises the per-vertex influence count -- so the final compiled
+    survivor model stays within the limit. GMod is never called here, so its pipeline is
+    byte-identical.
+    """
+    bone_names = {bone.name for bone in armature.data.bones}
+    removed_group_total = 0
+    meshes_with_orphan_groups = 0
+    limited_vertex_total = 0
+    renormalized_vertex_total = 0
+    max_influences_seen = 0
+    object_reports: list[dict[str, object]] = []
+
+    ensure_object_mode()
+    for obj in meshes:
+        mesh = obj.data
+
+        # (1) Drop vertex groups that map to no bone in the export skeleton.
+        orphan_groups = [vertex_group.name for vertex_group in obj.vertex_groups if vertex_group.name not in bone_names]
+        for name in orphan_groups:
+            group = obj.vertex_groups.get(name)
+            if group is not None:
+                obj.vertex_groups.remove(group)
+        if orphan_groups:
+            meshes_with_orphan_groups += 1
+            removed_group_total += len(orphan_groups)
+
+        # (2)+(3) Per vertex: keep the strongest `max_influences` weights, then renormalize to 1.0.
+        # Group indices are stable after the orphan removal above, so this map stays valid while we
+        # add/remove individual vertex assignments below (those never reindex the groups themselves).
+        group_by_index = {vertex_group.index: vertex_group for vertex_group in obj.vertex_groups}
+        obj_limited = 0
+        obj_renormalized = 0
+        obj_max_before = 0
+        for vertex in mesh.vertices:
+            # Snapshot to plain (index, weight) tuples first: adding/removing assignments
+            # invalidates the live VertexGroupElement wrappers we are iterating.
+            entries = [
+                (assignment.group, float(assignment.weight))
+                for assignment in vertex.groups
+                if assignment.group in group_by_index and assignment.weight > 0.0
+            ]
+            if not entries:
+                continue
+            obj_max_before = max(obj_max_before, len(entries))
+
+            drop_indices: list[int] = []
+            keep = entries
+            if len(entries) > max_influences:
+                entries.sort(key=lambda item: item[1], reverse=True)
+                keep = entries[:max_influences]
+                drop_indices = [group_index for group_index, _ in entries[max_influences:]]
+                obj_limited += 1
+
+            total = sum(weight for _, weight in keep)
+            if total <= 0.0:
+                continue
+
+            for group_index in drop_indices:
+                group_by_index[group_index].remove([vertex.index])
+            if not math.isclose(total, 1.0, rel_tol=1.0e-6, abs_tol=1.0e-6):
+                for group_index, weight in keep:
+                    group_by_index[group_index].add([vertex.index], weight / total, "REPLACE")
+                obj_renormalized += 1
+
+        if obj_limited or obj_renormalized or orphan_groups:
+            mesh.update()
+        limited_vertex_total += obj_limited
+        renormalized_vertex_total += obj_renormalized
+        max_influences_seen = max(max_influences_seen, obj_max_before)
+        object_reports.append(
+            {
+                "object": obj.name,
+                "removed_orphan_groups": orphan_groups[:200],
+                "max_influences_before": obj_max_before,
+                "limited_vertices": obj_limited,
+                "renormalized_vertices": obj_renormalized,
+            }
+        )
+
+    log(
+        f"L4D2 vertex weight limit: removed {removed_group_total} orphan vertex group(s) across "
+        f"{meshes_with_orphan_groups} mesh(es); capped {limited_vertex_total} vertex/vertices to "
+        f"{max_influences} bone(s) (max influences seen {max_influences_seen}); renormalized "
+        f"{renormalized_vertex_total} vertex/vertices to total weight 1.0."
+    )
+    return {
+        "enabled": True,
+        "max_influences": max_influences,
+        "mesh_count": len(meshes),
+        "removed_orphan_group_count": removed_group_total,
+        "meshes_with_orphan_groups": meshes_with_orphan_groups,
+        "limited_vertex_count": limited_vertex_total,
+        "renormalized_vertex_count": renormalized_vertex_total,
+        "max_influences_before": max_influences_seen,
+        "objects": object_reports,
+    }
+
+
 def enforce_single_physics_group(obj: bpy.types.Object, group_name: str, threshold: float = 0.001) -> int:
     group = obj.vertex_groups.get(group_name)
     if group is None:
@@ -796,6 +927,115 @@ def import_raw_vtas(raw_dir: Path) -> list[dict[str, object]]:
         }
         for path in raw_vtas
     ]
+
+
+def _set_export_slot_name(obj, export_name: str) -> None:
+    """Make Source Tools export this armature to ``<export_name>.smd``.
+
+    On Blender 4.4+ Source Tools derives a CURRENT-selection export filename from the active
+    action SLOT's ``name_display`` (``actionSlotExportName``), not the action name. A freshly
+    imported SMD leaves a slot named after the source file, so rename the active slot.
+    """
+    ad = getattr(obj, "animation_data", None)
+    if ad is None or ad.action is None:
+        return
+    slot = getattr(ad, "action_slot", None)
+    if slot is None:
+        slots = getattr(ad.action, "slots", None)
+        if slots:
+            ad.action_slot = slots[0]
+            slot = ad.action_slot
+    if slot is not None:
+        try:
+            slot.name_display = export_name
+        except Exception as exc:
+            log(f"Could not rename action slot for '{obj.name}': {exc}")
+
+
+def install_survivor_base_armatures(reference_smd: Path) -> dict[str, object]:
+    """L4D2: replace the built-in GMod template armatures with the selected survivor's skeleton.
+
+    The proportion-trick template ships GMod ValveBiped armatures: ``proportions`` (the
+    retarget/bind target the MMD mesh is snapped onto and bound to) and
+    ``reference_female``/``reference_male`` (the subtract base). In the GMod pipeline the model
+    is processed against this built-in GMod armature, so the compiled model lives in GMod's
+    bone convention -- which matches the GMod player animations.
+
+    L4D2 survivor animations (``anim_<slot>.mdl``) are authored in the SURVIVOR skeleton's own
+    bone convention, so for L4D2 all three armatures are swapped for that survivor's essential
+    skeleton. ``proportions`` becomes the survivor skeleton (the trick snaps it onto the MMD
+    body and binds the mesh to it, so the bind lives in the survivor convention), and both
+    gender references become the survivor's bind pose. The proportion subtract
+    (``proportions - reference``) is then internally consistent in the survivor convention, and
+    the compiled model is built on the survivor skeleton so its animations play correctly.
+    """
+    if not reference_smd.exists():
+        raise FileNotFoundError(reference_smd)
+    if not enable_source_tools():
+        raise RuntimeError("Blender Source Tools is required to import the survivor skeleton.")
+    existing = {obj.name for obj in bpy.data.objects if obj.type == "ARMATURE"}
+    log(f"Importing L4D2 survivor base skeleton: {reference_smd}")
+    bpy.ops.import_scene.smd(filepath=str(reference_smd), append="NEW_ARMATURE", upAxis="Z")
+    new_armatures = [
+        obj for obj in bpy.data.objects if obj.type == "ARMATURE" and obj.name not in existing
+    ]
+    if not new_armatures:
+        raise RuntimeError(f"Survivor skeleton import created no armature: {reference_smd}")
+    survivor = max(new_armatures, key=lambda obj: len(obj.data.bones))
+    target_collection = survivor.users_collection[0] if survivor.users_collection else bpy.context.collection
+
+    removed: list[str] = []
+    for name in ("proportions", "reference_female", "reference_male"):
+        old = bpy.data.objects.get(name)
+        if old is not None and old is not survivor:
+            data = old.data
+            bpy.data.objects.remove(old, do_unlink=True)
+            removed.append(name)
+            if isinstance(data, bpy.types.Armature) and data.users == 0:
+                bpy.data.armatures.remove(data)
+        # Also drop the template's now-orphaned rest-pose action of that name, otherwise the
+        # survivor action renamed below collides with it and becomes "<name>.001" (which Source
+        # Tools would export to "<name>.001.smd", missing the required proportions/reference SMDs).
+        # The template marks these actions with a fake user, so clear it before removing.
+        stale_action = bpy.data.actions.get(name)
+        if stale_action is not None:
+            stale_action.use_fake_user = False
+            if stale_action.users == 0:
+                bpy.data.actions.remove(stale_action)
+
+    # Source Tools names a CURRENT-action export after the armature's ACTION (the template
+    # ships rest-pose actions literally named "proportions"/"reference_female"/"reference_male").
+    # The SMD import leaves a 1-frame rest action named after the file; rename it to the object
+    # name so the three armatures export to distinct files instead of clobbering one another.
+    survivor.name = "proportions"
+    survivor.data.name = "proportions"
+    if survivor.animation_data and survivor.animation_data.action:
+        survivor.animation_data.action.name = "proportions"
+    _set_export_slot_name(survivor, "proportions")
+    for name in ("reference_female", "reference_male"):
+        dup = survivor.copy()
+        dup.data = survivor.data.copy()
+        dup.name = name
+        dup.data.name = name
+        if dup.animation_data and dup.animation_data.action:
+            action_copy = dup.animation_data.action.copy()
+            action_copy.name = name
+            dup.animation_data.action = action_copy
+        _set_export_slot_name(dup, name)
+        target_collection.objects.link(dup)
+
+    unhide_all_export_objects()
+    bone_count = len(survivor.data.bones)
+    log(
+        f"Installed survivor base skeleton ({bone_count} bones) as "
+        "proportions/reference_female/reference_male (replaced the built-in GMod armatures)."
+    )
+    return {
+        "enabled": True,
+        "reference_smd": str(reference_smd),
+        "survivor_bone_count": bone_count,
+        "removed_template_armatures": removed,
+    }
 
 
 def run_proportion_text_block() -> None:
@@ -1153,6 +1393,15 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     armature_report = prepare_armature_for_raw_export(armature)
     physics_simplification_report = simplify_physics_for_source_compile()
 
+    # L4D2: enforce Source's max-3-bones-per-vertex skinning limit (and drop junk vertex groups)
+    # before the raw export, so the survivor model never ships over-weighted vertices that L4D2's
+    # studiomdl would under-weight and fling outward (the "exploding bodygroup"). GMod's studiomdl
+    # handles >3 weights itself, so GMod is left byte-identical (the limit only runs for L4D2).
+    if str(getattr(args, "game", "gmod") or "gmod").strip().lower() == "l4d2":
+        vertex_influence_limit_report = limit_vertex_bone_influences(armature, visible_export_meshes())
+    else:
+        vertex_influence_limit_report = {"enabled": False}
+
     log(f"Saving prepared pre-proportion blend: {pre_blend}")
     pre_blend.parent.mkdir(parents=True, exist_ok=True)
     bpy.ops.wm.save_as_mainfile(filepath=str(pre_blend))
@@ -1171,12 +1420,37 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     import_report = import_raw_smds(raw_dir)
     vta_import_report = import_raw_vtas(raw_dir)
 
+    # L4D2: process the model against the selected survivor's skeleton instead of the
+    # built-in GMod ValveBiped armature, so the compiled model matches the survivor's
+    # animation bone convention. GMod leaves the template armatures untouched.
+    if str(getattr(args, "game", "gmod") or "gmod").strip().lower() == "l4d2" and getattr(args, "survivor_reference_smd", ""):
+        survivor_base_report = install_survivor_base_armatures(Path(args.survivor_reference_smd).resolve())
+    else:
+        survivor_base_report = {"enabled": False}
+
     log(f"Saving imported proportion workspace: {processed_blend}")
     processed_blend.parent.mkdir(parents=True, exist_ok=True)
     bpy.ops.wm.save_as_mainfile(filepath=str(processed_blend))
 
     run_proportion_text_block()
     processed_verification = verify_processed_scene()
+
+    if str(getattr(args, "game", "gmod") or "gmod").strip().lower() == "l4d2":
+        # The survivor swap added the survivor's functional weapon/attachment bones; together
+        # with the merged MMD cloth that can push the model past L4D2's 128-bone studiomdl limit.
+        # Merge the lowest-impact non-essential cloth leaf bones in the proportions armature (the
+        # mesh's bind target) down to a safe L4D2 budget. ValveBiped.* core + weapon/attachment
+        # bones are protected, so only MMD cloth/hair tips are folded into their parents.
+        prop_arm = bpy.data.objects.get("proportions")
+        if prop_arm is not None and len(prop_arm.data.bones) > L4D2_PROPORTION_BONE_TARGET:
+            set_active_only(prop_arm)
+            l4d2_bone_limit_report = enforce_source_bone_limit(prop_arm, target=L4D2_PROPORTION_BONE_TARGET)
+            bpy.context.view_layer.update()
+        else:
+            count = len(prop_arm.data.bones) if prop_arm is not None else 0
+            l4d2_bone_limit_report = {"enabled": True, "needed": False, "bone_count": count}
+    else:
+        l4d2_bone_limit_report = {"enabled": False}
 
     final_files_before_vta = export_source_files(final_dir, processed=True)
     log(f"Saving proportion processed blend: {processed_blend}")
@@ -1205,12 +1479,15 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "face_basis_stacking": face_report,
         "zero_weight_bone_cleanup": zero_weight_bone_report,
         "source_bone_limit": bone_limit_report,
+        "vertex_bone_influence_limit": vertex_influence_limit_report,
         "armature_preparation": armature_report,
         "physics_simplification": physics_simplification_report,
         "raw_export": {
             "file_count": len(raw_files),
             "files": [str(path.relative_to(raw_dir)) for path in raw_files],
         },
+        "survivor_base_armatures": survivor_base_report,
+        "l4d2_proportion_bone_limit": l4d2_bone_limit_report,
         "proportion_import": import_report,
         "vta_import": vta_import_report,
         "processed_scene_verification": processed_verification,
@@ -1242,6 +1519,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--report-json", required=True)
     parser.add_argument("--files-json", required=True)
     parser.add_argument("--remove-zero-weight-bones", action="store_true")
+    parser.add_argument("--game", default="gmod")
+    parser.add_argument("--survivor-reference-smd", default="")
     return parser.parse_args(argv)
 
 

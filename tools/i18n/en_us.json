@@ -400,6 +400,7 @@
     "import_to_gmod": "3. Import Model into GMod",
     "intro": "One-click import runs the default workflow from PMX import through QC compile and addon packaging. Advanced tabs remain available for manual correction when a step needs attention.",
     "language": "Language",
+    "game": "Game",
     "mmd_folder": "MMD model folder",
     "mmd_folder_hint": "Folder containing the selected PMX and texture files",
     "model_preview": "Model Preview",

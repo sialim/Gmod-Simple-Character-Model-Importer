@@ -97,6 +97,31 @@ LANGUAGE_OPTIONS = [
     ("es_es", "Español"),
     ("ru_ru", "Русский"),
 ]
+GMOD_ICON_PATH = ROOT_DIR / "tools" / "assets" / "Garry's_Mod_logo.png"
+L4D2_ICON_PATH = ROOT_DIR / "tools" / "assets" / "L4D2_Icon.png"
+# (code, display, icon_path). Display names are proper nouns and are not translated.
+GAME_OPTIONS = [
+    ("gmod", "Garry's Mod", GMOD_ICON_PATH),
+    ("l4d2", "Left 4 Dead 2", L4D2_ICON_PATH),
+]
+GAME_CODES = {code for code, _display, _icon in GAME_OPTIONS}
+# Per-game Step 4 bone budget; mirrors blender_sort_bones.GAME_BONE_LIMITS.
+GAME_BONE_LIMITS = {"gmod": 254, "l4d2": 126}
+# L4D2 survivors the model can be ported onto. In L4D2 mode this dropdown
+# replaces the gender selector; the choice drives the Step 9 proportion target.
+# (code = compiled survivor .mdl stem; default Rochelle/producer.)
+L4D2_SURVIVOR_OPTIONS = [
+    ("producer", "Rochelle (Producer)"),
+    ("coach", "Coach"),
+    ("gambler", "Nick (Gambler)"),
+    ("mechanic", "Ellis (Mechanic)"),
+    ("namvet", "Bill (Nam Vet)"),
+    ("teenangst", "Zoey (Teen Angst)"),
+    ("biker", "Francis (Biker)"),
+    ("manager", "Louis (Manager)"),
+]
+L4D2_SURVIVOR_CODES = {code for code, _display in L4D2_SURVIVOR_OPTIONS}
+DEFAULT_L4D2_SURVIVOR = "producer"
 CATEGORY_SUGGESTIONS_FILE = ROOT_DIR / "tools" / "category_suggestions.json"
 LOCAL_CATEGORY_SUGGESTIONS_FILE = (
     Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "MMDCharacterImporter" / "category_suggestions.json"
@@ -698,6 +723,21 @@ def importer_icon_path() -> Path | None:
     return None
 
 
+def game_icon(icon_path: Path) -> "QtGui.QIcon":
+    """QIcon for a game option, or an empty icon if the asset is missing."""
+    return QtGui.QIcon(str(icon_path)) if icon_path.exists() else QtGui.QIcon()
+
+
+def normalize_game_code(value: object) -> str:
+    code = str(value or "").strip().lower()
+    return code if code in GAME_CODES else "gmod"
+
+
+def normalize_survivor_code(value: object) -> str:
+    code = str(value or "").strip().lower()
+    return code if code in L4D2_SURVIVOR_CODES else DEFAULT_L4D2_SURVIVOR
+
+
 SPINE_CHAIN_TARGETS = [
     "ValveBiped.Bip01_Pelvis",
     "ValveBiped.Bip01_Spine",
@@ -774,6 +814,194 @@ def enable_crash_logging() -> Path | None:
         return log_path
     except Exception:
         return None
+
+
+class BlenderProvisionWorker(QtCore.QThread):
+    """Downloads the pinned Blender zip, or copies a user-browsed zip into place, then verifies its
+    checksum. Used by the first-run BlenderSetupDialog (the "without Blender" build)."""
+
+    progress = QtCore.Signal(str)
+    done = QtCore.Signal(bool, str, str)  # checksum_ok, actual_sha256, zip_path
+    failed = QtCore.Signal(str)
+
+    def __init__(self, mode: str, source: str = "") -> None:
+        super().__init__()
+        self.mode = mode  # "download" | "browse"
+        self.source = source
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return self.cancel_requested
+
+    def run(self) -> None:
+        try:
+            if self.mode == "download":
+                target = core.download_blender_zip(progress=self.progress.emit, cancel_check=self._cancelled)
+            else:
+                target = core.install_provisioned_blender_zip(
+                    Path(self.source), progress=self.progress.emit, cancel_check=self._cancelled
+                )
+            self.progress.emit("Verifying checksum...")
+            ok, actual = core.verify_blender_zip_checksum(
+                target, progress=self.progress.emit, cancel_check=self._cancelled
+            )
+            self.done.emit(ok, actual, str(target))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class BlenderSetupDialog(QtWidgets.QDialog):
+    """First-run prompt shown when Blender is not bundled (the "without Blender" build): the user can
+    download the official Blender 4.5.10 zip or browse to a local copy. A checksum mismatch warns but
+    can be overridden."""
+
+    def __init__(self, owner: "ImporterWindow") -> None:
+        super().__init__(owner)
+        self._owner = owner
+        self.worker: BlenderProvisionWorker | None = None
+        self.setModal(True)
+        self.setWindowTitle(owner._t("blender_setup.title", "Blender setup required"))
+        self.resize(600, 240)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        intro = QtWidgets.QLabel(
+            owner._t(
+                "blender_setup.intro",
+                "This build does not include Blender, which is required to process models.\n\n"
+                "Download Blender 4.5.10 now (~380 MB) from blender.org, or browse to a "
+                "blender-4.5.10-windows-x64.zip you have already downloaded.",
+            )
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        self.status = QtWidgets.QLabel("")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+
+        self.bar = QtWidgets.QProgressBar()
+        self.bar.setRange(0, 0)
+        self.bar.setVisible(False)
+        layout.addWidget(self.bar)
+        layout.addStretch(1)
+
+        buttons = QtWidgets.QHBoxLayout()
+        self.download_btn = QtWidgets.QPushButton(owner._t("blender_setup.download", "Download Blender"))
+        self.browse_btn = QtWidgets.QPushButton(owner._t("blender_setup.browse", "Browse to zip..."))
+        self.cancel_btn = QtWidgets.QPushButton(owner._t("blender_setup.cancel", "Cancel"))
+        buttons.addWidget(self.download_btn)
+        buttons.addWidget(self.browse_btn)
+        buttons.addStretch(1)
+        buttons.addWidget(self.cancel_btn)
+        layout.addLayout(buttons)
+
+        self.download_btn.clicked.connect(self._on_download)
+        self.browse_btn.clicked.connect(self._on_browse)
+        self.cancel_btn.clicked.connect(self._on_cancel)
+
+    def _t(self, key: str, default: str) -> str:
+        return self._owner._t(key, default)
+
+    def _set_busy(self, busy: bool) -> None:
+        self.download_btn.setEnabled(not busy)
+        self.browse_btn.setEnabled(not busy)
+        self.bar.setVisible(busy)
+        self.cancel_btn.setText(self._t("blender_setup.stop", "Stop") if busy else self._t("blender_setup.cancel", "Cancel"))
+
+    def _on_download(self) -> None:
+        self._start("download", "")
+
+    def _on_browse(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            self._t("blender_setup.pick", "Select Blender zip"),
+            str(Path.home()),
+            "Blender zip (blender-4.5*.zip *.zip)",
+        )
+        if path:
+            self._start("browse", path)
+
+    def _start(self, mode: str, source: str) -> None:
+        self._set_busy(True)
+        self.status.setText(self._t("blender_setup.working", "Working..."))
+        self.worker = BlenderProvisionWorker(mode, source)
+        self.worker.progress.connect(self.status.setText)
+        self.worker.done.connect(self._on_done)
+        self.worker.failed.connect(self._on_failed)
+        self.worker.start()
+
+    def _on_failed(self, message: str) -> None:
+        self._set_busy(False)
+        if "cancel" in message.lower():
+            self.status.setText(self._t("blender_setup.cancelled", "Cancelled."))
+            return
+        self.status.setText("")
+        QtWidgets.QMessageBox.critical(
+            self,
+            self._t("blender_setup.title", "Blender setup"),
+            self._t("blender_setup.error", "Blender setup failed:") + f"\n\n{message}",
+        )
+
+    def _on_done(self, ok: bool, actual: str, zip_path: str) -> None:
+        self._set_busy(False)
+        if ok:
+            self.status.setText(self._t("blender_setup.verified", "Checksum verified."))
+            QtWidgets.QMessageBox.information(
+                self,
+                self._t("blender_setup.title", "Blender setup"),
+                self._t(
+                    "blender_setup.ready",
+                    "Blender is ready. It will finish setting up the first time you run a step.",
+                ),
+            )
+            self.accept()
+            return
+        # Checksum mismatch: warn, but let the user insist on using it.
+        warn = (
+            self._t(
+                "blender_setup.mismatch",
+                "WARNING: this Blender zip does not match the expected official 4.5.10 checksum. "
+                "It may be corrupted or a different version.",
+            )
+            + f"\n\nExpected SHA-256:\n{core.EXPECTED_BLENDER_SHA256}\n\nActual SHA-256:\n{actual}\n\n"
+            + self._t("blender_setup.use_anyway_q", "Use it anyway?")
+        )
+        choice = QtWidgets.QMessageBox.warning(
+            self,
+            self._t("blender_setup.mismatch_title", "Checksum mismatch"),
+            warn,
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if choice == QtWidgets.QMessageBox.StandardButton.Yes:
+            self.accept()
+            return
+        # Declined: discard the provisioned zip so it is not used, let the user retry.
+        try:
+            candidate = Path(zip_path)
+            if candidate.exists() and candidate == core.provisioned_blender_zip_path():
+                candidate.unlink()
+        except Exception:
+            pass
+        self.status.setText(self._t("blender_setup.discarded", "Discarded. Choose Download or Browse to try again."))
+
+    def _on_cancel(self) -> None:
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.cancel()
+            self.status.setText(self._t("blender_setup.stopping", "Stopping..."))
+            return
+        self.reject()
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.cancel()
+            self.status.setText(self._t("blender_setup.stopping", "Stopping..."))
+            event.ignore()
+            return
+        event.accept()
 
 
 class CategoryScanWorker(QtCore.QThread):
@@ -1111,10 +1339,11 @@ class SortBonesAnalyzeWorker(QtCore.QThread):
     done = QtCore.Signal(dict)
     failed = QtCore.Signal(str)
 
-    def __init__(self, input_blend: str, limit: int) -> None:
+    def __init__(self, input_blend: str, limit: int, game: str = "gmod") -> None:
         super().__init__()
         self.input_blend = input_blend
         self.limit = limit
+        self.game = game
         self.cancel_requested = False
 
     def cancel(self) -> None:
@@ -1133,6 +1362,7 @@ class SortBonesAnalyzeWorker(QtCore.QThread):
                 self.limit,
                 progress=self._log,
                 cancel_check=self._cancelled,
+                game=self.game,
             )
             self.done.emit(
                 {
@@ -1157,11 +1387,12 @@ class SortBonesManualMergeWorker(QtCore.QThread):
     done = QtCore.Signal(dict)
     failed = QtCore.Signal(str)
 
-    def __init__(self, manual_blend: str, limit: int, source_blend: str = "") -> None:
+    def __init__(self, manual_blend: str, limit: int, source_blend: str = "", game: str = "gmod") -> None:
         super().__init__()
         self.manual_blend = manual_blend
         self.source_blend = source_blend
         self.limit = limit
+        self.game = game
         self.cancel_requested = False
         self.process: subprocess.Popen | None = None
 
@@ -1209,6 +1440,7 @@ class SortBonesManualMergeWorker(QtCore.QThread):
                 self.limit,
                 progress=self._log,
                 cancel_check=self._cancelled,
+                game=self.game,
             )
             self.done.emit(
                 {
@@ -1235,11 +1467,12 @@ class SortBonesWorker(QtCore.QThread):
     done = QtCore.Signal(dict)
     failed = QtCore.Signal(str)
 
-    def __init__(self, input_blend: str, plan: dict[str, object], limit: int) -> None:
+    def __init__(self, input_blend: str, plan: dict[str, object], limit: int, game: str = "gmod") -> None:
         super().__init__()
         self.input_blend = input_blend
         self.plan = plan
         self.limit = limit
+        self.game = game
         self.cancel_requested = False
 
     def cancel(self) -> None:
@@ -1259,6 +1492,7 @@ class SortBonesWorker(QtCore.QThread):
                 limit=self.limit,
                 progress=self._log,
                 cancel_check=self._cancelled,
+                game=self.game,
             )
             self.done.emit(
                 {
@@ -1684,9 +1918,10 @@ class FlexAnalyzeWorker(QtCore.QThread):
     done = QtCore.Signal(dict)
     failed = QtCore.Signal(str)
 
-    def __init__(self, input_blend: str) -> None:
+    def __init__(self, input_blend: str, game: str = "gmod") -> None:
         super().__init__()
         self.input_blend = input_blend
+        self.game = game
         self.cancel_requested = False
 
     def cancel(self) -> None:
@@ -1704,6 +1939,7 @@ class FlexAnalyzeWorker(QtCore.QThread):
                 Path(self.input_blend),
                 progress=self._log,
                 cancel_check=self._cancelled,
+                game=self.game,
             )
             self.done.emit(
                 {
@@ -1969,10 +2205,12 @@ class ProportionRunWorker(QtCore.QThread):
     done = QtCore.Signal(dict)
     failed = QtCore.Signal(str)
 
-    def __init__(self, input_blend: str, remove_zero_weight_bones: bool = True) -> None:
+    def __init__(self, input_blend: str, remove_zero_weight_bones: bool = True, game: str = "gmod", survivor: str = "producer") -> None:
         super().__init__()
         self.input_blend = input_blend
         self.remove_zero_weight_bones = bool(remove_zero_weight_bones)
+        self.game = game
+        self.survivor = survivor
         self.cancel_requested = False
 
     def cancel(self) -> None:
@@ -1991,6 +2229,8 @@ class ProportionRunWorker(QtCore.QThread):
                 remove_zero_weight_bones=self.remove_zero_weight_bones,
                 progress=self._log,
                 cancel_check=self._cancelled,
+                game=self.game,
+                survivor=self.survivor,
             )
             self.done.emit(
                 {
@@ -2216,10 +2456,11 @@ class TextureAnalyzeWorker(QtCore.QThread):
     done = QtCore.Signal(dict)
     failed = QtCore.Signal(str)
 
-    def __init__(self, input_path: str, scheme: str = "legacy") -> None:
+    def __init__(self, input_path: str, scheme: str = "legacy", game: str = "gmod") -> None:
         super().__init__()
         self.input_path = input_path
         self.scheme = scheme or "legacy"
+        self.game = game or "gmod"
         self.cancel_requested = False
 
     def cancel(self) -> None:
@@ -2233,7 +2474,7 @@ class TextureAnalyzeWorker(QtCore.QThread):
 
     def run(self) -> None:
         try:
-            result = core.analyze_textures(Path(self.input_path), progress=self._log, cancel_check=self._cancelled, scheme=self.scheme)
+            result = core.analyze_textures(Path(self.input_path), progress=self._log, cancel_check=self._cancelled, scheme=self.scheme, game=self.game)
             self.done.emit(
                 {
                     "input": str(result.input_path),
@@ -2256,10 +2497,11 @@ class TextureProcessWorker(QtCore.QThread):
     done = QtCore.Signal(dict)
     failed = QtCore.Signal(str)
 
-    def __init__(self, input_path: str, plan: dict[str, object]) -> None:
+    def __init__(self, input_path: str, plan: dict[str, object], game: str = "gmod") -> None:
         super().__init__()
         self.input_path = input_path
         self.plan = plan
+        self.game = game or "gmod"
         self.cancel_requested = False
 
     def cancel(self) -> None:
@@ -2273,7 +2515,7 @@ class TextureProcessWorker(QtCore.QThread):
 
     def run(self) -> None:
         try:
-            result = core.process_textures(Path(self.input_path), self.plan, progress=self._log, cancel_check=self._cancelled)
+            result = core.process_textures(Path(self.input_path), self.plan, progress=self._log, cancel_check=self._cancelled, game=self.game)
             self.done.emit(
                 {
                     "input": str(result.input_path),
@@ -2402,7 +2644,7 @@ class QcAnalyzeWorker(QtCore.QThread):
     done = QtCore.Signal(dict)
     failed = QtCore.Signal(str)
 
-    def __init__(self, input_path: str, author: str, category: str, model_name: str, gmod_root: str, studiomdl: str, gender: str = "female") -> None:
+    def __init__(self, input_path: str, author: str, category: str, model_name: str, gmod_root: str, studiomdl: str, gender: str = "female", game: str = "gmod", survivor: str = "producer") -> None:
         super().__init__()
         self.input_path = input_path
         self.author = author
@@ -2411,6 +2653,8 @@ class QcAnalyzeWorker(QtCore.QThread):
         self.gmod_root = gmod_root
         self.studiomdl = studiomdl
         self.gender = gender
+        self.game = game
+        self.survivor = survivor
         self.cancel_requested = False
 
     def cancel(self) -> None:
@@ -2434,6 +2678,8 @@ class QcAnalyzeWorker(QtCore.QThread):
                 progress=self._log,
                 cancel_check=self._cancelled,
                 gender=self.gender,
+                game=self.game,
+                survivor=self.survivor,
             )
             self.done.emit(
                 {
@@ -2561,6 +2807,8 @@ class FullImportWorker(QtCore.QThread):
         collision_quality: str = "balanced",
         gender: str = "female",
         bodygroup_scale_factor: float = float(getattr(core, "DEFAULT_BODYGROUP_SCALE_FACTOR", 40.457)),
+        game: str = "gmod",
+        survivor: str = "producer",
     ) -> None:
         super().__init__()
         self.pmx_path = Path(pmx_path)
@@ -2576,6 +2824,8 @@ class FullImportWorker(QtCore.QThread):
         self.workspace_root = workspace_root
         self.collision_quality = str(collision_quality or "balanced")
         self.gender = "male" if str(gender or "").strip().lower() == "male" else "female"
+        self.game = normalize_game_code(game)
+        self.survivor = normalize_survivor_code(survivor)
         self.bodygroup_scale_factor = float(bodygroup_scale_factor or getattr(core, "DEFAULT_BODYGROUP_SCALE_FACTOR", 40.457))
         self.cancel_requested = False
         self.step_results: dict[int, dict[str, object]] = {}
@@ -2718,8 +2968,8 @@ class FullImportWorker(QtCore.QThread):
             self.step_results[3] = {"blend": str(spine_result.output_blend), "report": str(spine_result.report_path), "dir": str(spine_result.spine_dir)}
 
             self._stage(4, "Sort Bones", str(spine_result.output_blend))
-            sort_analysis = core.analyze_sort_bones_blend(spine_result.output_blend, progress=self._log, cancel_check=self._cancelled)
-            sort_result = core.sort_bones_blend(spine_result.output_blend, sort_analysis.plan, progress=self._log, cancel_check=self._cancelled)
+            sort_analysis = core.analyze_sort_bones_blend(spine_result.output_blend, progress=self._log, cancel_check=self._cancelled, game=self.game)
+            sort_result = core.sort_bones_blend(spine_result.output_blend, sort_analysis.plan, progress=self._log, cancel_check=self._cancelled, game=self.game)
             self._require_clean_report(4, sort_result.report, "bone merge")
             self._write_marker(4, sort_result.sort_dir, outputs={"blend": str(sort_result.output_blend)}, report_path=sort_result.report_path)
             self.step_results[4] = {"blend": str(sort_result.output_blend), "report": str(sort_result.report_path), "dir": str(sort_result.sort_dir)}
@@ -2777,7 +3027,7 @@ class FullImportWorker(QtCore.QThread):
             self.step_results[6] = {"blend": str(body_result.output_blend), "report": str(body_result.report_path), "dir": str(body_result.bodygroup_dir)}
 
             self._stage(7, "Sort Flexes", str(body_result.output_blend))
-            flex_analysis = core.analyze_flexes_blend(body_result.output_blend, progress=self._log, cancel_check=self._cancelled)
+            flex_analysis = core.analyze_flexes_blend(body_result.output_blend, progress=self._log, cancel_check=self._cancelled, game=self.game)
             flex_result = core.sort_flexes_blend(body_result.output_blend, flex_analysis.plan, progress=self._log, cancel_check=self._cancelled)
             self._require_clean_report(7, flex_result.report, "flex sort")
             self._write_marker(7, flex_result.flex_dir, outputs={"blend": str(flex_result.output_blend), "flexes_json": str(flex_result.flexes_json_path)}, report_path=flex_result.report_path)
@@ -2802,7 +3052,7 @@ class FullImportWorker(QtCore.QThread):
             self.step_results[8] = {"blend": str(collision_result.output_blend), "report": str(collision_result.report_path), "dir": str(collision_result.collision_dir)}
 
             self._stage(9, "Export Proportion Trick", str(collision_result.output_blend))
-            proportion_result = core.run_proportion_export(collision_result.output_blend, remove_zero_weight_bones=True, progress=self._log, cancel_check=self._cancelled)
+            proportion_result = core.run_proportion_export(collision_result.output_blend, remove_zero_weight_bones=True, progress=self._log, cancel_check=self._cancelled, game=self.game, survivor=self.survivor)
             self._require_clean_report(9, proportion_result.report, "proportion export")
             self._write_marker(9, proportion_result.proportion_dir, outputs={"final_dir": str(proportion_result.final_dir), "files": str(proportion_result.files_path)}, report_path=proportion_result.report_path)
             self.step_results[9] = {"final_dir": str(proportion_result.final_dir), "report": str(proportion_result.report_path), "dir": str(proportion_result.proportion_dir)}
@@ -2825,8 +3075,8 @@ class FullImportWorker(QtCore.QThread):
             self._optional(11, "Sort VRD", run_vrd)
 
             def run_textures() -> None:
-                textures_analysis = core.analyze_textures(material_apply.materials_json_path, progress=self._log, cancel_check=self._cancelled)
-                textures = core.process_textures(material_apply.materials_json_path, textures_analysis.plan, progress=self._log, cancel_check=self._cancelled)
+                textures_analysis = core.analyze_textures(material_apply.materials_json_path, progress=self._log, cancel_check=self._cancelled, game=self.game)
+                textures = core.process_textures(material_apply.materials_json_path, textures_analysis.plan, progress=self._log, cancel_check=self._cancelled, game=self.game)
                 validation = textures.report.get("validation") if isinstance(textures.report.get("validation"), dict) else {"ok": True}
                 if validation.get("ok") is False:
                     raise RuntimeError("Texture processing validation failed.")
@@ -2856,10 +3106,14 @@ class FullImportWorker(QtCore.QThread):
                 progress=self._log,
                 cancel_check=self._cancelled,
                 gender=self.gender,
+                game=self.game,
+                survivor=self.survivor,
             )
             qc_plan = qc_analysis.plan
             qc_plan["author"] = "sheepylord"
             qc_plan["gender"] = self.gender
+            qc_plan["game"] = self.game
+            qc_plan["survivor"] = self.survivor
             qc_plan["auto_porting"] = True
             qc_plan["character_category"] = self.character_category
             if self.model_name:
@@ -3274,6 +3528,13 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self._step_tab_index_cache: dict[int, int] = {}
         self._texture_folder_scan_cache: dict[str, list[Path]] = {}
         self.gender_combos: list[QtWidgets.QComboBox] = []
+        self.game_combos: list[QtWidgets.QComboBox] = []
+        self.survivor_combos: list[QtWidgets.QComboBox] = []
+        # Per-placement (gender_combo, survivor_combo, label) so L4D2 mode can
+        # swap the gender selector for the survivor selector in place.
+        self.character_selectors: list[tuple[QtWidgets.QComboBox, QtWidgets.QComboBox, QtWidgets.QLabel]] = []
+        # Widgets shown only in L4D2 mode (e.g. the Step 9 survivor row).
+        self._l4d2_only_widgets: list[QtWidgets.QWidget] = []
         # Ordered membership per additional CoACD collision group; the first
         # bone in each list is the group's merge target.
         self._collision_group_members: dict[int, list[str]] = {}
@@ -3284,6 +3545,12 @@ class ImporterWindow(QtWidgets.QMainWindow):
         # QC plan; re-analyzing would silently discard those edits.
         self._qc_plan_user_modified = False
         self.language_code = str(self.settings_store.value("ui_language", "en_us", str) or "en_us")
+        # Target game for porting ("gmod" | "l4d2"). Threads through the pipeline
+        # like `gender`; defaults to gmod so the GMod path is unchanged.
+        self.selected_game = normalize_game_code(self.settings_store.value("selected_game", "gmod", str))
+        # Selected L4D2 survivor (replaces the gender choice in L4D2 mode); drives
+        # the Step 9 proportion target. Default Rochelle (producer).
+        self.selected_survivor = normalize_survivor_code(self.settings_store.value("selected_survivor", DEFAULT_L4D2_SURVIVOR, str))
         self.i18n_fallback = self.load_i18n_catalog("en_us")
         self.i18n_catalog = self.load_i18n_catalog(self.language_code)
         self._i18n_exact_map: dict[str, str] = {}
@@ -3445,14 +3712,56 @@ class ImporterWindow(QtWidgets.QMainWindow):
             self.flex_isolate_bodygroup_check.toggled.connect(lambda _value: self.save_settings())
         self._load_settings()
         self.apply_i18n()
+        # From here on, a target-game switch should re-run apply_i18n() so all GMod/L4D2
+        # brand text (buttons, labels, tabs, titles) relabels live (see apply_game_dependent_defaults).
+        self._i18n_initialized = True
         self.set_advanced_steps_visible(False)
-        QtCore.QTimer.singleShot(0, lambda: self._defer_step_preview(1, self.populate_pmx_files))
-        QtCore.QTimer.singleShot(0, self.populate_main_pmx_files)
-        QtCore.QTimer.singleShot(0, self.refresh_workflow_statuses)
-        QtCore.QTimer.singleShot(0, self.refresh_workspace_cache_size)
-        QtCore.QTimer.singleShot(200, self.start_category_scan)
-        QtCore.QTimer.singleShot(1500, self.start_update_check)
+        # Startup background work (PMX analysis, workspace scan, category scan, update check) spins
+        # up QThreads. Starting a QThread while the event loop is still processing the window's
+        # initial, input-synchronous show intermittently access-violates on Windows
+        # (RPC_E_CANTCALLOUT_ININPUTSYNCCALL -> ~50% blank-window crash, no Python traceback). So we
+        # defer all of it to the FIRST showEvent (event-driven, so it waits for the real show
+        # regardless of machine speed) instead of firing singleShot(0) timers from the constructor.
+        self._deferred_startup_started = False
         self.statusBar().showMessage(self._t("app.status.ready", "Ready"))
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        super().showEvent(event)
+        if not getattr(self, "_deferred_startup_started", False):
+            self._deferred_startup_started = True
+            # One more event-loop turn so the window's show/first-paint finishes before any thread
+            # starts; this is what moves the QThread.start() calls out of the input-sync window.
+            QtCore.QTimer.singleShot(0, self._run_deferred_startup_tasks)
+
+    def _run_deferred_startup_tasks(self) -> None:
+        # Runs after the first showEvent. Stagger the QThread-spawning tasks (PMX analysis,
+        # workspace scan, category scan, update check) so they (a) start well clear of the window's
+        # initial input-synchronous paint and (b) never start two threads in the same event-loop
+        # turn — both conditions were needed to eliminate the ~50% startup access violation.
+        self.refresh_workflow_statuses()
+        QtCore.QTimer.singleShot(300, lambda: self._defer_step_preview(1, self.populate_pmx_files))
+        QtCore.QTimer.singleShot(500, self.populate_main_pmx_files)
+        QtCore.QTimer.singleShot(700, self.refresh_workspace_cache_size)
+        QtCore.QTimer.singleShot(900, self.start_category_scan)
+        # First-run Blender prompt for the "without Blender" build (no-op when Blender is bundled or
+        # already provisioned/installed). Shown after the window has painted and the other startup
+        # tasks have kicked off.
+        QtCore.QTimer.singleShot(1100, self.maybe_prompt_blender_setup)
+        QtCore.QTimer.singleShot(1600, self.start_update_check)
+
+    def maybe_prompt_blender_setup(self) -> None:
+        """If this build does not bundle Blender and none has been provisioned yet, prompt the user
+        to download it (from blender.org) or browse to a local zip. Built into BOTH builds; a no-op
+        when Blender is bundled. Never allowed to crash startup."""
+        try:
+            if not core.blender_needs_provisioning():
+                return
+        except Exception:
+            return
+        try:
+            BlenderSetupDialog(self).exec()
+        except Exception:
+            pass
 
     def apply_startup_geometry(self) -> None:
         app = QtWidgets.QApplication.instance()
@@ -3610,6 +3919,187 @@ class ImporterWindow(QtWidgets.QMainWindow):
     def on_gender_combo_changed(self, source: QtWidgets.QComboBox) -> None:
         self.set_character_gender(str(source.currentData() or "female"))
         self.save_settings()
+
+    def _make_game_combo(self) -> QtWidgets.QComboBox:
+        combo = QtWidgets.QComboBox()
+        for code, display, icon_path in GAME_OPTIONS:
+            combo.addItem(game_icon(icon_path), display, code)
+        combo.setToolTip(
+            "Target game for porting. Garry's Mod is the default pipeline; "
+            "Left 4 Dead 2 retargets the bone limit and StudioMDL detection."
+        )
+        index = combo.findData(self.selected_game)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+        combo.currentIndexChanged.connect(lambda _index, source=combo: self.on_game_combo_changed(source))
+        self.game_combos.append(combo)
+        return combo
+
+    def current_selected_game(self) -> str:
+        for combo in getattr(self, "game_combos", []):
+            return normalize_game_code(combo.currentData())
+        return normalize_game_code(getattr(self, "selected_game", "gmod"))
+
+    def set_selected_game(self, game: str) -> None:
+        game = normalize_game_code(game)
+        self.selected_game = game
+        for combo in getattr(self, "game_combos", []):
+            blocker = QtCore.QSignalBlocker(combo)
+            try:
+                index = combo.findData(game)
+                if index >= 0:
+                    combo.setCurrentIndex(index)
+            finally:
+                del blocker
+        self.apply_game_dependent_defaults()
+
+    def on_game_combo_changed(self, source: QtWidgets.QComboBox) -> None:
+        new_game = normalize_game_code(source.currentData() or "gmod")
+        if new_game != getattr(self, "selected_game", "gmod"):
+            # Persist the current game's studiomdl path SYNCHRONOUSLY before the switch reloads
+            # the rows, so the per-game saved paths stay correct even with an unsaved edit in the
+            # field (save_settings() is debounced and would not flush before the reload reads).
+            self.flush_settings()
+        self.set_selected_game(new_game)
+        self.settings_store.setValue("selected_game", self.selected_game)
+        self.save_settings()
+
+    def apply_game_dependent_defaults(self) -> None:
+        """React to a game switch: retarget the Step 4 bone-limit spinbox and
+        swap the gender selector for the L4D2 survivor selector.
+
+        Only adjusts the spinbox ceiling/value when the user is still on the
+        previous game's default, so a deliberate custom limit is preserved.
+        """
+        spin = getattr(self, "sort_limit_spin", None)
+        if isinstance(spin, QtWidgets.QSpinBox):
+            game_limit = GAME_BONE_LIMITS.get(self.selected_game, 254)
+            previous_defaults = set(GAME_BONE_LIMITS.values())
+            blocker = QtCore.QSignalBlocker(spin)
+            try:
+                spin.setMaximum(max(GAME_BONE_LIMITS.values()))
+                if spin.value() in previous_defaults:
+                    spin.setValue(game_limit)
+            finally:
+                del blocker
+        self._refresh_character_selectors()
+        self._refresh_gmod_only_visibility()
+        # On a live target-game switch (not during initial construction): relabel all
+        # GMod<->L4D2 brand text and load the studiomdl path saved for the now-selected game.
+        if getattr(self, "_i18n_initialized", False):
+            self.apply_i18n()
+            self._load_studiomdl_paths_for_game()
+
+    def _refresh_gmod_only_visibility(self) -> None:
+        """Hide GMod-only surfaces when L4D2 is the target: the RTX Remix vertex-limit option
+        (a GMod-only rendering path) and the Model Manager tab (which manages garrysmod/addons
+        folders; L4D2 ports ship as a single .vpk with no such folder to scan)."""
+        l4d2 = getattr(self, "selected_game", "gmod") == "l4d2"
+        for attr in ("main_rtx_bodygroup_limit_check", "bodygroup_rtx_limit_check", "release_rtx_link_edit"):
+            widget = getattr(self, attr, None)
+            if isinstance(widget, QtWidgets.QWidget):
+                widget.setVisible(not l4d2)
+        rtx_label = (getattr(self, "main_form_labels", {}) or {}).get("rtx_vertex_limit")
+        if isinstance(rtx_label, QtWidgets.QWidget):
+            rtx_label.setVisible(not l4d2)
+        tabs = getattr(self, "tabs", None)
+        manager_tab = getattr(self, "model_manager_tab", None)
+        if tabs is not None and manager_tab is not None:
+            manager_index = self.tab_index_for_content_widget(manager_tab)
+            if manager_index is not None and manager_index >= 0:
+                try:
+                    tabs.setTabVisible(manager_index, not l4d2)
+                except AttributeError:
+                    tabs.tabBar().setTabVisible(manager_index, not l4d2)
+                if l4d2 and tabs.currentIndex() == manager_index:
+                    main_index = self.tab_index_for_content_widget(getattr(self, "main_tab", None))
+                    tabs.setCurrentIndex(max(0, main_index))
+
+    def _studiomdl_setting_key(self, base: str, game: str | None = None) -> str:
+        """Per-game QSettings key for a studiomdl/install path. GMod keeps the legacy key for
+        backward compatibility; L4D2 gets a '_l4d2'-suffixed key so each target game remembers
+        its own studiomdl path instead of sharing one and showing the wrong game's path."""
+        resolved = normalize_game_code(game or getattr(self, "selected_game", "gmod"))
+        return base if resolved == "gmod" else f"{base}_{resolved}"
+
+    def _load_studiomdl_paths_for_game(self) -> None:
+        """Load the main + QC studiomdl path rows from the keys saved for the current game."""
+        main_val = str(self.settings_store.value(self._studiomdl_setting_key("main_gmod_path"), "", str) or "")
+        qc_val = str(self.settings_store.value(self._studiomdl_setting_key("qc_gmod_path"), "", str) or "")
+        main_val = main_val or qc_val
+        qc_val = qc_val or main_val
+        if hasattr(self, "main_gmod_row"):
+            self.main_gmod_row.set_value(main_val)
+        if hasattr(self, "qc_gmod_row"):
+            self.qc_gmod_row.set_value(qc_val)
+
+    def _make_survivor_combo(self) -> QtWidgets.QComboBox:
+        combo = QtWidgets.QComboBox()
+        for code, display in L4D2_SURVIVOR_OPTIONS:
+            combo.addItem(display, code)
+        combo.setToolTip(
+            "L4D2 survivor whose skeleton/proportions the model is aligned to "
+            "in Step 9. Replaces the animation gender in L4D2 mode."
+        )
+        index = combo.findData(self.selected_survivor)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+        combo.currentIndexChanged.connect(lambda _index, source=combo: self.on_survivor_combo_changed(source))
+        self.survivor_combos.append(combo)
+        return combo
+
+    def current_selected_survivor(self) -> str:
+        for combo in getattr(self, "survivor_combos", []):
+            return normalize_survivor_code(combo.currentData())
+        return normalize_survivor_code(getattr(self, "selected_survivor", DEFAULT_L4D2_SURVIVOR))
+
+    def set_selected_survivor(self, survivor: str) -> None:
+        survivor = normalize_survivor_code(survivor)
+        self.selected_survivor = survivor
+        for combo in getattr(self, "survivor_combos", []):
+            blocker = QtCore.QSignalBlocker(combo)
+            try:
+                index = combo.findData(survivor)
+                if index >= 0:
+                    combo.setCurrentIndex(index)
+            finally:
+                del blocker
+
+    def on_survivor_combo_changed(self, source: QtWidgets.QComboBox) -> None:
+        self.set_selected_survivor(str(source.currentData() or DEFAULT_L4D2_SURVIVOR))
+        self.settings_store.setValue("selected_survivor", self.selected_survivor)
+        self.save_settings()
+
+    def _make_character_field(self, label: QtWidgets.QLabel) -> QtWidgets.QWidget:
+        """A form field holding both the gender and L4D2-survivor selectors; only
+        one is shown depending on the selected game (survivor in L4D2 mode)."""
+        if not hasattr(self, "survivor_combos"):
+            self.survivor_combos: list[QtWidgets.QComboBox] = []
+        container = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        gender = self._make_gender_combo()
+        survivor = self._make_survivor_combo()
+        layout.addWidget(gender)
+        layout.addWidget(survivor)
+        layout.addStretch(1)
+        self.character_selectors.append((gender, survivor, label))
+        return container
+
+    def _refresh_character_selectors(self) -> None:
+        l4d2 = self.selected_game == "l4d2"
+        translate = getattr(self, "translate_static_text", None)
+        def _label(text: str) -> str:
+            return translate(text) if callable(translate) else text
+        for gender, survivor, label in getattr(self, "character_selectors", []):
+            gender.setVisible(not l4d2)
+            survivor.setVisible(l4d2)
+            if isinstance(label, QtWidgets.QLabel):
+                # Route through the i18n exact-map so the existing gender-label
+                # translation is preserved (new survivor label falls back to English).
+                label.setText(_label("Survivor character") if l4d2 else _label("Animation gender"))
+        for widget in getattr(self, "_l4d2_only_widgets", []):
+            widget.setVisible(l4d2)
 
     def apply_main_scale_default_for_selected(self) -> None:
         """Track the selected model's format and reset the scale to its default on change."""
@@ -3978,10 +4468,36 @@ class ImporterWindow(QtWidgets.QMainWindow):
         text = self._lookup_i18n(self.i18n_catalog, key) or self._lookup_i18n(self.i18n_fallback, key) or default or key
         if kwargs:
             try:
-                return text.format(**kwargs)
+                text = text.format(**kwargs)
             except Exception:
-                return text
-        return text
+                pass
+        return self._apply_game_brand(text)
+
+    def _apply_game_brand(self, text: str) -> str:
+        """In L4D2 mode, relabel the GMod / Garry's Mod brand tokens in user-visible text to
+        L4D2 / Left 4 Dead 2 so the interface matches the selected target game. Applied centrally
+        to every string that flows through _t()/translate_static_text()/translate_runtime_text(),
+        so buttons, labels, tab titles, dialog titles and messages all relabel together.
+
+        Deliberately CASE-SENSITIVE and brand-token-only: it never touches lowercase path
+        literals ('garrysmod/addons'), output-folder names ('GarrysMod'), the RTX-remix_GMod_Package
+        repo/URL, or internal settings keys (copy_to_gmod_addons, qc_gmod_path, ...). A few strings
+        that intentionally name BOTH games (the game selector's own option label + explainer
+        tooltips) or that describe the GMod-only RTX Remix path are left exactly as authored."""
+        if not text or getattr(self, "selected_game", "gmod") != "l4d2":
+            return text
+        if (
+            text == "Garry's Mod"
+            or "RTX Remix" in text
+            or "GMod 254" in text
+            or "Garry's Mod is the default" in text
+        ):
+            return text
+        return (
+            text.replace("Garry's Mod", "Left 4 Dead 2")
+            .replace("GMod", "L4D2")
+            .replace("Gmod", "L4D2")
+        )
 
     def _flatten_i18n_strings(self, catalog: dict[str, object], prefix: str = "") -> dict[str, str]:
         flattened: dict[str, str] = {}
@@ -4011,11 +4527,13 @@ class ImporterWindow(QtWidgets.QMainWindow):
     def translate_static_text(self, text: str) -> str:
         if not text:
             return text
-        return self._i18n_exact_map.get(text, text)
+        return self._apply_game_brand(self._i18n_exact_map.get(text, text))
 
     def translate_runtime_text(self, text: str) -> str:
-        if not text or self.language_code == "en_us":
+        if not text:
             return text
+        if self.language_code == "en_us":
+            return self._apply_game_brand(text)
         dll_prefix = "Windows error 0xC0000142 (STATUS_DLL_INIT_FAILED): "
         dll_suffix = " or one of its DLL/application components failed during initialization."
         if text.startswith(dll_prefix) and text.endswith(dll_suffix):
@@ -4027,11 +4545,11 @@ class ImporterWindow(QtWidgets.QMainWindow):
             )
         exact = self._i18n_exact_map.get(text)
         if exact:
-            return exact
+            return self._apply_game_brand(exact)
         for source, translated in self._i18n_prefix_map:
             if text.startswith(source):
-                return translated + text[len(source) :]
-        return text
+                return self._apply_game_brand(translated + text[len(source) :])
+        return self._apply_game_brand(text)
 
     def translate_multiline_runtime_text(self, text: str) -> str:
         if not text or self.language_code == "en_us":
@@ -4169,6 +4687,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.apply_preview_i18n()
         self.apply_main_i18n()
         self.apply_workflow_i18n()
+        # Re-assert the gender/survivor label swap after i18n re-sets label text.
+        self._refresh_character_selectors()
 
     def apply_preview_i18n(self) -> None:
         texts = {
@@ -4206,6 +4726,10 @@ class ImporterWindow(QtWidgets.QMainWindow):
         label = getattr(self, "main_language_label", None)
         if isinstance(label, QtWidgets.QLabel):
             label.setText(self._t("main.language", "Language"))
+        for game_label_attr in ("main_game_label", "import_game_label"):
+            game_label = getattr(self, game_label_attr, None)
+            if isinstance(game_label, QtWidgets.QLabel):
+                game_label.setText(self._t("main.game", "Game"))
         intro = getattr(self, "main_intro_label", None)
         if isinstance(intro, QtWidgets.QLabel):
             intro.setText(
@@ -4464,12 +4988,17 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.advanced_steps_visible = visible
         main_index = self.tab_index_for_content_widget(getattr(self, "main_tab", None))
         manager_index = self.tab_index_for_content_widget(getattr(self, "model_manager_tab", None))
+        l4d2 = getattr(self, "selected_game", "gmod") == "l4d2"
         for index in range(self.tabs.count()):
             is_primary = index == main_index or index == manager_index
+            tab_visible = is_primary or visible
+            if index == manager_index and l4d2:
+                # Model Manager is GMod-only (manages garrysmod/addons); hide it under L4D2.
+                tab_visible = False
             try:
-                self.tabs.setTabVisible(index, is_primary or visible)
+                self.tabs.setTabVisible(index, tab_visible)
             except AttributeError:
-                self.tabs.tabBar().setTabVisible(index, is_primary or visible)
+                self.tabs.tabBar().setTabVisible(index, tab_visible)
         if not visible:
             current = self.tabs.currentIndex()
             if current not in {main_index, manager_index}:
@@ -5221,6 +5750,11 @@ class ImporterWindow(QtWidgets.QMainWindow):
             self.main_language_combo.addItem(display, code)
         language_layout.addWidget(self.main_language_label)
         language_layout.addWidget(self.main_language_combo, 0)
+        language_layout.addSpacing(16)
+        self.main_game_label = QtWidgets.QLabel("Game")
+        self.main_game_combo = self._make_game_combo()
+        language_layout.addWidget(self.main_game_label)
+        language_layout.addWidget(self.main_game_combo, 0)
         language_layout.addStretch(1)
         layout.addLayout(language_layout)
 
@@ -5293,7 +5827,6 @@ class ImporterWindow(QtWidgets.QMainWindow):
         )
         self.main_clear_custom_normals_hint.setObjectName("fieldHint")
         self.main_clear_custom_normals_hint.setWordWrap(True)
-        self.main_gender_combo = self._make_gender_combo()
         self.main_scale_spin = QtWidgets.QDoubleSpinBox()
         self.main_scale_spin.setRange(0.01, 10.0)
         self.main_scale_spin.setDecimals(3)
@@ -5328,7 +5861,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         form.addRow(self.main_form_labels["category_display"], self.main_category_display_edit)
         form.addRow(self.main_form_labels["character_internal"], self.main_model_name_edit)
         form.addRow(self.main_form_labels["character_display"], self.main_model_display_edit)
-        form.addRow(self.main_form_labels["gender"], self.main_gender_combo)
+        form.addRow(self.main_form_labels["gender"], self._make_character_field(self.main_form_labels["gender"]))
         form.addRow(self.main_form_labels["model_scale"], self.main_scale_spin)
         form.addRow(self.main_form_labels["rtx_vertex_limit"], self.main_rtx_bodygroup_limit_check)
         main_clear_custom_normals_box = QtWidgets.QWidget()
@@ -5610,6 +6143,14 @@ class ImporterWindow(QtWidgets.QMainWindow):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
 
+        game_row = QtWidgets.QHBoxLayout()
+        self.import_game_label = QtWidgets.QLabel("Game")
+        self.import_game_combo = self._make_game_combo()
+        game_row.addWidget(self.import_game_label)
+        game_row.addWidget(self.import_game_combo, 0)
+        game_row.addStretch(1)
+        layout.addLayout(game_row)
+
         self.source_row = PathRow(
             "MMD model folder",
             "dir",
@@ -5648,8 +6189,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
         workspace_row.addWidget(self.workspace_browse_button, 0)
         workspace_layout = QtWidgets.QFormLayout()
         workspace_layout.addRow("Workspace", workspace_row)
-        self.import_gender_combo = self._make_gender_combo()
-        workspace_layout.addRow("Animation gender", self.import_gender_combo)
+        self.import_character_label = QtWidgets.QLabel("Animation gender")
+        workspace_layout.addRow(self.import_character_label, self._make_character_field(self.import_character_label))
         layout.addLayout(workspace_layout)
 
         self.preflight_group = QtWidgets.QGroupBox("Preflight")
@@ -6123,9 +6664,9 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.sort_output_edit = QtWidgets.QLineEdit()
         self.sort_output_edit.setReadOnly(True)
         self.sort_limit_spin = QtWidgets.QSpinBox()
-        self.sort_limit_spin.setRange(1, 254)
-        self.sort_limit_spin.setValue(254)
-        self.sort_limit_spin.setToolTip("Source/GMod hard bone limit. Leave at 254 unless you need a lower target.")
+        self.sort_limit_spin.setRange(1, max(GAME_BONE_LIMITS.values()))
+        self.sort_limit_spin.setValue(GAME_BONE_LIMITS.get(self.selected_game, 254))
+        self.sort_limit_spin.setToolTip("Source bone limit for the target game (GMod 254, L4D2 126). Lower to merge more aggressively.")
         sort_settings.addRow("Output folder", self._output_folder_row(self.sort_output_edit))
         sort_settings.addRow("Bone limit", self.sort_limit_spin)
         layout.addLayout(sort_settings)
@@ -7878,6 +8419,11 @@ class ImporterWindow(QtWidgets.QMainWindow):
         )
         settings.addRow("Output folder", self._output_folder_row(self.proportion_output_edit))
         settings.addRow("Export cleanup", self.proportion_remove_zero_weight_check)
+        # L4D2-only: the survivor whose skeleton/proportions the model aligns to.
+        self.proportion_survivor_label = QtWidgets.QLabel("Survivor character")
+        self.proportion_survivor_combo = self._make_survivor_combo()
+        settings.addRow(self.proportion_survivor_label, self.proportion_survivor_combo)
+        self._l4d2_only_widgets.extend([self.proportion_survivor_label, self.proportion_survivor_combo])
         self.detect_collision_blend_button = QtWidgets.QPushButton("Detect Step 8 Output")
         self.detect_collision_blend_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogContentsView))
         settings.addRow("", self.detect_collision_blend_button)
@@ -8905,8 +9451,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
         settings.addRow("Character category display name", self.qc_category_display_edit)
         settings.addRow("Model internal name", self.qc_model_name_edit)
         settings.addRow("Model display name", self.qc_model_display_edit)
-        self.qc_gender_combo = self._make_gender_combo()
-        settings.addRow("Animation gender", self.qc_gender_combo)
+        self.qc_character_label = QtWidgets.QLabel("Animation gender")
+        settings.addRow(self.qc_character_label, self._make_character_field(self.qc_character_label))
         settings.addRow("Jiggle direction", self.qc_invert_jiggle_check)
         settings.addRow("GMod addons install", self.qc_copy_to_gmod_addons_check)
         settings.addRow("MCI metadata JSON", self.qc_include_mci_metadata_check)
@@ -9589,6 +10135,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
                     self.main_language_combo.setCurrentIndex(language_index)
                 finally:
                     del blocker
+        self.set_selected_survivor(self.settings_store.value("selected_survivor", self.selected_survivor, str))
+        self.set_selected_game(self.settings_store.value("selected_game", self.selected_game, str))
         source = str(self.settings_store.value("source_dir", "", str) or "")
         if not source:
             source = self.default_sample_dir()
@@ -9599,14 +10147,15 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 self.main_source_row.set_value(main_source)
             finally:
                 self._loading_main_source_from_settings = False
-        main_gmod = str(self.settings_store.value("main_gmod_path", "", str) or "")
+        main_gmod = str(self.settings_store.value(self._studiomdl_setting_key("main_gmod_path"), "", str) or "")
         if not main_gmod:
-            main_gmod = str(self.settings_store.value("qc_gmod_path", "", str) or "")
+            main_gmod = str(self.settings_store.value(self._studiomdl_setting_key("qc_gmod_path"), "", str) or "")
         if main_gmod and hasattr(self, "main_gmod_row"):
             self.main_gmod_row.set_value(main_gmod)
+        # Model Manager is GMod-only, so it always reads the GMod (legacy) studiomdl path.
         model_manager_gmod = str(self.settings_store.value("model_manager_gmod_path", "", str) or "")
         if not model_manager_gmod:
-            model_manager_gmod = main_gmod or str(self.settings_store.value("qc_gmod_path", "", str) or "")
+            model_manager_gmod = str(self.settings_store.value("main_gmod_path", "", str) or "") or str(self.settings_store.value("qc_gmod_path", "", str) or "")
         if model_manager_gmod and hasattr(self, "model_manager_gmod_row"):
             self.model_manager_gmod_row.set_value(model_manager_gmod)
         main_model = str(self.settings_store.value("main_model_name", "", str) or "")
@@ -9691,7 +10240,9 @@ class ImporterWindow(QtWidgets.QMainWindow):
         qc_input = str(self.settings_store.value("qc_input_dir", "", str) or "")
         if qc_input and hasattr(self, "qc_input_row"):
             self.qc_input_row.set_value(qc_input)
-        qc_gmod = str(self.settings_store.value("qc_gmod_path", "", str) or "")
+        qc_gmod = str(self.settings_store.value(self._studiomdl_setting_key("qc_gmod_path"), "", str) or "")
+        if not qc_gmod:
+            qc_gmod = str(self.settings_store.value(self._studiomdl_setting_key("main_gmod_path"), "", str) or "")
         if qc_gmod and hasattr(self, "qc_gmod_row"):
             self.qc_gmod_row.set_value(qc_gmod)
         if hasattr(self, "qc_author_edit"):
@@ -9759,12 +10310,13 @@ class ImporterWindow(QtWidgets.QMainWindow):
                         widget.setCurrentText(value)
                     else:
                         widget.setText(value)
-        sort_limit = self.settings_store.value("sort_bone_limit", 254, int)
+        game_bone_limit = GAME_BONE_LIMITS.get(self.selected_game, 254)
+        sort_limit = self.settings_store.value("sort_bone_limit", game_bone_limit, int)
         if hasattr(self, "sort_limit_spin"):
             try:
-                self.sort_limit_spin.setValue(max(1, min(254, int(sort_limit))))
+                self.sort_limit_spin.setValue(max(1, min(max(GAME_BONE_LIMITS.values()), int(sort_limit))))
             except Exception:
-                self.sort_limit_spin.setValue(254)
+                self.sort_limit_spin.setValue(game_bone_limit)
         material_limit = self.settings_store.value("material_limit", 32, int)
         if hasattr(self, "material_limit_spin"):
             try:
@@ -9860,6 +10412,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
         if self._loading_settings:
             return
         self.settings_store.setValue("ui_language", self.language_code)
+        self.settings_store.setValue("selected_game", self.selected_game)
+        self.settings_store.setValue("selected_survivor", self.selected_survivor)
         if hasattr(self, "main_source_row"):
             self.settings_store.setValue("main_source_dir", self.main_source_row.value())
         if hasattr(self, "main_pmx_combo"):
@@ -9867,7 +10421,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
             if pmx:
                 self.settings_store.setValue("main_pmx_path", str(pmx))
         if hasattr(self, "main_gmod_row"):
-            self.settings_store.setValue("main_gmod_path", self.main_gmod_row.value())
+            self.settings_store.setValue(self._studiomdl_setting_key("main_gmod_path"), self.main_gmod_row.value())
         if hasattr(self, "model_manager_gmod_row"):
             self.settings_store.setValue("model_manager_gmod_path", self.model_manager_gmod_row.value())
         if hasattr(self, "main_model_name_edit"):
@@ -9954,7 +10508,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         if hasattr(self, "qc_input_row"):
             self.settings_store.setValue("qc_input_dir", self.qc_input_row.value())
         if hasattr(self, "qc_gmod_row"):
-            self.settings_store.setValue("qc_gmod_path", self.qc_gmod_row.value())
+            self.settings_store.setValue(self._studiomdl_setting_key("qc_gmod_path"), self.qc_gmod_row.value())
         if hasattr(self, "qc_author_edit"):
             self.settings_store.setValue("qc_author", "sheepylord")
         if hasattr(self, "qc_category_edit"):
@@ -10490,26 +11044,76 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 return str(resolved.get("display") or candidate)
         return ""
 
+    def find_l4d2_candidate(self) -> str:
+        candidates: list[Path] = []
+        raw = os.environ.get("STUDIOMDL", "") or os.environ.get("L4D2_PATH", "")
+        if raw:
+            path = Path(raw)
+            candidates.append(path)
+            if path.is_dir():
+                candidates.append(path / "bin" / "studiomdl.exe")
+        steam_dir = core._find_steam_dir()
+        if steam_dir:
+            for lib in core._find_steam_library_folders(steam_dir):
+                base = lib / "steamapps" / "common" / "Left 4 Dead 2"
+                candidates.append(base / "bin" / "studiomdl.exe")
+        candidates.append(Path("C:/Program Files (x86)/Steam/steamapps/common/Left 4 Dead 2/bin/studiomdl.exe"))
+        seen: set[Path] = set()
+        for candidate in candidates:
+            candidate = safe_resolve_path(candidate)
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            resolved = resolve_gmod_path_input(str(candidate))
+            if resolved.get("ok"):
+                return str(resolved.get("display") or candidate)
+        return ""
+
+    def find_game_studiomdl_candidate(self) -> str:
+        """Auto-find the StudioMDL for the currently selected target game."""
+        if getattr(self, "selected_game", "gmod") == "l4d2":
+            return self.find_l4d2_candidate()
+        return self.find_gmod_candidate()
+
+    def _studiomdl_path_is_wrong_game(self, resolved: dict[str, object]) -> bool:
+        """True when an already-resolved studiomdl/install path clearly belongs to the
+        OTHER target game than the one currently selected. Used so the Detect button
+        re-finds the correct game's studiomdl instead of silently keeping a stale path
+        from the other game (e.g. a saved Garry's Mod path while L4D2 is selected).
+        Custom/ambiguous paths that match neither game's folder are left untouched."""
+        blob = " ".join(
+            str(resolved.get(key) or "") for key in ("display", "studiomdl", "gmod_root", "input")
+        ).lower()
+        if getattr(self, "selected_game", "gmod") == "l4d2":
+            return "garrysmod" in blob
+        return "left 4 dead 2" in blob or "left4dead2" in blob
+
     def detect_gmod_for_main(self) -> None:
+        game_label = "Left 4 Dead 2" if self.selected_game == "l4d2" else "GMod"
         current = resolve_gmod_path_input(self.main_gmod_row.value() if hasattr(self, "main_gmod_row") else "")
-        if current.get("ok"):
+        if current.get("ok") and not self._studiomdl_path_is_wrong_game(current):
             found = str(current.get("display") or "")
             self.main_gmod_row.set_value(found)
-            self.append_main_log(f"Using existing GMod StudioMDL/install path: {found}")
+            self.append_main_log(f"Using existing {game_label} StudioMDL/install path: {found}")
             self.save_settings()
             return
-        found = self.find_gmod_candidate()
+        found = self.find_game_studiomdl_candidate()
         if found:
             self.main_gmod_row.set_value(found)
-            self.append_main_log(f"Detected GMod StudioMDL/install: {found}")
+            self.append_main_log(f"Detected {game_label} StudioMDL/install: {found}")
             self.save_settings()
             return
         detail = str(current.get("error") or "").strip()
         if detail and self.main_gmod_row.value().strip():
             detail = "\n\nCurrent path is not usable:\n" + detail
+        browse_hint = (
+            "Browse to 'Left 4 Dead 2/bin/studiomdl.exe'"
+            if self.selected_game == "l4d2"
+            else "Browse to garrysmod/bin/studiomdl.exe"
+        )
         self.show_error(
-            "Detect GMod",
-            "Could not find Garry's Mod StudioMDL. Browse to garrysmod/bin/studiomdl.exe or set STUDIOMDL." + detail,
+            f"Detect {game_label}",
+            f"Could not find {game_label} StudioMDL. {browse_hint} or set STUDIOMDL." + detail,
         )
 
     def browse_model_manager_gmod_folder(self) -> None:
@@ -10991,6 +11595,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
             ),
             gender=self.current_character_gender(),
             bodygroup_scale_factor=self.main_effective_bodygroup_scale(),
+            game=self.selected_game,
+            survivor=self.current_selected_survivor(),
         )
         self.worker.log.connect(self.append_main_log)
         self.worker.progress.connect(self.set_main_progress)
@@ -12757,7 +13363,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.sort_manual_merge_button.setEnabled(False)
         self.detect_spine_blend_button.setEnabled(False)
         self.sort_cancel_button.setEnabled(True)
-        self.worker = SortBonesAnalyzeWorker(str(input_blend), self.sort_limit_spin.value())
+        self.worker = SortBonesAnalyzeWorker(str(input_blend), self.sort_limit_spin.value(), self.selected_game)
         self.worker.log.connect(self.append_sort_log)
         self.worker.done.connect(self.sort_analyze_done)
         self.worker.failed.connect(self.sort_failed)
@@ -12859,7 +13465,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
                     if candidate_text and Path(candidate_text).exists():
                         source_blend = candidate_text
                         break
-        self.worker = SortBonesManualMergeWorker(str(manual_blend), self.sort_limit_spin.value(), source_blend)
+        self.worker = SortBonesManualMergeWorker(str(manual_blend), self.sort_limit_spin.value(), source_blend, self.selected_game)
         self.worker.log.connect(self.append_sort_log)
         self.worker.done.connect(self.sort_manual_merge_done)
         self.worker.failed.connect(self.sort_failed)
@@ -13213,7 +13819,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.sort_cancel_button.setEnabled(True)
         self.sort_blend_label.clear()
         self.sort_report_label.clear()
-        self.worker = SortBonesWorker(str(input_blend), self.current_sort_plan, self.sort_limit_spin.value())
+        self.worker = SortBonesWorker(str(input_blend), self.current_sort_plan, self.sort_limit_spin.value(), self.selected_game)
         self.worker.log.connect(self.append_sort_log)
         self.worker.done.connect(self.sort_bones_done)
         self.worker.failed.connect(self.sort_failed)
@@ -15141,7 +15747,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.flex_remove_button.setEnabled(False)
         self.detect_bodygroup_blend_button.setEnabled(False)
         self.flex_cancel_button.setEnabled(True)
-        self.worker = FlexAnalyzeWorker(str(input_blend))
+        self.worker = FlexAnalyzeWorker(str(input_blend), self.selected_game)
         self.worker.log.connect(self.append_flex_log)
         self.worker.done.connect(self.flex_analyze_done)
         self.worker.failed.connect(self.flex_failed)
@@ -17473,6 +18079,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.worker = ProportionRunWorker(
             str(input_blend),
             remove_zero_weight_bones=self.proportion_remove_zero_weight_check.isChecked(),
+            game=self.selected_game,
+            survivor=self.current_selected_survivor(),
         )
         self.worker.log.connect(self.append_proportion_log)
         self.worker.done.connect(self.proportion_done)
@@ -19147,7 +19755,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.detect_texture_mapping_button.setEnabled(False)
         self.texture_cancel_button.setEnabled(True)
         scheme = self.current_texture_scheme()
-        self.worker = TextureAnalyzeWorker(str(input_path), scheme=scheme)
+        self.worker = TextureAnalyzeWorker(str(input_path), scheme=scheme, game=self.current_selected_game())
         self.worker.log.connect(self.append_texture_log)
         self.worker.done.connect(self.texture_analyze_done)
         self.worker.failed.connect(self.texture_failed)
@@ -19223,7 +19831,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.texture_process_button.setEnabled(False)
         self.detect_texture_mapping_button.setEnabled(False)
         self.texture_cancel_button.setEnabled(True)
-        self.worker = TextureProcessWorker(input_raw, deepcopy(self.current_texture_plan))
+        self.worker = TextureProcessWorker(input_raw, deepcopy(self.current_texture_plan), game=self.current_selected_game())
         self.worker.log.connect(self.append_texture_log)
         self.worker.done.connect(self.texture_process_done)
         self.worker.failed.connect(self.texture_failed)
@@ -20931,53 +21539,31 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.show_error("Detect Step Outputs", "No Step 9 proportion export folder was found. Run Step 9 or browse to 2_proportion_export.")
 
     def detect_gmod_for_qc(self) -> None:
+        game_label = "Left 4 Dead 2" if self.selected_game == "l4d2" else "GMod"
         current = resolve_gmod_path_input(self.qc_gmod_row.value() if hasattr(self, "qc_gmod_row") else "")
-        if current.get("ok"):
+        if current.get("ok") and not self._studiomdl_path_is_wrong_game(current):
             found = str(current.get("display") or "")
             self.qc_gmod_row.set_value(found)
-            self.append_qc_log(f"Using existing GMod StudioMDL/install path: {found}")
+            self.append_qc_log(f"Using existing {game_label} StudioMDL/install path: {found}")
             self.save_settings()
             return
-        candidates: list[Path] = []
-        # 1. Environment variables (highest priority when explicitly set)
-        for key in ("STUDIOMDL", "GMOD_PATH"):
-            raw = os.environ.get(key, "")
-            if raw:
-                path = Path(raw)
-                candidates.append(path)
-                if path.is_dir():
-                    candidates.append(path / "bin" / "studiomdl.exe")
-        # 2. Detect Steam installation and libraries first
-        steam_dir = core._find_steam_dir()
-        if steam_dir:
-            for lib in core._find_steam_library_folders(steam_dir):
-                for name in ("GarrysMod_RTX_c", "GarrysMod"):
-                    base = lib / "steamapps" / "common" / name
-                    candidates.append(base / "bin" / "studiomdl.exe")
-                    candidates.append(base / "bin" / "win64" / "studiomdl.exe")
-        # 3. Fallback standard install path
-        for root in (Path("C:/Program Files (x86)/Steam/steamapps/common/GarrysMod"),):
-            candidates.append(root / "bin" / "studiomdl.exe")
-            candidates.append(root / "bin" / "win64" / "studiomdl.exe")
-        seen: set[Path] = set()
-        for candidate in candidates:
-            candidate = safe_resolve_path(candidate)
-            if candidate in seen:
-                continue
-            seen.add(candidate)
-            resolved = resolve_gmod_path_input(str(candidate))
-            if resolved.get("ok"):
-                found = str(resolved.get("display") or candidate)
-                self.qc_gmod_row.set_value(found)
-                self.append_qc_log(f"Detected GMod StudioMDL/install: {found}")
-                self.save_settings()
-                return
+        found = self.find_game_studiomdl_candidate()
+        if found:
+            self.qc_gmod_row.set_value(found)
+            self.append_qc_log(f"Detected {game_label} StudioMDL/install: {found}")
+            self.save_settings()
+            return
         detail = str(current.get("error") or "").strip()
         if detail and self.qc_gmod_row.value().strip():
             detail = "\n\nCurrent path is not usable:\n" + detail
+        browse_hint = (
+            "Browse to 'Left 4 Dead 2/bin/studiomdl.exe'"
+            if self.selected_game == "l4d2"
+            else "Browse to garrysmod/bin/studiomdl.exe"
+        )
         self.show_error(
-            "Detect GMod",
-            "Could not find Garry's Mod StudioMDL. Browse to garrysmod/bin/studiomdl.exe or set STUDIOMDL." + detail,
+            f"Detect {game_label}",
+            f"Could not find {game_label} StudioMDL. {browse_hint} or set STUDIOMDL." + detail,
         )
 
     def start_qc_analyze(self) -> None:
@@ -21036,6 +21622,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
             gmod_root,
             studiomdl,
             gender=self.current_character_gender(),
+            game=self.selected_game,
+            survivor=self.current_selected_survivor(),
         )
         self.worker.log.connect(self.append_qc_log)
         self.worker.done.connect(self.qc_analyze_done)
@@ -21504,6 +22092,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
             or self.qc_display_from_internal(category, "Sheepy Lord")
         )
         plan["gender"] = self.current_character_gender()
+        plan["game"] = self.selected_game
+        plan["survivor"] = self.current_selected_survivor()
         plan["invert_jiggle_direction"] = bool(self.qc_invert_jiggle_check.isChecked()) if hasattr(self, "qc_invert_jiggle_check") else False
         plan["copy_to_gmod_addons"] = (
             bool(self.qc_copy_to_gmod_addons_check.isChecked()) if hasattr(self, "qc_copy_to_gmod_addons_check") else False
@@ -22436,6 +23026,9 @@ def main() -> int:
     if dispatched_exit_code is not None:
         return dispatched_exit_code
     crash_log_path = enable_crash_logging()
+    # Sharing one GL context across the app's two QOpenGLWidgets (model + material preview) is good
+    # practice and harmless; set before QApplication as Qt requires.
+    QtCore.QCoreApplication.setAttribute(QtCore.Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName("MMD Character Importer")
     theme_preference = str(

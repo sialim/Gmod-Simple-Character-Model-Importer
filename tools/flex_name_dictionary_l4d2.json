@@ -1,0 +1,36 @@
+{
+ "_comment": "Maps CATS-translated MMD morph names to Left 4 Dead 2 survivor FACS flex CONTROLLER names (the 52 inputs the survivor animations drive, verified identical across the official coach/gambler/mechanic/producer survivors). Used by tools/blender_sort_flexes.py in L4D2 mode: a morph is kept only if it maps to one of these controllers (and the controller is not already taken); every other morph is dropped (eyes-iris/heart/star/look, tears, blush, sweat, emote overlays, teeth and tongue have no L4D2 flex equivalent). Lookup is exact then name-normalized, so spacing/underscore/case variants match. _controllers lists the authoritative set for reference.",
+ "_controllers": [
+  "right_lid_raiser","left_lid_raiser","right_lid_tightener","left_lid_tightener","right_lid_droop","left_lid_droop","right_lid_closer","left_lid_closer","half_closed","blink","right_lid_squinter","left_lid_squinter","right_inner_raiser","left_inner_raiser","right_outer_raiser","left_outer_raiser","right_lowerer","left_lowerer","right_cheek_raiser","left_cheek_raiser","right_wrinkler","left_wrinkler","dilator","right_upper_raiser","left_upper_raiser","right_corner_puller","left_corner_puller","right_corner_depressor","left_corner_depressor","chin_raiser","right_part","left_part","right_puckerer","left_puckerer","right_funneler","left_funneler","right_stretcher","left_stretcher","bite","presser","tightener","jaw_clencher","jaw_drop","right_mouth_drop","left_mouth_drop","right_cheek_puffer","left_cheek_puffer","mouth_sideways","jaw_sideways","lower_lip","eyes_updown","eyes_rightleft"
+ ],
+ "mapping": {
+  "Blink": "blink",
+  "Wink 2": "left_lid_closer",
+  "Wink 2 Right": "right_lid_closer",
+  "Jito Eye": "half_closed",
+  "Anger Left": "left_lowerer",
+  "Anger Right": "right_lowerer",
+  "Lower Left": "left_lowerer",
+  "Lower Right": "right_lowerer",
+  "Front Left": "left_lowerer",
+  "Front Right": "right_lowerer",
+  "Sadness Left": "left_inner_raiser",
+  "Sadness Right": "right_inner_raiser",
+  "Upper": "right_outer_raiser",
+  "Upper Left": "left_outer_raiser",
+  "Upper Right": "right_outer_raiser",
+  "Cheerful Left": "left_outer_raiser",
+  "Cheerful Right": "right_outer_raiser",
+  "Ah": "jaw_drop",
+  "Smile": "right_corner_puller",
+  "Grin": "right_corner_puller",
+  "Mouth Horn Raise": "right_corner_puller",
+  "Mouth Horn Lower": "right_corner_depressor",
+  "Jaw Left": "jaw_sideways",
+  "Jaw Right": "jaw_sideways",
+  "Mouth Lower": "lower_lip",
+  "Mouth Upper": "right_upper_raiser",
+  "Hmm": "presser",
+  "Bite": "bite"
+ }
+}

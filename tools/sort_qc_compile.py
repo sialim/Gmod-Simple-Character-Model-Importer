@@ -47,6 +47,7 @@ BAD_OPEN_BRACE_RE = re.compile(r"\((?P<line>\d+)\):\s*-\s*bad command\s+\{", re.
 
 ESSENTIAL_EXACT = {"ZArmTwist_L", "ZArmTwist_R", "ZHandTwist_L", "ZHandTwist_R", "Eye_L", "Eye_R"}
 GENDER_CHOICES = ("female", "male")
+GAME_CHOICES = ("gmod", "l4d2")
 GENDER_ANIMATION_INCLUDES = {
     "female": {
         # Playermodel QC needs ONLY the standard GMod player animation packs.
@@ -94,6 +95,130 @@ NPC_ANIMATION_INCLUDES = GENDER_ANIMATION_INCLUDES["female"]["npc"]
 def normalize_gender(value: object) -> str:
     text = str(value or "").strip().lower()
     return text if text in GENDER_CHOICES else "female"
+
+
+def normalize_game(value: object) -> str:
+    text = str(value or "").strip().lower()
+    return text if text in GAME_CHOICES else "gmod"
+
+
+# The 8 L4D2 survivor slots an MMD model can be ported onto (the 4 L4D2 survivors
+# plus the 4 returning L4D1 survivors). The model name/path MUST be the exact
+# survivor slot (custom names are not allowed in L4D2): the character is
+# survivors/survivor_<slot>.mdl and the first-person arms are
+# weapons/arms/v_arms_<slot>_new.mdl (the "_new" suffix is the L4D2 arms
+# convention). anim/gesture includes and the vgui survivor panels also use the
+# exact slot. Internal slot -> in-game name: producer=Rochelle, coach=Coach,
+# gambler=Nick, mechanic=Ellis, namvet=Bill, teenangst=Zoey, biker=Francis,
+# manager=Louis.
+L4D2_SURVIVOR_SLOTS = (
+    "producer",
+    "coach",
+    "gambler",
+    "mechanic",
+    "namvet",
+    "teenangst",
+    "biker",
+    "manager",
+)
+DEFAULT_L4D2_SURVIVOR = "producer"
+
+
+def normalize_survivor(value: object) -> str:
+    text = str(value or "").strip().lower()
+    return text if text in L4D2_SURVIVOR_SLOTS else DEFAULT_L4D2_SURVIVOR
+
+
+# L4D2 survivor $attachment set (from the base-game survivor_producer decompile). These tell
+# the game where to place weapons and items: without them the held weapon world-model has no
+# bone to bone-merge to and is dropped at the model origin. Offsets are bone-relative and shared
+# across survivors (the body is a custom MMD model regardless); each line is emitted only if the
+# referenced bone exists in the selected survivor's skeleton (the L4D1 survivors lack
+# L_weapon_bone, etc.), so the compile never references a missing bone.
+L4D2_SURVIVOR_ATTACHMENTS = [
+    '$attachment "eyes" "ValveBiped.Bip01_Head1" 3.42 -2.36 0.05 rotate 0 -89.37 -90',
+    '$attachment "mouth" "ValveBiped.Bip01_Head1" 0.71 -5.15 -0.13 rotate 0 -80 -90',
+    '$attachment "survivor_light" "ValveBiped.Bip01_Spine2" 5.33 21.31 0 rotate 0 0 0',
+    '$attachment "forward" "ValveBiped.forward" 0 0 0 rotate 0 0 0',
+    '$attachment "pistol" "ValveBiped.Bip01_R_Thigh" -2.95 1.84 -4.61 rotate -3.66 -0.47 91.7',
+    '$attachment "L_weapon_bone" "ValveBiped.L_weapon_bone" 0 0 0 rotate 0 0 0',
+    '$attachment "weapon_bone" "ValveBiped.weapon_bone" 0 0 0 rotate 0 0 0',
+    '$attachment "medkit" "ValveBiped.Bip01_Spine4" -0.65 -2.83 -1.16 rotate 5.03 77.16 0',
+    '$attachment "primary" "ValveBiped.Bip01_Spine4" 2.71 -4.36 -2.33 rotate -13.7 170.19 174.29',
+    '$attachment "attach_R_shoulderBladeAim" "ValveBiped.Bip01_Spine4" -8.88 0.88 -4.51 rotate -90 -102.85 0',
+    '$attachment "attach_L_shoulderBladeAim" "ValveBiped.Bip01_Spine4" -8.88 0.88 3.12 rotate -90 -102.85 0',
+    '$attachment "melee" "ValveBiped.Bip01_Spine4" 2.64 -3.12 4.45 rotate 24.08 175.37 97.14',
+    '$attachment "molotov" "ValveBiped.Bip01_Spine" -3.19 -2.44 7.01 rotate -63.44 -74.67 -101.41',
+    '$attachment "grenade" "ValveBiped.Bip01_Spine" -0.68 1.17 6.97 rotate -90 -175.23 0',
+    '$attachment "pills" "ValveBiped.Bip01_Spine" -2.63 0.63 -7.56 rotate -41.18 -88.48 -87.05',
+    '$attachment "lfoot" "ValveBiped.Bip01_L_Foot" 0 4.44 0 rotate 0 0 0',
+    '$attachment "rfoot" "ValveBiped.Bip01_R_Foot" 0 4.44 0 rotate 0 0 0',
+    '$attachment "muzzle_flash" "ValveBiped.Bip01_L_Hand" 0 0 0 rotate 0 0 0',
+    '$attachment "survivor_neck" "ValveBiped.Bip01_Neck1" 0 0 0 rotate 0 0 0',
+    '$attachment "bleedout" "ValveBiped.Bip01_Pelvis" 8.44 8.88 4.44 rotate 0 0 0',
+    '$attachment "legL_B" "ValveBiped.attachment_bandage_legL" 0 0 0 rotate -90 -90 0',
+    '$attachment "armL_B" "ValveBiped.attachment_bandage_armL" 0 0 0 rotate -90 -90 0',
+    '$attachment "armL_T" "ValveBiped.attachment_armL_T" 0 0 0 rotate -90 -90 0',
+    '$attachment "armR_T" "ValveBiped.attachment_armR_T" 0 0 0 rotate -90 -90 0',
+    '$attachment "armL" "ValveBiped.Bip01_L_Forearm" 0 0 0 rotate 0 0 0',
+    '$attachment "legL" "ValveBiped.Bip01_L_Calf" 0 0 0 rotate 0 0 0',
+    '$attachment "thighL" "ValveBiped.Bip01_L_Thigh" 0 0 0 rotate 0 0 0',
+    '$attachment "spine" "ValveBiped.Bip01_Spine" 0 0 0 rotate -90 -90 0',
+]
+
+
+def l4d2_survivor_skeleton_bones(slot: str) -> set[str]:
+    """Bone names present in the bundled survivor skeleton (the proportion base armature).
+
+    The compiled L4D2 model carries exactly these bones (core biped + the survivor's functional
+    weapon/attachment bones), so this is the authoritative set for deciding which attachments and
+    IK chains can be emitted without referencing a bone that does not exist.
+    """
+
+    smd = Path(__file__).resolve().parent / "l4d2_reference_skeletons" / f"{normalize_survivor(slot)}.smd"
+    names: set[str] = set()
+    if not smd.exists():
+        return names
+    for line in smd.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.strip() == "skeleton":
+            break
+        match = re.match(r'\s*\d+\s+"([^"]+)"', line)
+        if match:
+            names.add(match.group(1))
+    return names
+
+
+def _attachment_bone(line: str) -> str:
+    parts = line.split('"')
+    return parts[3] if len(parts) >= 4 else ""
+
+
+def l4d2_attachment_lines(model_bones: set[str]) -> list[str]:
+    return [f"{line} \n" for line in L4D2_SURVIVOR_ATTACHMENTS if _attachment_bone(line) in model_bones]
+
+
+def l4d2_ik_lines(model_bones: set[str]) -> list[str]:
+    """L4D2 survivor IK chains + autoplay locks (matches the base-game survivor QC)."""
+    lines = [
+        '$ikchain "rhand" "ValveBiped.Bip01_R_Hand" knee 0.707 0.707 0 \n',
+        '$ikchain "lhand" "ValveBiped.Bip01_L_Hand" knee 0.707 0.707 0 \n',
+        '$ikchain "rfoot" "ValveBiped.Bip01_R_Foot" knee 0.707 -0.707 0 \n',
+        '$ikchain "lfoot" "ValveBiped.Bip01_L_Foot" knee 0.707 -0.707 0 \n',
+    ]
+    if "ValveBiped.weapon_bone_Clip" in model_bones:
+        lines.append('$ikchain "ikclip" "ValveBiped.weapon_bone_Clip" knee 0.707 -0.707 0 \n')
+    lines.append("\n")
+    lines.append('$ikautoplaylock "rfoot" 1 0.1 \n')
+    lines.append('$ikautoplaylock "lfoot" 1 0.1 \n\n')
+    return lines
+
+
+def l4d2_character_modelname(slot: str) -> str:
+    return f"survivors/survivor_{normalize_survivor(slot)}.mdl"
+
+
+def l4d2_arms_modelname(slot: str) -> str:
+    return f"weapons/arms/v_arms_{normalize_survivor(slot)}_new.mdl"
 
 
 def gendered_reference_name(plan: dict, anims_dir: Path, warnings: list | None = None) -> str:
@@ -488,6 +613,67 @@ def detect_gmod(explicit_root: str = "", explicit_studiomdl: str = "") -> dict[s
             hit["checked"] = checked
             return hit
     return {"install_root": "", "game_dir": "", "studiomdl_path": "", "source": "not_found", "checked": checked}
+
+
+def validate_l4d2_root(root: Path) -> dict[str, str] | None:
+    # The install root is the "Left 4 Dead 2" folder (holds bin/studiomdl.exe);
+    # the game dir is its "left4dead2" subfolder (holds gameinfo.txt).
+    if root.name.lower() == "left4dead2" and (root / "gameinfo.txt").exists():
+        install_root = root.parent
+        game_dir = root
+    else:
+        install_root = root
+        game_dir = root / "left4dead2"
+    studiomdl = install_root / "bin" / "studiomdl.exe"
+    if studiomdl.exists() and (game_dir / "gameinfo.txt").exists():
+        return {"install_root": str(install_root), "game_dir": str(game_dir), "studiomdl_path": str(studiomdl)}
+    return None
+
+
+def detect_l4d2(explicit_root: str = "", explicit_studiomdl: str = "") -> dict[str, Any]:
+    candidates: list[Path] = []
+    if explicit_studiomdl:
+        exe = Path(explicit_studiomdl)
+        if exe.exists():
+            hit = validate_l4d2_root(exe.parent.parent)
+            if hit:
+                hit["source"] = "explicit_studiomdl"
+                return hit
+    for raw in [explicit_root, os.environ.get("L4D2_PATH", ""), os.environ.get("LEFT4DEAD2_PATH", "")]:
+        if raw:
+            candidates.append(Path(raw))
+    env_studiomdl = os.environ.get("STUDIOMDL", "")
+    if env_studiomdl:
+        exe = Path(env_studiomdl)
+        if exe.exists():
+            candidates.append(exe.parent.parent)
+    for library in steam_library_roots():
+        candidates.append(library / "steamapps" / "common" / "Left 4 Dead 2")
+    seen: set[str] = set()
+    checked: list[str] = []
+    for candidate in candidates:
+        try:
+            candidate = candidate.resolve()
+        except Exception:
+            pass
+        key = str(candidate).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        checked.append(str(candidate))
+        hit = validate_l4d2_root(candidate)
+        if hit:
+            hit["source"] = "detected"
+            hit["checked"] = checked
+            return hit
+    return {"install_root": "", "game_dir": "", "studiomdl_path": "", "source": "not_found", "checked": checked}
+
+
+def detect_game(game: str, explicit_root: str = "", explicit_studiomdl: str = "") -> dict[str, Any]:
+    """Detect the Source install (studiomdl + game dir) for the target game."""
+    if normalize_game(game) == "l4d2":
+        return detect_l4d2(explicit_root, explicit_studiomdl)
+    return detect_gmod(explicit_root, explicit_studiomdl)
 
 
 def find_vtfcmd() -> Path | None:
@@ -1300,7 +1486,7 @@ def load_smds(smd_files: list[str]) -> tuple[list[SmdData], dict[int, SmdNode]]:
     return smds, nodes
 
 
-def analyze(input_path: Path, author: str = "", category: str = "", model_name: str = "", gmod_root: str = "", studiomdl_path: str = "", gender: str = "female") -> dict[str, Any]:
+def analyze(input_path: Path, author: str = "", category: str = "", model_name: str = "", gmod_root: str = "", studiomdl_path: str = "", gender: str = "female", game: str = "gmod", survivor: str = DEFAULT_L4D2_SURVIVOR) -> dict[str, Any]:
     paths = qc_paths_for_input(input_path)
     qc_dir = paths["qc_dir"]
     qc_dir.mkdir(parents=True, exist_ok=True)
@@ -1345,9 +1531,11 @@ def analyze(input_path: Path, author: str = "", category: str = "", model_name: 
     texture_map = build_texture_map(texture_manifest)
     materials, model_preview = build_preview(smds, texture_map)
     bones_preview = bone_preview(nodes)
-    gmod = detect_gmod(gmod_root, studiomdl_path)
+    game = normalize_game(game)
+    gmod = detect_game(game, gmod_root, studiomdl_path)
     if not gmod.get("studiomdl_path"):
-        warnings.append("Garry's Mod StudioMDL was not detected; compile will require manual selection.")
+        game_label = "Left 4 Dead 2" if game == "l4d2" else "Garry's Mod"
+        warnings.append(f"{game_label} StudioMDL was not detected; compile will require manual selection.")
     physics_globals, physics_rows, physics_collision_text_lines = physics_plan_from_qc_lines(collision_qc_block({"inputs": discovered}))
 
     workspace_name = Path(discovered["workspace_root"]).name
@@ -1383,6 +1571,8 @@ def analyze(input_path: Path, author: str = "", category: str = "", model_name: 
         "character_category": safe_category,
         "model_name": default_model,
         "gender": normalize_gender(gender),
+        "game": game,
+        "survivor": normalize_survivor(survivor),
         "display_name": display_from_identifier(strip_model_hash_suffix(default_model), "Mmd Model"),
         "category_readable": category_display_from_identifier(safe_category, "Sheepy Lord"),
         "gmod": gmod,
@@ -1523,6 +1713,12 @@ def prepare_qc_source(plan: dict[str, Any]) -> Path:
 
 
 def qc_model_header(plan: dict[str, Any], pm: bool = False, arms: bool = False) -> list[str]:
+    # L4D2 requires exact, non-custom model paths: the character is
+    # survivors/survivor_<slot>.mdl and the arms are weapons/arms/v_arms_<slot>_new.mdl.
+    if normalize_game(plan.get("game")) == "l4d2":
+        slot = normalize_survivor(plan.get("survivor"))
+        name = l4d2_arms_modelname(slot) if arms else l4d2_character_modelname(slot)
+        return [f'$modelname "{name}" \n\n']
     author = str(plan["author"])
     category = str(plan["character_category"])
     model = str(plan["model_name"])
@@ -1811,7 +2007,9 @@ def base_qc_lines(
     include_hboxes: list[str] | None = None,
     include_collision: bool = False,
     include_flexes: bool = True,
+    for_definebone_capture: bool = False,
 ) -> list[str]:
+    l4d2 = normalize_game(plan.get("game")) == "l4d2"
     lines: list[str] = []
     lines.append('// Created by MMD Character Importer Step 14\n\n')
     lines.extend(qc_model_header(plan, pm=pm))
@@ -1819,7 +2017,14 @@ def base_qc_lines(
     lines.extend(bodygroup_qc_blocks(source_dir, include_flexes=include_flexes, bodygroups=bodygroups))
     lines.append('$surfaceprop "flesh" \n\n')
     lines.append('$contents "solid" \n\n')
-    lines.append("$illumposition -0.637 0 35.954 \n\n")
+    if l4d2:
+        # L4D2 survivor head/eye conventions.
+        lines.append("$illumposition 0 -0.861 33.401 \n\n")
+        lines.append("$eyeposition 0 0 60 \n")
+        lines.append("$maxeyedeflection 30 \n")
+        lines.append("$forcephonemecrossfade \n\n")
+    else:
+        lines.append("$illumposition -0.637 0 35.954 \n\n")
     lines.append("$ambientboost \n\n")
     lines.append("$mostlyopaque \n\n")
     lines.append(f'$cdmaterials "models/{plan["author"]}/{plan["model_name"]}/" \n\n')
@@ -1831,20 +2036,48 @@ def base_qc_lines(
         if lines and not lines[-1].endswith("\n\n"):
             lines.append("\n")
     if include_hboxes:
+        if l4d2:
+            # L4D2 survivors use a named "L4D" hitbox set.
+            lines.append('$hboxset "L4D" \n')
         lines.extend(include_hboxes)
         if lines and not lines[-1].endswith("\n\n"):
             lines.append("\n")
     if include_jiggles:
         lines.extend(include_jiggles)
         lines.append("\n")
+    if l4d2:
+        lines.append('$poseparameter "body_pitch" -90 90 loop 360 \n')
+        lines.append('$poseparameter "body_yaw" -90 90 loop 360 \n')
+        lines.append('$poseparameter "head_pitch" -90 90 loop 360 \n')
+        lines.append('$poseparameter "head_yaw" -90 90 loop 360 \n\n')
     if (source_dir / "vrd.vrd").exists():
         lines.append('$proceduralbones "vrd.vrd"\n\n')
-    lines.append('$ikchain "rhand" "ValveBiped.Bip01_R_Hand" knee 0.707 0.707 0 \n')
-    lines.append('$ikchain "lhand" "ValveBiped.Bip01_L_Hand" knee 0.707 0.707 0 \n')
-    lines.append('$ikchain "rfoot" "ValveBiped.Bip01_R_Foot" knee 0.707 -0.707 0 \n')
-    lines.append('$ikchain "lfoot" "ValveBiped.Bip01_L_Foot" knee 0.707 -0.707 0 \n\n')
-    lines.append('$ikautoplaylock "rfoot" 0.7 0.1 \n')
-    lines.append('$ikautoplaylock "lfoot" 0.7 0.1 \n\n')
+    if l4d2:
+        # L4D2 survivor weapon/item placement + IK. Without these $attachments the game has
+        # nowhere to place the held weapon and drops it at the model origin; the survivor IK set
+        # (incl. the "ikclip" weapon chain and ikautoplaylock 1) matches the base-game survivor.
+        survivor_bones = l4d2_survivor_skeleton_bones(plan.get("survivor"))
+        attachment_lines = l4d2_attachment_lines(survivor_bones)
+        if attachment_lines:
+            lines.extend(attachment_lines)
+            lines.append("\n")
+        # IMPORTANT: omit $ikchain/$ikautoplaylock from the `-definebones` capture pass for L4D2.
+        # Our L4D2 base armature is extracted from the base-game survivor's *compiled* .mdl, whose
+        # bind pose is already post-IK-realignment. Declaring $ikchain here makes studiomdl realign
+        # the left leg / hands a SECOND time, snapping the left calf into a 90deg quadrant and
+        # garbling the left foot + right hand. We capture the definebones WITHOUT ik (clean bind),
+        # then re-add the ik chains in the real compile (definebones lock the bind, so the real
+        # compile stays clean). The base-game/gold ports avoid this by using a clean canonical
+        # reference where the realignment is idempotent.
+        if not for_definebone_capture:
+            lines.extend(l4d2_ik_lines(survivor_bones))
+    else:
+        lines.append('$ikchain "rhand" "ValveBiped.Bip01_R_Hand" knee 0.707 0.707 0 \n')
+        lines.append('$ikchain "lhand" "ValveBiped.Bip01_L_Hand" knee 0.707 0.707 0 \n')
+        lines.append('$ikchain "rfoot" "ValveBiped.Bip01_R_Foot" knee 0.707 -0.707 0 \n')
+        lines.append('$ikchain "lfoot" "ValveBiped.Bip01_L_Foot" knee 0.707 -0.707 0 \n\n')
+        lines.append('$ikautoplaylock "rfoot" 0.7 0.1 \n')
+        lines.append('$ikautoplaylock "lfoot" 0.7 0.1 \n\n')
     reference_name = gendered_reference_name(plan, source_dir / "anims")
     lines.append(f'$sequence reference "anims/{reference_name}" fps 1 \n')
     lines.append('$origin 0 0 -2.50 \n\n')
@@ -1857,9 +2090,16 @@ def base_qc_lines(
     lines.append('\tfadeout 0.2\n')
     lines.append('\tfps 60\n')
     lines.append('}\n\n')
-    gender_includes = GENDER_ANIMATION_INCLUDES[normalize_gender(plan.get("gender"))]
-    for include in (gender_includes["player"] if pm else gender_includes["npc"]):
-        lines.append(f'$includemodel "{include}" \n')
+    if l4d2:
+        # Include the base-game survivor animation set for the selected slot so
+        # the model animates with that survivor's movement/gesture animations.
+        slot = normalize_survivor(plan.get("survivor"))
+        lines.append(f'$includemodel "survivors/anim_{slot}.mdl" \n')
+        lines.append(f'$includemodel "survivors/gestures_{slot}.mdl" \n')
+    else:
+        gender_includes = GENDER_ANIMATION_INCLUDES[normalize_gender(plan.get("gender"))]
+        for include in (gender_includes["player"] if pm else gender_includes["npc"]):
+            lines.append(f'$includemodel "{include}" \n')
     lines.append("\n")
     if include_collision and (source_dir / "Physics.smd").exists():
         lines.extend(collision_qc_block(plan))
@@ -3518,6 +3758,131 @@ def package_addon_gma(addon_dir: Path, output_gma: Path, gmod: dict[str, Any], l
             shutil.rmtree(scratch, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# L4D2 packaging helpers (VPK + addoninfo). The character/arms compiled outputs
+# live at the exact survivor paths (models/survivors, models/weapons/arms), not
+# the author namespace, so L4D2 uses dedicated clean/copy helpers.
+# ---------------------------------------------------------------------------
+
+def l4d2_compiled_relpaths(slot: str, has_arms: bool) -> list[str]:
+    """Compiled output relative paths (under models/) for the L4D2 survivor."""
+    slot = normalize_survivor(slot)
+    rels = [f"survivors/survivor_{slot}"]
+    if has_arms:
+        rels.append(f"weapons/arms/v_arms_{slot}_new")
+    return rels
+
+
+def clean_expected_compiled_l4d2(game_dir: Path, slot: str, has_arms: bool) -> None:
+    for rel in l4d2_compiled_relpaths(slot, has_arms):
+        for ext in COMPILED_EXTENSIONS:
+            path = game_dir / "models" / f"{rel}{ext}"
+            if path.exists():
+                path.unlink()
+
+
+def copy_compiled_outputs_l4d2(game_dir: Path, addon_dir: Path, slot: str, has_arms: bool) -> tuple[list[dict[str, Any]], list[str]]:
+    files: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for rel in l4d2_compiled_relpaths(slot, has_arms):
+        src_base = game_dir / "models" / rel
+        dst_base = addon_dir / "models" / rel
+        dst_base.parent.mkdir(parents=True, exist_ok=True)
+        found = False
+        for ext in COMPILED_EXTENSIONS:
+            src = src_base.with_name(src_base.name + ext)
+            if src.exists():
+                dst = dst_base.with_name(dst_base.name + ext)
+                shutil.copyfile(src, dst)
+                files.append(file_row(dst, "compiled_model"))
+                found = True
+        if not found:
+            errors.append(f"Compiled L4D2 model files not found for models/{rel} in {game_dir}")
+    return files, errors
+
+
+def write_l4d2_addoninfo(plan: dict[str, Any], addon_dir: Path) -> Path:
+    """Write the L4D2 addoninfo.txt (the VPK addon manifest)."""
+    slot = normalize_survivor(plan.get("survivor"))
+    survivor_display = {"producer": "Rochelle", "coach": "Coach", "gambler": "Nick", "mechanic": "Ellis"}.get(slot, slot)
+    title = str(plan.get("display_name") or plan.get("model_name") or "MMD Survivor")
+    author = str(plan.get("author") or "MMD Character Importer")
+    path = addon_dir / "addoninfo.txt"
+    lines = [
+        '"AddonInfo"',
+        "{",
+        "addonSteamAppID         550",
+        f'addontitle "{title}"',
+        "addonversion 1.0",
+        f'addontagline "survivor,{survivor_display}"',
+        f'addonauthor "{author}"',
+        f'addonDescription "Replaces {survivor_display}"',
+        "addonContent_Survivor 1",
+        "}",
+        "",
+    ]
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+def find_vpk_executable(gmod: dict[str, Any]) -> Path:
+    candidates: list[Path] = []
+    install_root = Path(str(gmod.get("install_root") or ""))
+    game_dir = Path(str(gmod.get("game_dir") or ""))
+    if install_root:
+        candidates.append(install_root / "bin" / "vpk.exe")
+    if game_dir:
+        candidates.append(game_dir.parent / "bin" / "vpk.exe")
+        candidates.append(game_dir / "bin" / "vpk.exe")
+    found = shutil.which("vpk.exe") or shutil.which("vpk")
+    if found:
+        candidates.append(Path(found))
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    searched = ", ".join(str(c) for c in candidates if str(c))
+    raise FileNotFoundError(f"vpk.exe was not found. Searched: {searched or 'PATH'}")
+
+
+def package_addon_vpk(addon_dir: Path, output_vpk: Path, gmod: dict[str, Any], log_path: Path) -> Path:
+    """Pack the composed addon folder into a single .vpk using L4D2's vpk.exe.
+
+    `vpk.exe <folder>` produces `<folder>.vpk` next to the folder; we then move it
+    to the requested output path.
+
+    vpk.exe converts its path argument to the system ANSI codepage internally and fails
+    (prints its usage banner and exits 1) when the path contains characters that don't
+    round-trip in that codepage — e.g. a workspace named with an em dash / fullwidth
+    parentheses. So when the addon folder or the output path is non-ASCII, stage the
+    packaging through an ASCII scratch directory, exactly like package_addon_gma.
+    """
+    vpk = find_vpk_executable(gmod)
+    output_vpk = output_vpk.with_suffix(".vpk")
+    output_vpk.parent.mkdir(parents=True, exist_ok=True)
+    if output_vpk.exists():
+        output_vpk.unlink()
+    actual_addon_dir = addon_dir
+    scratch: Path | None = None
+    try:
+        if not path_is_ascii(addon_dir) or not path_is_ascii(output_vpk):
+            scratch = external_safe_dir_for(output_vpk, "vpk")
+            if scratch.exists():
+                shutil.rmtree(scratch)
+            scratch.mkdir(parents=True, exist_ok=True)
+            actual_addon_dir = scratch / safe_name(addon_dir.name, "addon")
+            copytree_clean(addon_dir, actual_addon_dir)
+            emit(f"Staging VPK packaging through ASCII path: {actual_addon_dir}")
+        returncode, output = run_command([str(vpk), str(actual_addon_dir)], log_path, cwd=actual_addon_dir.parent)
+        produced = actual_addon_dir.with_name(actual_addon_dir.name + ".vpk")
+        if returncode != 0 or not produced.exists():
+            raise RuntimeError(f"vpk.exe failed (exit {returncode}) or did not write {produced}. Output:\n{output}")
+        shutil.move(str(produced), str(output_vpk))
+        return output_vpk
+    finally:
+        if scratch is not None and scratch.exists():
+            shutil.rmtree(scratch, ignore_errors=True)
+
+
 def build_carms_qc(plan: dict[str, Any], source_dir: Path, definebones: list[str]) -> Path | None:
     carms_dir = Path(str(plan.get("inputs", {}).get("step10_dir") or ""))
     if not carms_dir.exists():
@@ -3554,7 +3919,12 @@ def build_carms_qc(plan: dict[str, Any], source_dir: Path, definebones: list[str
     lines.append('$animation a_proportions "anims/proportions" subtract reference 0 \n\n')
     lines.append('$sequence proportions a_proportions predelta autoplay \n\n')
     lines.append('$Sequence "ragdoll" {\n\t"anims/proportions"\n\tactivity "ACT_DIERAGDOLL" 1\n\tfadein 0.2\n\tfadeout 0.2\n\tfps 60\n}\n\n')
-    lines.append('$includemodel "weapons/c_arms_animations.mdl" \n')
+    if normalize_game(plan.get("game")) == "l4d2":
+        # L4D2 first-person arms (v_arms_<slot>_new): a static idle from the
+        # proportion pose; the arms bonemerge onto the weapon viewmodel at runtime.
+        lines.append('$sequence "idle" {\n\t"anims/proportions"\n\tfadein 0.2\n\tfadeout 0.2\n\tfps 30\n}\n')
+    else:
+        lines.append('$includemodel "weapons/c_arms_animations.mdl" \n')
     qc = carms_work / "pm_carms.qc"
     write_lines(qc, lines)
     return qc
@@ -3601,9 +3971,11 @@ def compose(plan_path: Path) -> dict[str, Any]:
     author = str(plan["author"])
     category = str(plan["character_category"])
     model = str(plan["model_name"])
+    l4d2 = normalize_game(plan.get("game")) == "l4d2"
+    survivor_slot = normalize_survivor(plan.get("survivor"))
 
     initial_qc = source_dir / "compile_initial.qc"
-    write_lines(initial_qc, base_qc_lines(plan, source_dir, pm=False, include_flexes=False))
+    write_lines(initial_qc, base_qc_lines(plan, source_dir, pm=False, include_flexes=False, for_definebone_capture=True))
     define_log = qc_dir / "compile_definebones.log"
     emit("Running studiomdl -definebones.")
     code, define_output = run_command([str(studiomdl), "-game", str(game_dir), "-definebones", "-nop4", "-verbose", str(initial_qc)], define_log, cwd=source_dir)
@@ -3790,7 +4162,8 @@ def compose(plan_path: Path) -> dict[str, Any]:
             raise RuntimeError(f"StudioMDL missing parent definebone retry did not clear warnings for {qc_path.name}. See {retry_log}")
         return retry_output, True
 
-    stems = [model, f"{model}_pm"]
+    # L4D2 compiles a single survivor model (no GMod-style "_pm" playermodel).
+    stems = [model] if l4d2 else [model, f"{model}_pm"]
     if carms_qc:
         stems.append(f"{model}_arms")
 
@@ -3805,12 +4178,14 @@ def compose(plan_path: Path) -> dict[str, Any]:
             main_qc,
             compile_log_path("compile_main", log_suffix),
         )
-        emit("Compiling player model.")
-        _pm_output, pm_repaired = compile_with_definebone_repair(
-            f"player{('_' + log_suffix) if log_suffix else ''}",
-            pm_qc,
-            compile_log_path("compile_pm", log_suffix),
-        )
+        pm_repaired = False
+        if not l4d2:
+            emit("Compiling player model.")
+            _pm_output, pm_repaired = compile_with_definebone_repair(
+                f"player{('_' + log_suffix) if log_suffix else ''}",
+                pm_qc,
+                compile_log_path("compile_pm", log_suffix),
+            )
         if pm_repaired:
             emit("Recompiling main model after player-model definebone repair.")
             _main_output, _main_repaired_after_pm = compile_with_definebone_repair(
@@ -3826,17 +4201,18 @@ def compose(plan_path: Path) -> dict[str, Any]:
                 compile_log_path("compile_carms", log_suffix),
             )
             if carms_repaired:
-                emit("Recompiling main and player models after c_arms definebone repair.")
+                emit("Recompiling main model after c_arms definebone repair.")
                 _main_output, _ = compile_with_definebone_repair(
                     f"main_after_carms_repair{('_' + log_suffix) if log_suffix else ''}",
                     main_qc,
                     compile_log_path("compile_main_after_carms_definebone_repair", log_suffix),
                 )
-                _pm_output, _ = compile_with_definebone_repair(
-                    f"player_after_carms_repair{('_' + log_suffix) if log_suffix else ''}",
-                    pm_qc,
-                    compile_log_path("compile_pm_after_carms_definebone_repair", log_suffix),
-                )
+                if not l4d2:
+                    _pm_output, _ = compile_with_definebone_repair(
+                        f"player_after_carms_repair{('_' + log_suffix) if log_suffix else ''}",
+                        pm_qc,
+                        compile_log_path("compile_pm_after_carms_definebone_repair", log_suffix),
+                    )
 
     if not carms_qc:
         warnings.append("Step 10 c_arms output was not found; c_arms QC and Lua hands registration were skipped.")
@@ -3851,7 +4227,10 @@ def compose(plan_path: Path) -> dict[str, Any]:
         if not flex_compile_enabled:
             suffix_parts.append("no_flex")
         log_suffix = "_".join(suffix_parts)
-        clean_expected_compiled(compile_game_dir, author, category, stems)
+        if l4d2:
+            clean_expected_compiled_l4d2(compile_game_dir, survivor_slot, carms_qc is not None)
+        else:
+            clean_expected_compiled(compile_game_dir, author, category, stems)
         try:
             compile_all_models(log_suffix)
             successful_compile_log_suffix = log_suffix
@@ -3896,6 +4275,12 @@ def compose(plan_path: Path) -> dict[str, Any]:
                     emit("WARNING: " + warning)
                     carms_qc = refresh_compile_qcs()
                     continue
+            if l4d2 and is_collision_block_parser_failure(exc):
+                # No GMod-studiomdl fallback for L4D2 (it would compile against the
+                # wrong game dir); surface the failure directly.
+                raise RuntimeError(
+                    f"L4D2 StudioMDL rejected the physics collision block. See {exc.log_path}"
+                ) from exc
             if not fallback_compile_used and is_collision_block_parser_failure(exc):
                 fallback_candidates = fallback_gmod_compile_candidates(gmod)
                 if not fallback_candidates:
@@ -3939,41 +4324,71 @@ def compose(plan_path: Path) -> dict[str, Any]:
         prune_extra_compile_source_qc(compile_source_copy_dir)
     except Exception as exc:
         errors.append(f"Failed to copy QC compile source folder: {exc}")
-    compiled_files, compiled_errors = copy_compiled_outputs(compile_game_dir, addon_dir, author, category, stems)
+    if l4d2:
+        compiled_files, compiled_errors = copy_compiled_outputs_l4d2(compile_game_dir, addon_dir, survivor_slot, carms_qc is not None)
+    else:
+        compiled_files, compiled_errors = copy_compiled_outputs(compile_game_dir, addon_dir, author, category, stems)
     generated_files.extend(compiled_files)
     errors.extend(compiled_errors)
     material_files, material_warnings, material_errors = compose_materials(plan, addon_dir)
     generated_files.extend(material_files)
     warnings.extend(material_warnings)
     errors.extend(material_errors)
-    icon_files, icon_warnings = compose_icons(plan, addon_dir)
-    generated_files.extend(icon_files)
-    warnings.extend(icon_warnings)
-    lua_path = write_lua(plan, addon_dir, carms_qc is not None)
-    generated_files.append(file_row(lua_path, "lua"))
     include_mci_metadata_json = bool(plan.get("include_mci_metadata_json", True))
     simple_vrd_immunity_path: Path | None = None
     dynamic_model_manifest_path: Path | None = None
-    if include_mci_metadata_json:
-        simple_vrd_immunity_path = write_simple_vrd_immunity(plan, addon_dir, carms_qc is not None)
-        generated_files.append(file_row(simple_vrd_immunity_path, "simple_vrd_immunity"))
-        dynamic_model_manifest_path = write_dynamic_model_importer_manifest(plan, addon_dir, carms_qc is not None)
-        generated_files.append(file_row(dynamic_model_manifest_path, "dynamic_model_importer_manifest"))
+    if l4d2:
+        # L4D2 uses a VPK addoninfo.txt manifest; GMod-only spawn icons / lua /
+        # MCI metadata / addon.json are skipped.
+        addoninfo_path = write_l4d2_addoninfo(plan, addon_dir)
+        generated_files.append(file_row(addoninfo_path, "addoninfo"))
+        warnings.append("L4D2 survivor select-panel images (vgui/s_panel_<slot>*) are not generated yet.")
     else:
-        emit("Skipping MMD Character Importer metadata JSON files by user request.")
-    addon_json = addon_dir / "addon.json"
-    addon_json.write_text(json.dumps({"title": f"{model}_public_version", "type": "model", "tags": ["cartoon", "fun"]}, indent=4), encoding="utf-8")
-    generated_files.append(file_row(addon_json, "addon_json"))
+        icon_files, icon_warnings = compose_icons(plan, addon_dir)
+        generated_files.extend(icon_files)
+        warnings.extend(icon_warnings)
+        lua_path = write_lua(plan, addon_dir, carms_qc is not None)
+        generated_files.append(file_row(lua_path, "lua"))
+        if include_mci_metadata_json:
+            simple_vrd_immunity_path = write_simple_vrd_immunity(plan, addon_dir, carms_qc is not None)
+            generated_files.append(file_row(simple_vrd_immunity_path, "simple_vrd_immunity"))
+            dynamic_model_manifest_path = write_dynamic_model_importer_manifest(plan, addon_dir, carms_qc is not None)
+            generated_files.append(file_row(dynamic_model_manifest_path, "dynamic_model_importer_manifest"))
+        else:
+            emit("Skipping MMD Character Importer metadata JSON files by user request.")
+        addon_json = addon_dir / "addon.json"
+        addon_json.write_text(json.dumps({"title": f"{model}_public_version", "type": "model", "tags": ["cartoon", "fun"]}, indent=4), encoding="utf-8")
+        generated_files.append(file_row(addon_json, "addon_json"))
 
-    required_lua = addon_dir / "lua" / "autorun" / f"{model}_{author}.lua"
-    if not required_lua.exists():
-        errors.append("Lua autorun file was not written.")
-    model_dir = addon_dir / "models" / author / category
-    if not (model_dir / f"{model}.mdl").exists() or not (model_dir / f"{model}_pm.mdl").exists():
-        errors.append("Main or player-model .mdl output is missing from the final addon folder.")
+    if l4d2:
+        for rel in l4d2_compiled_relpaths(survivor_slot, carms_qc is not None):
+            if not (addon_dir / "models" / f"{rel}.mdl").exists():
+                errors.append(f"L4D2 compiled .mdl missing from addon folder: models/{rel}.mdl")
+    else:
+        required_lua = addon_dir / "lua" / "autorun" / f"{model}_{author}.lua"
+        if not required_lua.exists():
+            errors.append("Lua autorun file was not written.")
+        model_dir = addon_dir / "models" / author / category
+        if not (model_dir / f"{model}.mdl").exists() or not (model_dir / f"{model}_pm.mdl").exists():
+            errors.append("Main or player-model .mdl output is missing from the final addon folder.")
     mat_dir = addon_dir / "materials" / "models" / author / model
     if not any(mat_dir.glob("*.vmt")):
         warnings.append("No material VMT files were written.")
+
+    # L4D2 ships as a single .vpk; the unpacked addon folder is not needed in-game. Package the
+    # VPK once here and deliver ONLY that file to the distribution folder and the game addons
+    # (below). GMod keeps copying the unpacked addon folder + a .gma.
+    l4d2_vpk_path: Path | None = None
+    if l4d2:
+        try:
+            emit("Packaging final addon VPK.")
+            l4d2_vpk_path = package_addon_vpk(
+                addon_dir, qc_dir / f"survivor_{survivor_slot}_{model}.vpk", gmod, qc_dir / "vpk_create.log"
+            )
+            generated_files.append(file_row(l4d2_vpk_path, "vpk_package"))
+            emit(f"Wrote VPK package: {l4d2_vpk_path}")
+        except Exception as exc:
+            errors.append(f"Failed to package addon VPK: {exc}")
 
     distribution_output_dir = Path(str(plan.get("distribution_output_dir") or "")).expanduser()
     distribution_addon_dir = Path("")
@@ -3990,12 +4405,14 @@ def compose(plan_path: Path) -> dict[str, Any]:
             if compile_source_copy_dir.exists() and path_is_inside(distribution_output_dir, compile_source_copy_dir):
                 raise RuntimeError("The selected distribution folder cannot be inside the QC compile source folder.")
             distribution_output_dir.mkdir(parents=True, exist_ok=True)
-            distribution_addon_dir = distribution_output_dir / addon_dir.name
-            if same_resolved_path(distribution_addon_dir, addon_dir):
-                generated_files.append(folder_row(distribution_addon_dir, "distribution_addon_folder", ["Already composed in this folder."]))
-            else:
-                copytree_clean(addon_dir, distribution_addon_dir)
-                generated_files.append(folder_row(distribution_addon_dir, "distribution_addon_folder"))
+            if not l4d2:
+                # L4D2 delivers only the .vpk (below); the unpacked addon folder is not needed.
+                distribution_addon_dir = distribution_output_dir / addon_dir.name
+                if same_resolved_path(distribution_addon_dir, addon_dir):
+                    generated_files.append(folder_row(distribution_addon_dir, "distribution_addon_folder", ["Already composed in this folder."]))
+                else:
+                    copytree_clean(addon_dir, distribution_addon_dir)
+                    generated_files.append(folder_row(distribution_addon_dir, "distribution_addon_folder"))
             if compile_source_copy_dir.exists():
                 distribution_compile_source_dir = distribution_compile_source_copy_dir(distribution_output_dir, model, author)
                 if same_resolved_path(distribution_compile_source_dir, compile_source_copy_dir):
@@ -4003,31 +4420,53 @@ def compose(plan_path: Path) -> dict[str, Any]:
                 else:
                     copytree_clean(compile_source_copy_dir, distribution_compile_source_dir)
                     generated_files.append(folder_row(distribution_compile_source_dir, "distribution_qc_compile_source"))
-            emit("Packaging final addon GMA.")
-            distribution_gma = distribution_output_dir / f"{model}_{author}.gma"
-            distribution_gma = package_addon_gma(addon_dir, distribution_gma, gmod, qc_dir / "gmad_create.log")
-            generated_files.append(file_row(distribution_gma, "gma_package"))
-            emit(f"Wrote GMA package: {distribution_gma}")
+            if l4d2:
+                # Deliver only the .vpk packaged above; the unpacked folder is omitted.
+                if l4d2_vpk_path and l4d2_vpk_path.exists():
+                    distribution_gma = distribution_output_dir / l4d2_vpk_path.name
+                    if not same_resolved_path(distribution_gma, l4d2_vpk_path):
+                        shutil.copyfile(l4d2_vpk_path, distribution_gma)
+                    generated_files.append(file_row(distribution_gma, "vpk_package"))
+                    emit(f"Copied VPK package to distribution folder: {distribution_gma}")
+            else:
+                emit("Packaging final addon GMA.")
+                distribution_gma = distribution_output_dir / f"{model}_{author}.gma"
+                distribution_gma = package_addon_gma(addon_dir, distribution_gma, gmod, qc_dir / "gmad_create.log")
+                generated_files.append(file_row(distribution_gma, "gma_package"))
+                emit(f"Wrote GMA package: {distribution_gma}")
         except Exception as exc:
             errors.append(f"Failed to copy/package addon to selected output folder: {exc}")
 
     if bool(plan.get("copy_to_gmod_addons", False)):
-        emit("Installing composed addon folder to detected GMod addons folder.")
         try:
             gmod_game_dir = Path(str(gmod.get("game_dir") or ""))
             if not gmod_game_dir.exists():
-                raise RuntimeError(f"GMod game directory was not found: {gmod_game_dir}")
+                raise RuntimeError(f"Game directory was not found: {gmod_game_dir}")
             gmod_addons_dir = gmod_game_dir / "addons"
             gmod_addons_dir.mkdir(parents=True, exist_ok=True)
-            gmod_addon_dir = gmod_addons_dir / addon_dir.name
-            if same_resolved_path(gmod_addon_dir, addon_dir):
-                generated_files.append(folder_row(gmod_addon_dir, "gmod_addons_folder", ["Already composed in this folder."]))
+            if l4d2:
+                # L4D2 installs the single .vpk into addons/; the unpacked folder is not needed.
+                emit("Installing addon VPK to detected L4D2 addons folder.")
+                if l4d2_vpk_path and l4d2_vpk_path.exists():
+                    installed_vpk = gmod_addons_dir / l4d2_vpk_path.name
+                    if not same_resolved_path(installed_vpk, l4d2_vpk_path):
+                        shutil.copyfile(l4d2_vpk_path, installed_vpk)
+                    generated_files.append(file_row(installed_vpk, "gmod_addons_vpk"))
+                    gmod_addon_dir = gmod_addons_dir  # report/open points at the addons folder
+                    emit(f"Installed addon VPK: {installed_vpk}")
+                else:
+                    errors.append("L4D2 addon VPK was not packaged, so nothing was installed to the addons folder.")
             else:
-                copytree_clean(addon_dir, gmod_addon_dir)
-                generated_files.append(folder_row(gmod_addon_dir, "gmod_addons_folder"))
-            emit(f"Installed composed addon folder: {gmod_addon_dir}")
+                emit("Installing composed addon folder to detected GMod addons folder.")
+                gmod_addon_dir = gmod_addons_dir / addon_dir.name
+                if same_resolved_path(gmod_addon_dir, addon_dir):
+                    generated_files.append(folder_row(gmod_addon_dir, "gmod_addons_folder", ["Already composed in this folder."]))
+                else:
+                    copytree_clean(addon_dir, gmod_addon_dir)
+                    generated_files.append(folder_row(gmod_addon_dir, "gmod_addons_folder"))
+                emit(f"Installed composed addon folder: {gmod_addon_dir}")
         except Exception as exc:
-            errors.append(f"Failed to copy addon folder to GMod addons: {exc}")
+            errors.append(f"Failed to copy addon to {'L4D2' if l4d2 else 'GMod'} addons: {exc}")
 
     files_json = qc_dir / "qc_files.json"
     report_json = qc_dir / "qc_report.json"
@@ -4131,6 +4570,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--character-category", default="")
     parser.add_argument("--model-name", default="")
     parser.add_argument("--gender", choices=GENDER_CHOICES, default="female")
+    parser.add_argument("--game", choices=GAME_CHOICES, default="gmod")
+    parser.add_argument("--survivor", choices=L4D2_SURVIVOR_SLOTS, default=DEFAULT_L4D2_SURVIVOR)
     parser.add_argument("--gmod-root", default="")
     parser.add_argument("--studiomdl", default="")
     return parser.parse_args()
@@ -4145,7 +4586,7 @@ def main() -> int:
                 pass
     args = parse_args()
     if args.mode == "analyze":
-        result = analyze(args.input, args.author, args.character_category, args.model_name, args.gmod_root, args.studiomdl, args.gender)
+        result = analyze(args.input, args.author, args.character_category, args.model_name, args.gmod_root, args.studiomdl, args.gender, args.game, args.survivor)
         if args.analysis_json and Path(result["paths"]["analysis"]) != args.analysis_json:
             shutil.copyfile(result["paths"]["analysis"], args.analysis_json)
         if Path(result["paths"]["plan"]) != args.plan_json:
