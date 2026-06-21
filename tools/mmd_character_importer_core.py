@@ -57,6 +57,7 @@ BLENDER_SORT_BODYGROUPS_SCRIPT = TOOLS_DIR / "blender_sort_bodygroups.py"
 BLENDER_SORT_FLEXES_SCRIPT = TOOLS_DIR / "blender_sort_flexes.py"
 BLENDER_SORT_COLLISION_SCRIPT = TOOLS_DIR / "blender_sort_collision.py"
 BLENDER_PROPORTION_SCRIPT = TOOLS_DIR / "blender_export_proportion_trick.py"
+BLENDER_DECIMATE_L4D2_SCRIPT = TOOLS_DIR / "blender_decimate_l4d2.py"
 BLENDER_CARMS_SCRIPT = TOOLS_DIR / "blender_sort_carms.py"
 BLENDER_VRD_SCRIPT = TOOLS_DIR / "blender_sort_vrd.py"
 TEXTURE_PROCESSOR_SCRIPT = TOOLS_DIR / "sort_param_textures.py"
@@ -4415,6 +4416,64 @@ def l4d2_reference_skeleton_path(survivor: str) -> Path:
     return L4D2_REFERENCE_SKELETON_DIR / f"{survivor}.smd"
 
 
+# L4D2 polygon budget (triangles). Derived from working vs broken survivor ports: a single
+# bodygroup mesh above ~30k tris renders as an exploding spray in game, and the whole model is
+# unstable above the base-game envelope. Working community ports keep every mesh well under
+# ~27.7k tris and the whole model under ~76k tris; the broken model had a 32.7k-tri mesh and
+# ~100k tris total. These caps (with margin) bring an over-budget L4D2 model back inside the
+# proven-safe envelope. GMod is never decimated (the budget only runs for L4D2).
+L4D2_PER_MESH_TRIS_BUDGET = 25000
+L4D2_TOTAL_TRIS_BUDGET = 70000
+
+
+def run_l4d2_polygon_budget(
+    final_dir: Path,
+    blender_exe: Path,
+    per_mesh_tris: int = L4D2_PER_MESH_TRIS_BUDGET,
+    total_tris: int = L4D2_TOTAL_TRIS_BUDGET,
+    progress: ProgressCallback | None = None,
+    cancel_check: CancelCheck | None = None,
+) -> dict:
+    """L4D2 only: decimate the Step 9 export's bodygroup SMDs to the triangle budget.
+
+    Runs AFTER the proportion export is finished, on the exported SMD files. Meshes that have a
+    paired ``.vta`` (vertex animation / flexes) and the Physics collision SMD are left untouched
+    (the script handles that); decimation re-imposes the <=3-bones-per-vertex limit afterwards.
+    """
+    if not BLENDER_DECIMATE_L4D2_SCRIPT.exists():
+        raise FileNotFoundError(BLENDER_DECIMATE_L4D2_SCRIPT)
+    report_path = final_dir.parent / "l4d2_decimation_report.json"
+    log_path = final_dir.parent / "blender_decimate_l4d2.log"
+    command = [
+        str(blender_exe),
+        "--background",
+        "--factory-startup",
+        "--python-exit-code",
+        "1",
+        "--python",
+        str(BLENDER_DECIMATE_L4D2_SCRIPT),
+        "--",
+        "--export-dir",
+        str(final_dir),
+        "--per-mesh-tris",
+        str(int(per_mesh_tris)),
+        "--total-tris",
+        str(int(total_tris)),
+        "--report-json",
+        str(report_path),
+    ]
+    emit(progress, f"L4D2 polygon budget: decimating bodygroups to <= {per_mesh_tris} tris/mesh, {total_tris} tris total.")
+    run_process_streamed(command, progress=progress, log_path=log_path, cancel_check=cancel_check)
+    if report_path.exists():
+        try:
+            rep = json.loads(report_path.read_text(encoding="utf-8"))
+            emit(progress, f"L4D2 polygon budget: total tris {rep.get('total_tris_before')} -> {rep.get('total_tris_after')} (budget {total_tris}).")
+            return rep
+        except Exception:
+            return {}
+    return {}
+
+
 def run_proportion_export(
     input_blend: Path,
     remove_zero_weight_bones: bool = True,
@@ -4507,6 +4566,17 @@ def run_proportion_export(
     # SMDs are already exported in the survivor's bone convention. No post-export reference
     # overwrite is needed (and doing one would reintroduce a convention mismatch).
     emit(progress, f"Blender proportion export finished in {time.monotonic() - started:.1f}s")
+    # L4D2 only: now that the export is finished, decimate over-budget bodygroup SMDs to L4D2's
+    # safe polygon envelope (a single mesh above ~30k tris / the model above ~76k tris explodes in
+    # game). VTA-flexed meshes and the Physics SMD are left untouched. GMod is never decimated.
+    if str(game or "").strip().lower() == "l4d2":
+        try:
+            decimation = run_l4d2_polygon_budget(
+                final_dir, setup.blender_exe, progress=progress, cancel_check=cancel_check
+            )
+            report["l4d2_polygon_budget"] = decimation
+        except Exception as exc:
+            emit(progress, f"WARNING: L4D2 polygon-budget decimation failed ({exc}); shipping full-resolution meshes.")
     return ProportionResult(
         input_blend=input_blend,
         proportion_dir=proportion_dir,
