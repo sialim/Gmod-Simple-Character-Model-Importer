@@ -3524,6 +3524,9 @@ class ImporterWindow(QtWidgets.QMainWindow):
             self.flex_isolate_bodygroup_check.toggled.connect(lambda _value: self.save_settings())
         self._load_settings()
         self.apply_i18n()
+        # From here on, a target-game switch should re-run apply_i18n() so all GMod/L4D2
+        # brand text (buttons, labels, tabs, titles) relabels live (see apply_game_dependent_defaults).
+        self._i18n_initialized = True
         self.set_advanced_steps_visible(False)
         QtCore.QTimer.singleShot(0, lambda: self._defer_step_preview(1, self.populate_pmx_files))
         QtCore.QTimer.singleShot(0, self.populate_main_pmx_files)
@@ -3724,7 +3727,13 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.apply_game_dependent_defaults()
 
     def on_game_combo_changed(self, source: QtWidgets.QComboBox) -> None:
-        self.set_selected_game(str(source.currentData() or "gmod"))
+        new_game = normalize_game_code(source.currentData() or "gmod")
+        if new_game != getattr(self, "selected_game", "gmod"):
+            # Persist the current game's studiomdl path SYNCHRONOUSLY before the switch reloads
+            # the rows, so the per-game saved paths stay correct even with an unsaved edit in the
+            # field (save_settings() is debounced and would not flush before the reload reads).
+            self.flush_settings()
+        self.set_selected_game(new_game)
         self.settings_store.setValue("selected_game", self.selected_game)
         self.save_settings()
 
@@ -3747,6 +3756,55 @@ class ImporterWindow(QtWidgets.QMainWindow):
             finally:
                 del blocker
         self._refresh_character_selectors()
+        self._refresh_gmod_only_visibility()
+        # On a live target-game switch (not during initial construction): relabel all
+        # GMod<->L4D2 brand text and load the studiomdl path saved for the now-selected game.
+        if getattr(self, "_i18n_initialized", False):
+            self.apply_i18n()
+            self._load_studiomdl_paths_for_game()
+
+    def _refresh_gmod_only_visibility(self) -> None:
+        """Hide GMod-only surfaces when L4D2 is the target: the RTX Remix vertex-limit option
+        (a GMod-only rendering path) and the Model Manager tab (which manages garrysmod/addons
+        folders; L4D2 ports ship as a single .vpk with no such folder to scan)."""
+        l4d2 = getattr(self, "selected_game", "gmod") == "l4d2"
+        for attr in ("main_rtx_bodygroup_limit_check", "bodygroup_rtx_limit_check", "release_rtx_link_edit"):
+            widget = getattr(self, attr, None)
+            if isinstance(widget, QtWidgets.QWidget):
+                widget.setVisible(not l4d2)
+        rtx_label = (getattr(self, "main_form_labels", {}) or {}).get("rtx_vertex_limit")
+        if isinstance(rtx_label, QtWidgets.QWidget):
+            rtx_label.setVisible(not l4d2)
+        tabs = getattr(self, "tabs", None)
+        manager_tab = getattr(self, "model_manager_tab", None)
+        if tabs is not None and manager_tab is not None:
+            manager_index = self.tab_index_for_content_widget(manager_tab)
+            if manager_index is not None and manager_index >= 0:
+                try:
+                    tabs.setTabVisible(manager_index, not l4d2)
+                except AttributeError:
+                    tabs.tabBar().setTabVisible(manager_index, not l4d2)
+                if l4d2 and tabs.currentIndex() == manager_index:
+                    main_index = self.tab_index_for_content_widget(getattr(self, "main_tab", None))
+                    tabs.setCurrentIndex(max(0, main_index))
+
+    def _studiomdl_setting_key(self, base: str, game: str | None = None) -> str:
+        """Per-game QSettings key for a studiomdl/install path. GMod keeps the legacy key for
+        backward compatibility; L4D2 gets a '_l4d2'-suffixed key so each target game remembers
+        its own studiomdl path instead of sharing one and showing the wrong game's path."""
+        resolved = normalize_game_code(game or getattr(self, "selected_game", "gmod"))
+        return base if resolved == "gmod" else f"{base}_{resolved}"
+
+    def _load_studiomdl_paths_for_game(self) -> None:
+        """Load the main + QC studiomdl path rows from the keys saved for the current game."""
+        main_val = str(self.settings_store.value(self._studiomdl_setting_key("main_gmod_path"), "", str) or "")
+        qc_val = str(self.settings_store.value(self._studiomdl_setting_key("qc_gmod_path"), "", str) or "")
+        main_val = main_val or qc_val
+        qc_val = qc_val or main_val
+        if hasattr(self, "main_gmod_row"):
+            self.main_gmod_row.set_value(main_val)
+        if hasattr(self, "qc_gmod_row"):
+            self.qc_gmod_row.set_value(qc_val)
 
     def _make_survivor_combo(self) -> QtWidgets.QComboBox:
         combo = QtWidgets.QComboBox()
@@ -4183,10 +4241,36 @@ class ImporterWindow(QtWidgets.QMainWindow):
         text = self._lookup_i18n(self.i18n_catalog, key) or self._lookup_i18n(self.i18n_fallback, key) or default or key
         if kwargs:
             try:
-                return text.format(**kwargs)
+                text = text.format(**kwargs)
             except Exception:
-                return text
-        return text
+                pass
+        return self._apply_game_brand(text)
+
+    def _apply_game_brand(self, text: str) -> str:
+        """In L4D2 mode, relabel the GMod / Garry's Mod brand tokens in user-visible text to
+        L4D2 / Left 4 Dead 2 so the interface matches the selected target game. Applied centrally
+        to every string that flows through _t()/translate_static_text()/translate_runtime_text(),
+        so buttons, labels, tab titles, dialog titles and messages all relabel together.
+
+        Deliberately CASE-SENSITIVE and brand-token-only: it never touches lowercase path
+        literals ('garrysmod/addons'), output-folder names ('GarrysMod'), the RTX-remix_GMod_Package
+        repo/URL, or internal settings keys (copy_to_gmod_addons, qc_gmod_path, ...). A few strings
+        that intentionally name BOTH games (the game selector's own option label + explainer
+        tooltips) or that describe the GMod-only RTX Remix path are left exactly as authored."""
+        if not text or getattr(self, "selected_game", "gmod") != "l4d2":
+            return text
+        if (
+            text == "Garry's Mod"
+            or "RTX Remix" in text
+            or "GMod 254" in text
+            or "Garry's Mod is the default" in text
+        ):
+            return text
+        return (
+            text.replace("Garry's Mod", "Left 4 Dead 2")
+            .replace("GMod", "L4D2")
+            .replace("Gmod", "L4D2")
+        )
 
     def _flatten_i18n_strings(self, catalog: dict[str, object], prefix: str = "") -> dict[str, str]:
         flattened: dict[str, str] = {}
@@ -4216,11 +4300,13 @@ class ImporterWindow(QtWidgets.QMainWindow):
     def translate_static_text(self, text: str) -> str:
         if not text:
             return text
-        return self._i18n_exact_map.get(text, text)
+        return self._apply_game_brand(self._i18n_exact_map.get(text, text))
 
     def translate_runtime_text(self, text: str) -> str:
-        if not text or self.language_code == "en_us":
+        if not text:
             return text
+        if self.language_code == "en_us":
+            return self._apply_game_brand(text)
         dll_prefix = "Windows error 0xC0000142 (STATUS_DLL_INIT_FAILED): "
         dll_suffix = " or one of its DLL/application components failed during initialization."
         if text.startswith(dll_prefix) and text.endswith(dll_suffix):
@@ -4232,11 +4318,11 @@ class ImporterWindow(QtWidgets.QMainWindow):
             )
         exact = self._i18n_exact_map.get(text)
         if exact:
-            return exact
+            return self._apply_game_brand(exact)
         for source, translated in self._i18n_prefix_map:
             if text.startswith(source):
-                return translated + text[len(source) :]
-        return text
+                return self._apply_game_brand(translated + text[len(source) :])
+        return self._apply_game_brand(text)
 
     def translate_multiline_runtime_text(self, text: str) -> str:
         if not text or self.language_code == "en_us":
@@ -4675,12 +4761,17 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.advanced_steps_visible = visible
         main_index = self.tab_index_for_content_widget(getattr(self, "main_tab", None))
         manager_index = self.tab_index_for_content_widget(getattr(self, "model_manager_tab", None))
+        l4d2 = getattr(self, "selected_game", "gmod") == "l4d2"
         for index in range(self.tabs.count()):
             is_primary = index == main_index or index == manager_index
+            tab_visible = is_primary or visible
+            if index == manager_index and l4d2:
+                # Model Manager is GMod-only (manages garrysmod/addons); hide it under L4D2.
+                tab_visible = False
             try:
-                self.tabs.setTabVisible(index, is_primary or visible)
+                self.tabs.setTabVisible(index, tab_visible)
             except AttributeError:
-                self.tabs.tabBar().setTabVisible(index, is_primary or visible)
+                self.tabs.tabBar().setTabVisible(index, tab_visible)
         if not visible:
             current = self.tabs.currentIndex()
             if current not in {main_index, manager_index}:
@@ -9829,14 +9920,15 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 self.main_source_row.set_value(main_source)
             finally:
                 self._loading_main_source_from_settings = False
-        main_gmod = str(self.settings_store.value("main_gmod_path", "", str) or "")
+        main_gmod = str(self.settings_store.value(self._studiomdl_setting_key("main_gmod_path"), "", str) or "")
         if not main_gmod:
-            main_gmod = str(self.settings_store.value("qc_gmod_path", "", str) or "")
+            main_gmod = str(self.settings_store.value(self._studiomdl_setting_key("qc_gmod_path"), "", str) or "")
         if main_gmod and hasattr(self, "main_gmod_row"):
             self.main_gmod_row.set_value(main_gmod)
+        # Model Manager is GMod-only, so it always reads the GMod (legacy) studiomdl path.
         model_manager_gmod = str(self.settings_store.value("model_manager_gmod_path", "", str) or "")
         if not model_manager_gmod:
-            model_manager_gmod = main_gmod or str(self.settings_store.value("qc_gmod_path", "", str) or "")
+            model_manager_gmod = str(self.settings_store.value("main_gmod_path", "", str) or "") or str(self.settings_store.value("qc_gmod_path", "", str) or "")
         if model_manager_gmod and hasattr(self, "model_manager_gmod_row"):
             self.model_manager_gmod_row.set_value(model_manager_gmod)
         main_model = str(self.settings_store.value("main_model_name", "", str) or "")
@@ -9921,7 +10013,9 @@ class ImporterWindow(QtWidgets.QMainWindow):
         qc_input = str(self.settings_store.value("qc_input_dir", "", str) or "")
         if qc_input and hasattr(self, "qc_input_row"):
             self.qc_input_row.set_value(qc_input)
-        qc_gmod = str(self.settings_store.value("qc_gmod_path", "", str) or "")
+        qc_gmod = str(self.settings_store.value(self._studiomdl_setting_key("qc_gmod_path"), "", str) or "")
+        if not qc_gmod:
+            qc_gmod = str(self.settings_store.value(self._studiomdl_setting_key("main_gmod_path"), "", str) or "")
         if qc_gmod and hasattr(self, "qc_gmod_row"):
             self.qc_gmod_row.set_value(qc_gmod)
         if hasattr(self, "qc_author_edit"):
@@ -10100,7 +10194,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
             if pmx:
                 self.settings_store.setValue("main_pmx_path", str(pmx))
         if hasattr(self, "main_gmod_row"):
-            self.settings_store.setValue("main_gmod_path", self.main_gmod_row.value())
+            self.settings_store.setValue(self._studiomdl_setting_key("main_gmod_path"), self.main_gmod_row.value())
         if hasattr(self, "model_manager_gmod_row"):
             self.settings_store.setValue("model_manager_gmod_path", self.model_manager_gmod_row.value())
         if hasattr(self, "main_model_name_edit"):
@@ -10187,7 +10281,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         if hasattr(self, "qc_input_row"):
             self.settings_store.setValue("qc_input_dir", self.qc_input_row.value())
         if hasattr(self, "qc_gmod_row"):
-            self.settings_store.setValue("qc_gmod_path", self.qc_gmod_row.value())
+            self.settings_store.setValue(self._studiomdl_setting_key("qc_gmod_path"), self.qc_gmod_row.value())
         if hasattr(self, "qc_author_edit"):
             self.settings_store.setValue("qc_author", "sheepylord")
         if hasattr(self, "qc_category_edit"):
@@ -10754,10 +10848,23 @@ class ImporterWindow(QtWidgets.QMainWindow):
             return self.find_l4d2_candidate()
         return self.find_gmod_candidate()
 
+    def _studiomdl_path_is_wrong_game(self, resolved: dict[str, object]) -> bool:
+        """True when an already-resolved studiomdl/install path clearly belongs to the
+        OTHER target game than the one currently selected. Used so the Detect button
+        re-finds the correct game's studiomdl instead of silently keeping a stale path
+        from the other game (e.g. a saved Garry's Mod path while L4D2 is selected).
+        Custom/ambiguous paths that match neither game's folder are left untouched."""
+        blob = " ".join(
+            str(resolved.get(key) or "") for key in ("display", "studiomdl", "gmod_root", "input")
+        ).lower()
+        if getattr(self, "selected_game", "gmod") == "l4d2":
+            return "garrysmod" in blob
+        return "left 4 dead 2" in blob or "left4dead2" in blob
+
     def detect_gmod_for_main(self) -> None:
         game_label = "Left 4 Dead 2" if self.selected_game == "l4d2" else "GMod"
         current = resolve_gmod_path_input(self.main_gmod_row.value() if hasattr(self, "main_gmod_row") else "")
-        if current.get("ok"):
+        if current.get("ok") and not self._studiomdl_path_is_wrong_game(current):
             found = str(current.get("display") or "")
             self.main_gmod_row.set_value(found)
             self.append_main_log(f"Using existing {game_label} StudioMDL/install path: {found}")
@@ -21207,7 +21314,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
     def detect_gmod_for_qc(self) -> None:
         game_label = "Left 4 Dead 2" if self.selected_game == "l4d2" else "GMod"
         current = resolve_gmod_path_input(self.qc_gmod_row.value() if hasattr(self, "qc_gmod_row") else "")
-        if current.get("ok"):
+        if current.get("ok") and not self._studiomdl_path_is_wrong_game(current):
             found = str(current.get("display") or "")
             self.qc_gmod_row.set_value(found)
             self.append_qc_log(f"Using existing {game_label} StudioMDL/install path: {found}")
