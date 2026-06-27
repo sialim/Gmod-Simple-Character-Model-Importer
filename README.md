@@ -150,13 +150,3 @@ For a portable-folder build, keep `_internal` beside the executable and launch:
 ```powershell
 .\release\GmodSimpleMMDCharacterImporter_portable\GmodSimpleMMDCharacterImporter.exe
 ```
-
-## Repository Maintenance
-
-- `blender-4.5.10-windows-x64.zip` is required by the build script but is excluded from git because it is larger than GitHub's normal file limit.
-- `external_tools\vtfcmd` and the required VC runtime DLLs are included directly because they are needed for icon and VTF generation.
-- Garry's Mod is still required on the machine that runs the importer because StudioMDL and gmad are distributed with Garry's Mod.
-- The source project updates this folder by running `tools\sync_github_upload.ps1`; do not manually copy files when refreshing this repo.
-- Generated `build`, `dist`, and `release` folders are ignored by git.
-
-The original project README is copied to `docs\MMDCharacterImporter_README.md`.
