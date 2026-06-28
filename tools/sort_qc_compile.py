@@ -1684,10 +1684,11 @@ def refresh_input_availability_warnings(plan: dict[str, Any], warnings: list[str
     (and must warn when an input vanished after the analyze).
     """
     inputs = plan.get("inputs", {}) if isinstance(plan.get("inputs"), dict) else {}
-    # SFM ships loose models + materials only (no GMod spawn-menu icons), so a missing
-    # Step 13 icon dir is expected and must not warn.
+    # SFM ships loose models + materials only (no GMod spawn-menu icons), so a missing Step 13 icon
+    # dir is expected and must not warn. VRD ($proceduralbones) is also opt-in / off by default for
+    # SFM, so a missing Step 11 VRD is expected and must not warn either.
     sfm = normalize_game(plan.get("game")) == "sfm"
-    skip_keys = {"step13_dir"} if sfm else set()
+    skip_keys = {"step13_dir", "step11_vrd"} if sfm else set()
     messages = {message for _key, message in INPUT_AVAILABILITY_WARNINGS}
     warnings[:] = [warning for warning in warnings if str(warning) not in messages]
     for key, message in INPUT_AVAILABILITY_WARNINGS:
@@ -1738,7 +1739,12 @@ def analyze(input_path: Path, author: str = "", category: str = "", model_name: 
                 "female reference pose. Re-run Step 9 to regenerate both reference animations."
             )
     texture_manifest = Path(discovered["step12_manifest"])
+    # SFM: VRD ($proceduralbones) is opt-in and off by default, so a missing Step 11 VRD is
+    # expected and must not warn.
+    vrd_warning_skip = {"step11_vrd"} if normalize_game(game) == "sfm" else set()
     for key, message in INPUT_AVAILABILITY_WARNINGS:
+        if key in vrd_warning_skip:
+            continue
         if not Path(str(discovered.get(key) or "")).exists():
             warnings.append(message)
 
@@ -4277,6 +4283,110 @@ def package_addon_vpk(addon_dir: Path, output_vpk: Path, gmod: dict[str, Any], l
             shutil.rmtree(scratch, ignore_errors=True)
 
 
+def matrix_to_xyz_radians(m: list[list[float]]) -> tuple[float, float, float]:
+    """Inverse of rotation_matrix_xyz (which builds Rz·Ry·Rx): recover (rx, ry, rz) radians.
+    Used to re-express a bone's accumulated GLOBAL rotation as a root local rotation."""
+    cy = math.sqrt(m[0][0] * m[0][0] + m[1][0] * m[1][0])
+    if cy > 1.0e-8:
+        rx = math.atan2(m[2][1], m[2][2])
+        ry = math.atan2(-m[2][0], cy)
+        rz = math.atan2(m[1][0], m[0][0])
+    else:  # gimbal lock (cos(ry) ~ 0)
+        rx = math.atan2(-m[1][2], m[1][1])
+        ry = math.atan2(-m[2][0], cy)
+        rz = 0.0
+    return (rx, ry, rz)
+
+
+def compose_global_rotation(name: str, poses: dict[str, SmdBonePose]) -> list[list[float]]:
+    """Accumulate root->name local rotations into name's global rotation matrix."""
+    chain: list[str] = []
+    current = name
+    guard: set[str] = set()
+    while current and current in poses and current not in guard:
+        guard.add(current)
+        chain.append(current)
+        current = poses[current].parent
+    chain.reverse()  # root first
+    rot = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    for bone_name in chain:
+        rot = matmul(rot, rotation_matrix_xyz(*poses[bone_name].local_rot))
+    return rot
+
+
+# The GMod c_arms root: the arms hang off Spine4 (matching the bones a weapon viewmodel
+# carries and what models/weapons/c_arms_animations.mdl is authored against).
+CARMS_ROOT_BONE = "ValveBiped.Bip01_Spine4"
+
+
+def carms_minimal_definebones(carms_work: Path) -> list[str]:
+    """GMod c_arms $definebone block: a MINIMAL arms-only skeleton -- Spine4 root plus only the
+    bones the cut mesh is weighted to, closed over parents up to Spine4 -- with the character's
+    FINAL proportions BAKED into the bone rest positions. This mirrors a hand-made GMod c_arms
+    (issue #121): no full-body skeleton and no runtime proportion-trick delta, so nothing
+    re-drives the bones on top of the weapon-viewmodel bonemerge (which displaced the arms on
+    non-Valve-standard custom weapons).
+
+    Positions come from the proportioned SMD node blocks already present in carms_work: the
+    Step-10 cut meshes and the copied anims/proportions.smd both carry the FULL proportioned
+    skeleton (Blender Source Tools writes every node), even though the pruned mesh itself only
+    weights to forearm-and-below. No mesh re-cut and no new definebone capture are required."""
+    poses = collect_smd_bone_poses(carms_work)
+    if not poses:
+        return []
+    # Bones the pruned arm mesh is actually skinned to (forearm/hand/fingers + any arm-deform
+    # helper the mesh uses). UpperArm/Clavicle/Spine4 are pulled in by the parent closure below.
+    used: set[str] = set()
+    for smd_path in sorted(carms_work.glob("*.smd"), key=lambda item: natural_key(item.name)):
+        try:
+            smd = parse_smd(smd_path, include_triangles=True)
+        except Exception as exc:
+            emit(f"c_arms minimal skeleton: skipped unreadable SMD {smd_path.name}: {exc}")
+            continue
+        id_to_name = {bone_id: node.name for bone_id, node in smd.nodes.items()}
+        for triangle in smd.triangles:
+            for vertex in triangle["vertices"]:
+                for bone_id, weight in vertex["weights"]:
+                    if weight > 0.0 and bone_id in id_to_name:
+                        used.add(id_to_name[bone_id])
+    # Close over parents up to (and including) the Spine4 root.
+    keep: set[str] = set()
+    for name in used:
+        current = name
+        guard: set[str] = set()
+        while current and current in poses and current not in guard:
+            guard.add(current)
+            keep.add(current)
+            if current == CARMS_ROOT_BONE:
+                break
+            current = poses[current].parent
+    if CARMS_ROOT_BONE in poses:
+        keep.add(CARMS_ROOT_BONE)
+    subset = {name: poses[name] for name in keep if name in poses}
+    if not subset:
+        return []
+    # Re-root Spine4: zero its position and bake its GLOBAL rotation, so the arm chain keeps the
+    # correct orientation once the spine above it is dropped (as the hand-made c_arms does).
+    if CARMS_ROOT_BONE in subset:
+        root_global = compose_global_rotation(CARMS_ROOT_BONE, poses)
+        subset[CARMS_ROOT_BONE] = SmdBonePose(
+            name=CARMS_ROOT_BONE,
+            parent="",
+            local_pos=(0.0, 0.0, 0.0),
+            local_rot=matrix_to_xyz_radians(root_global),
+            source_smd=subset[CARMS_ROOT_BONE].source_smd,
+        )
+    # Any other kept bone whose parent fell outside the minimal set becomes a root too (rare:
+    # an arm-deform helper whose ancestor chain does not pass through Spine4).
+    for name, pose in list(subset.items()):
+        if name != CARMS_ROOT_BONE and pose.parent and pose.parent not in subset:
+            subset[name] = SmdBonePose(
+                name=name, parent="", local_pos=pose.local_pos, local_rot=pose.local_rot, source_smd=pose.source_smd
+            )
+    ordered = order_smd_definebone_names(subset)
+    return [make_definebone_from_smd_pose(subset[name]) for name in ordered]
+
+
 def build_carms_qc(plan: dict[str, Any], source_dir: Path, definebones: list[str]) -> Path | None:
     carms_dir = Path(str(plan.get("inputs", {}).get("step10_dir") or ""))
     if not carms_dir.exists():
@@ -4300,24 +4410,41 @@ def build_carms_qc(plan: dict[str, Any], source_dir: Path, definebones: list[str
     lines.append(f'$cdmaterials "models/{plan["author"]}/{plan["model_name"]}/" \n\n')
     lines.append('$cbox 0 0 0 0 0 0 \n\n')
     lines.append('$bbox -13 -13 0 13 13 72 \n\n')
-    lines.extend(definebones)
-    lines.append('$ikchain "rhand" "ValveBiped.Bip01_R_Hand" knee 0.707 0.707 0 \n')
-    lines.append('$ikchain "lhand" "ValveBiped.Bip01_L_Hand" knee 0.707 0.707 0 \n')
-    lines.append('$ikchain "rfoot" "ValveBiped.Bip01_R_Foot" knee 0.707 -0.707 0 \n')
-    lines.append('$ikchain "lfoot" "ValveBiped.Bip01_L_Foot" knee 0.707 -0.707 0 \n\n')
-    lines.append('$ikautoplaylock "rfoot" 0.7 0.1 \n')
-    lines.append('$ikautoplaylock "lfoot" 0.7 0.1 \n\n')
-    carms_reference = gendered_reference_name(plan, carms_work / "anims")
-    lines.append(f'$sequence reference "anims/{carms_reference}" fps 1 \n')
-    lines.append('$origin 0 0 -2.40 \n\n')
-    lines.append('$animation a_proportions "anims/proportions" subtract reference 0 \n\n')
-    lines.append('$sequence proportions a_proportions predelta autoplay \n\n')
-    lines.append('$Sequence "ragdoll" {\n\t"anims/proportions"\n\tactivity "ACT_DIERAGDOLL" 1\n\tfadein 0.2\n\tfadeout 0.2\n\tfps 60\n}\n\n')
     if normalize_game(plan.get("game")) == "l4d2":
-        # L4D2 first-person arms (v_arms_<slot>_new): a static idle from the
-        # proportion pose; the arms bonemerge onto the weapon viewmodel at runtime.
+        # L4D2 first-person arms (v_arms_<slot>_new): UNCHANGED -- the full-body skeleton +
+        # proportion trick + ragdoll + foot IK + a static idle are kept byte-identical so L4D2's
+        # sensitive sequence layout is not disturbed. The arms bonemerge onto the weapon
+        # viewmodel at runtime.
+        lines.extend(definebones)
+        lines.append('$ikchain "rhand" "ValveBiped.Bip01_R_Hand" knee 0.707 0.707 0 \n')
+        lines.append('$ikchain "lhand" "ValveBiped.Bip01_L_Hand" knee 0.707 0.707 0 \n')
+        lines.append('$ikchain "rfoot" "ValveBiped.Bip01_R_Foot" knee 0.707 -0.707 0 \n')
+        lines.append('$ikchain "lfoot" "ValveBiped.Bip01_L_Foot" knee 0.707 -0.707 0 \n\n')
+        lines.append('$ikautoplaylock "rfoot" 0.7 0.1 \n')
+        lines.append('$ikautoplaylock "lfoot" 0.7 0.1 \n\n')
+        carms_reference = gendered_reference_name(plan, carms_work / "anims")
+        lines.append(f'$sequence reference "anims/{carms_reference}" fps 1 \n')
+        lines.append('$origin 0 0 -2.40 \n\n')
+        lines.append('$animation a_proportions "anims/proportions" subtract reference 0 \n\n')
+        lines.append('$sequence proportions a_proportions predelta autoplay \n\n')
+        lines.append('$Sequence "ragdoll" {\n\t"anims/proportions"\n\tactivity "ACT_DIERAGDOLL" 1\n\tfadein 0.2\n\tfadeout 0.2\n\tfps 60\n}\n\n')
         lines.append('$sequence "idle" {\n\t"anims/proportions"\n\tfadein 0.2\n\tfadeout 0.2\n\tfps 30\n}\n')
     else:
+        # GMod character c_arms (issue #121): a MINIMAL arms-only skeleton with the character's
+        # proportions BAKED into the bone rest positions, ONE static idle, and the shared
+        # first-person hand/finger animations. Learned from a hand-made GMod port: no full-body
+        # skeleton, no proportion-trick autoplay, no ragdoll, no foot IK -- so nothing re-drives
+        # the bones on top of the weapon-viewmodel bonemerge, which is what displaced the arms on
+        # non-Valve-standard custom weapons.
+        minimal_definebones = carms_minimal_definebones(carms_work)
+        if not minimal_definebones or not any('_Hand"' in line for line in minimal_definebones):
+            # Safety net: if the cut SMDs could not be read / under-collected, fall back to the
+            # captured (proportioned) full-body definebones so the c_arms still compiles. Still an
+            # improvement: no proportion-trick autoplay delta is emitted on the GMod c_arms.
+            emit("c_arms minimal skeleton under-collected; falling back to full definebones.")
+            minimal_definebones = definebones
+        lines.extend(minimal_definebones)
+        lines.append('$sequence "idle" {\n\t"anims/proportions"\n\tfps 1\n}\n\n')
         lines.append('$includemodel "weapons/c_arms_animations.mdl" \n')
     qc = carms_work / "pm_carms.qc"
     write_lines(qc, lines)

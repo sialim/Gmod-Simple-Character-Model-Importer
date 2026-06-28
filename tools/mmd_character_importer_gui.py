@@ -2814,6 +2814,7 @@ class FullImportWorker(QtCore.QThread):
         survivor: str = "producer",
         copy_to_sfm_usermod: bool = True,
         nodecal: bool = False,
+        generate_vrd: bool = True,
     ) -> None:
         super().__init__()
         self.pmx_path = Path(pmx_path)
@@ -2833,6 +2834,7 @@ class FullImportWorker(QtCore.QThread):
         self.survivor = normalize_survivor_code(survivor)
         self.copy_to_sfm_usermod = bool(copy_to_sfm_usermod)
         self.nodecal = bool(nodecal)
+        self.generate_vrd = bool(generate_vrd)
         self.bodygroup_scale_factor = float(bodygroup_scale_factor or getattr(core, "DEFAULT_BODYGROUP_SCALE_FACTOR", 40.457))
         self.cancel_requested = False
         self.step_results: dict[int, dict[str, object]] = {}
@@ -3095,7 +3097,12 @@ class FullImportWorker(QtCore.QThread):
                 self._write_marker(11, vrd.vrd_dir, outputs={"vrd": str(vrd.vrd_path)}, report_path=vrd.report_path)
                 self.step_results[11] = {"dir": str(vrd.vrd_dir), "report": str(vrd.report_path), "vrd": str(vrd.vrd_path)}
 
-            self._optional(11, "Sort VRD", run_vrd)
+            if self.game == "sfm" and not self.generate_vrd:
+                # SFM: VRD ($proceduralbones skirt helpers) is opt-in and off by default. Skip Step 11
+                # entirely so no VRD is generated or compiled; Step 14 will not warn about its absence.
+                self._log("Skipping Step 11 (Sort VRD): disabled for Source Filmmaker (enable 'Generate VRD' to include it).")
+            else:
+                self._optional(11, "Sort VRD", run_vrd)
 
             def run_textures() -> None:
                 textures_analysis = core.analyze_textures(material_apply.materials_json_path, progress=self._log, cancel_check=self._cancelled, game=self.game)
@@ -4218,6 +4225,11 @@ class ImporterWindow(QtWidgets.QMainWindow):
         main_sfm_label = getattr(self, "main_copy_to_sfm_usermod_label", None)
         if isinstance(main_sfm_label, QtWidgets.QWidget):
             main_sfm_label.setVisible(sfm)
+        # SFM-only: the "generate VRD" toggle (procedural skirt bones; off by default for SFM).
+        for attr in ("main_generate_vrd_check", "main_generate_vrd_label"):
+            widget = getattr(self, attr, None)
+            if isinstance(widget, QtWidgets.QWidget):
+                widget.setVisible(sfm)
         # The $nodecal toggle applies to GMod and L4D2 only; hide it in SFM mode.
         for attr in ("main_nodecal_check", "texture_nodecal_check"):
             check = getattr(self, attr, None)
@@ -6180,6 +6192,17 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.main_copy_to_sfm_usermod_label = QtWidgets.QLabel("SFM usermod install")
         form.addRow(self.main_copy_to_sfm_usermod_label, self.main_copy_to_sfm_usermod_check)
         self.main_copy_to_sfm_usermod_check.toggled.connect(lambda _value: self.save_settings())
+        # SFM-only auto-port option (shown only in SFM mode by _refresh_gmod_only_visibility).
+        self.main_generate_vrd_check = QtWidgets.QCheckBox("Generate VRD procedural skirt bones")
+        self.main_generate_vrd_check.setChecked(False)
+        self.main_generate_vrd_check.setToolTip(
+            "Default OFF for Source Filmmaker. When on, the auto-port runs Step 11 and compiles the VRD "
+            "($proceduralbones) skirt/dress helpers into the model. When off, no VRD is generated, it is not "
+            "compiled with the model, and Step 14 will not warn about the missing VRD."
+        )
+        self.main_generate_vrd_label = QtWidgets.QLabel("SFM procedural VRD")
+        form.addRow(self.main_generate_vrd_label, self.main_generate_vrd_check)
+        self.main_generate_vrd_check.toggled.connect(lambda _value: self.save_settings())
         layout.addLayout(form)
         layout.addWidget(self.main_gmod_row)
 
@@ -10486,6 +10509,10 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 if isinstance(raw_main_sfm, str)
                 else bool(raw_main_sfm)
             )
+        if hasattr(self, "main_generate_vrd_check"):
+            self.main_generate_vrd_check.setChecked(
+                self.settings_bool(self.settings_store.value("main_generate_vrd", False), False)
+            )
         # Model Manager is GMod-only, so it always reads the GMod (legacy) studiomdl path.
         model_manager_gmod = str(self.settings_store.value("model_manager_gmod_path", "", str) or "")
         if not model_manager_gmod:
@@ -10767,6 +10794,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
             self.settings_store.setValue(self._studiomdl_setting_key("main_gmod_path"), self.main_gmod_row.value())
         if hasattr(self, "main_copy_to_sfm_usermod_check"):
             self.settings_store.setValue("main_copy_to_sfm_usermod", self.main_copy_to_sfm_usermod_check.isChecked())
+        if hasattr(self, "main_generate_vrd_check"):
+            self.settings_store.setValue("main_generate_vrd", self.main_generate_vrd_check.isChecked())
         if hasattr(self, "model_manager_gmod_row"):
             self.settings_store.setValue("model_manager_gmod_path", self.model_manager_gmod_row.value())
         if hasattr(self, "main_model_name_edit"):
@@ -12002,6 +12031,12 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 else True
             ),
             nodecal=self.current_nodecal_enabled(),
+            generate_vrd=(
+                # VRD is opt-in for SFM (default off); always generated for GMod/L4D2.
+                bool(self.main_generate_vrd_check.isChecked())
+                if (self.selected_game == "sfm" and hasattr(self, "main_generate_vrd_check"))
+                else True
+            ),
         )
         self.worker.log.connect(self.append_main_log)
         self.worker.progress.connect(self.set_main_progress)
