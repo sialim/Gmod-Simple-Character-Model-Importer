@@ -4430,21 +4430,29 @@ def build_carms_qc(plan: dict[str, Any], source_dir: Path, definebones: list[str
         lines.append('$Sequence "ragdoll" {\n\t"anims/proportions"\n\tactivity "ACT_DIERAGDOLL" 1\n\tfadein 0.2\n\tfadeout 0.2\n\tfps 60\n}\n\n')
         lines.append('$sequence "idle" {\n\t"anims/proportions"\n\tfadein 0.2\n\tfadeout 0.2\n\tfps 30\n}\n')
     else:
-        # GMod character c_arms (issue #121): a MINIMAL arms-only skeleton with the character's
-        # proportions BAKED into the bone rest positions, ONE static idle, and the shared
-        # first-person hand/finger animations. Learned from a hand-made GMod port: no full-body
-        # skeleton, no proportion-trick autoplay, no ragdoll, no foot IK -- so nothing re-drives
-        # the bones on top of the weapon-viewmodel bonemerge, which is what displaced the arms on
-        # non-Valve-standard custom weapons.
+        # GMod character c_arms (issue #121): the arm MESH is rest-pose-conformed onto the STANDARD
+        # c_arms skeleton in Step 10 (blender_sort_carms.py conform_meshes_to_standard), so the cut
+        # SMDs now carry standard ValveBiped arm proportions. carms_minimal_definebones therefore
+        # reads STANDARD bone positions straight from the conformed SMD -- no proportion trick and no
+        # MMD-proportion bake -- which is what bonemerges cleanly onto weapon viewmodels. Like the
+        # stock weapons/c_arms.mdl, no local $sequence is emitted; the included animation model
+        # supplies the first-person hand/finger poses (a local idle from the MMD-proportion
+        # anims/proportions would fight the now-standard skeleton).
         minimal_definebones = carms_minimal_definebones(carms_work)
         if not minimal_definebones or not any('_Hand"' in line for line in minimal_definebones):
             # Safety net: if the cut SMDs could not be read / under-collected, fall back to the
-            # captured (proportioned) full-body definebones so the c_arms still compiles. Still an
-            # improvement: no proportion-trick autoplay delta is emitted on the GMod c_arms.
-            emit("c_arms minimal skeleton under-collected; falling back to full definebones.")
+            # captured definebones so the c_arms still compiles.
+            emit("c_arms minimal skeleton under-collected; falling back to captured definebones.")
             minimal_definebones = definebones
         lines.extend(minimal_definebones)
-        lines.append('$sequence "idle" {\n\t"anims/proportions"\n\tfps 1\n}\n\n')
+        # Forearm-twist Ulna procedural bones (matches the good human port) so the lower forearm
+        # twists with the hand. Emit ONLY when the Ulna bones are actually defined (Step 10 weighted
+        # them), so the VRD never references an undeclared bone.
+        if any('_Ulna"' in line for line in minimal_definebones):
+            vrd_src = Path(__file__).resolve().parent / "assets" / "std_c_arms_skeleton" / "c_arms_ulna.vrd"
+            if vrd_src.exists():
+                shutil.copyfile(vrd_src, carms_work / "c_arms_ulna.vrd")
+                lines.append('$proceduralbones "c_arms_ulna.vrd" \n')
         lines.append('$includemodel "weapons/c_arms_animations.mdl" \n')
     qc = carms_work / "pm_carms.qc"
     write_lines(qc, lines)

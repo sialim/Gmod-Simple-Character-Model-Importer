@@ -2263,10 +2263,11 @@ class CArmsRunWorker(QtCore.QThread):
     done = QtCore.Signal(dict)
     failed = QtCore.Signal(str)
 
-    def __init__(self, input_dir: str, weight_threshold: float) -> None:
+    def __init__(self, input_dir: str, weight_threshold: float, game: str = "gmod") -> None:
         super().__init__()
         self.input_dir = input_dir
         self.weight_threshold = weight_threshold
+        self.game = normalize_game_code(game)
         self.cancel_requested = False
 
     def cancel(self) -> None:
@@ -2285,6 +2286,7 @@ class CArmsRunWorker(QtCore.QThread):
                 self.weight_threshold,
                 progress=self._log,
                 cancel_check=self._cancelled,
+                game=self.game,
             )
             self.done.emit(
                 {
@@ -3078,7 +3080,7 @@ class FullImportWorker(QtCore.QThread):
                 self._log("Skipping Step 10 (Sort c_arms): not required for Source Filmmaker.")
             else:
                 def run_carms() -> None:
-                    carms = core.run_carms_sort(proportion_result.final_dir, progress=self._log, cancel_check=self._cancelled)
+                    carms = core.run_carms_sort(proportion_result.final_dir, progress=self._log, cancel_check=self._cancelled, game=self.game)
                     self._require_clean_report(10, carms.report, "c_arms sort")
                     self._write_marker(10, carms.carms_dir, outputs={"files": str(carms.files_path)}, report_path=carms.report_path)
                     self.step_results[10] = {"dir": str(carms.carms_dir), "report": str(carms.report_path), "files": str(carms.files_path)}
@@ -19081,7 +19083,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.carms_run_button.setEnabled(False)
         self.detect_proportion_export_button.setEnabled(False)
         self.carms_cancel_button.setEnabled(True)
-        self.worker = CArmsRunWorker(str(input_dir), self.carms_weight_spin.value())
+        self.worker = CArmsRunWorker(str(input_dir), self.carms_weight_spin.value(), game=self.selected_game)
         self.worker.log.connect(self.append_carms_log)
         self.worker.done.connect(self.carms_done)
         self.worker.failed.connect(self.carms_failed)

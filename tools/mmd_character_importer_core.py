@@ -4733,6 +4733,7 @@ def run_carms_sort(
     weight_threshold: float = 0.12,
     progress: ProgressCallback | None = None,
     cancel_check: CancelCheck | None = None,
+    game: str = "gmod",
 ) -> CArmsResult:
     input_dir = input_dir.resolve()
     final_dir, carms_dir, workspace_blend, report_path, files_path = carms_paths_for_proportion_export(input_dir)
@@ -4764,6 +4765,8 @@ def run_carms_sort(
         str(files_path),
         "--weight-threshold",
         str(float(weight_threshold)),
+        "--game",
+        (str(game or "gmod").strip().lower() or "gmod"),
     ]
     emit(progress, f"Starting Blender c_arms sorting: {final_dir}")
     started = time.monotonic()
@@ -5733,6 +5736,7 @@ def main(argv: list[str] | None = None) -> int:
     carms_parser = subparsers.add_parser("carms-run", help="create c_arms SMD files from the proportion export")
     carms_parser.add_argument("proportion_export_dir", type=Path)
     carms_parser.add_argument("--weight-threshold", type=float, default=0.12)
+    carms_parser.add_argument("--game", default="gmod")
 
     vrd_analyze_parser = subparsers.add_parser("vrd-analyze", help="analyze Step 9 SMD files and propose VRD skirt helpers")
     vrd_analyze_parser.add_argument("proportion_export_dir", type=Path)
@@ -6158,7 +6162,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     if args.command == "carms-run":
-        result = run_carms_sort(args.proportion_export_dir, args.weight_threshold, progress=print_progress)
+        result = run_carms_sort(args.proportion_export_dir, args.weight_threshold, progress=print_progress, game=args.game)
         print(
             json.dumps(
                 {
