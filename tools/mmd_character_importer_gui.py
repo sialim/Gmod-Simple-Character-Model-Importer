@@ -3085,7 +3085,12 @@ class FullImportWorker(QtCore.QThread):
 
             def run_vrd() -> None:
                 vrd_analysis = core.analyze_vrd(proportion_result.final_dir, progress=self._log, cancel_check=self._cancelled)
-                vrd = core.apply_vrd(proportion_result.final_dir, vrd_analysis.plan, progress=self._log, cancel_check=self._cancelled)
+                vrd_plan = vrd_analysis.plan
+                if self.game == "sfm" and isinstance(vrd_plan, dict):
+                    # SFM auto-port uses gentler skirt follow-through than the in-game targets:
+                    # front / front-side / side (driver frames 10/20/30) intensity = 0.6 / 0.3 / 0.15.
+                    vrd_plan["intensity_multipliers"] = {"10": 0.6, "20": 0.3, "30": 0.15}
+                vrd = core.apply_vrd(proportion_result.final_dir, vrd_plan, progress=self._log, cancel_check=self._cancelled)
                 self._require_clean_report(11, vrd.report, "VRD export")
                 self._write_marker(11, vrd.vrd_dir, outputs={"vrd": str(vrd.vrd_path)}, report_path=vrd.report_path)
                 self.step_results[11] = {"dir": str(vrd.vrd_dir), "report": str(vrd.report_path), "vrd": str(vrd.vrd_path)}
