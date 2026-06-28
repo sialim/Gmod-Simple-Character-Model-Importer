@@ -221,6 +221,70 @@ def l4d2_arms_modelname(slot: str) -> str:
     return f"weapons/arms/v_arms_{normalize_survivor(slot)}_new.mdl"
 
 
+# The exact $includemodel set each survivor's base-game model uses, verbatim from TwentyCat's
+# l4d2_survivors_converter same-slot wrapper QCs. The 4 main survivors are just anim_<slot> +
+# gestures_<slot>, but the L4D1 survivors pull extra/aliased anim models (Zoey also loads producer
+# anims; Francis/Louis use the *_animloader + Biker anim set), so a naive "anim_<slot>" would
+# reference models that don't exist and the $declaresequence names would not resolve. Strings kept
+# verbatim, including the few without a "survivors/" prefix.
+L4D2_SURVIVOR_INCLUDEMODELS = {
+    "producer": ["survivors/anim_producer.mdl", "survivors/gestures_producer.mdl"],
+    "coach": ["survivors/anim_coach.mdl", "survivors/gestures_coach.mdl"],
+    "gambler": ["survivors/anim_gambler.mdl", "survivors/gestures_gambler.mdl"],
+    "mechanic": ["survivors/anim_mechanic.mdl", "survivors/gestures_mechanic.mdl"],
+    "namvet": ["survivors/anim_NamVet.mdl", "survivors/gestures_namvet.mdl"],
+    "teenangst": [
+        "survivors/anim_teenangst.mdl",
+        "survivors/gestures_TeenAngst.mdl",
+        "survivors/anim_producer.mdl",
+        "survivors/anim_gestures.mdl",
+    ],
+    "biker": [
+        "survivors/anim_biker_animloader.mdl",
+        "anim_biker_own_anims.mdl",
+        "survivors/anim_Biker.mdl",
+        "survivors/gestures_biker.mdl",
+    ],
+    "manager": [
+        "survivors/anim_louis_animloader.mdl",
+        "anim_louis_own_anims.mdl",
+        "survivors/anim_Biker.mdl",
+        "survivors/gestures_biker.mdl",
+    ],
+}
+
+
+def l4d2_includemodel_lines(slot: str) -> list[str]:
+    survivor = normalize_survivor(slot)
+    includes = L4D2_SURVIVOR_INCLUDEMODELS.get(survivor) or [
+        f"survivors/anim_{survivor}.mdl",
+        f"survivors/gestures_{survivor}.mdl",
+    ]
+    return [f'$includemodel "{include}" \n' for include in includes]
+
+
+def l4d2_reference_sequences_path(slot: str) -> Path:
+    return Path(__file__).resolve().parent / "l4d2_reference_sequences" / f"{normalize_survivor(slot)}.txt"
+
+
+def l4d2_declaresequence_lines(slot: str) -> list[str]:
+    """The selected survivor's full ordered base-game sequence-name list, emitted as $declaresequence.
+
+    This is the fix for the multiplayer survivor T-pose (issue #105). A survivor REPLACEMENT prepends
+    its own local sequences (reference/ragdoll/proportions) before $includemodel, which shifts the
+    index of every included anim/gesture sequence. L4D2 transmits animation across the network by
+    integer sequence INDEX, so the server addresses the wrong sequence and remote clients render the
+    bind pose (= T-pose); single-player resolves locally by name and looks fine. Forward-declaring
+    every included sequence here, in canonical order, re-pins them to the indices the server expects.
+    Lists are bundled verbatim from TwentyCat's l4d2_survivors_converter wrapper QCs (the names are
+    Valve base-game sequence names)."""
+    path = l4d2_reference_sequences_path(slot)
+    if not path.exists():
+        return []
+    names = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return [f'$declaresequence "{name}" \n' for name in names]
+
+
 def gendered_reference_name(plan: dict, anims_dir: Path, warnings: list | None = None) -> str:
     """Pick the reference SMD for the plan's gender, falling back to female.
 
@@ -2257,21 +2321,39 @@ def base_qc_lines(
     lines.append(f'$sequence reference "anims/{reference_name}" fps 1 \n')
     lines.append('$origin 0 0 -2.50 \n\n')
     lines.append('$animation a_proportions "anims/proportions" subtract reference 0 \n\n')
-    lines.append('$sequence proportions a_proportions predelta autoplay \n\n')
-    lines.append('$Sequence "ragdoll" {\n')
-    lines.append('\t"anims/proportions"\n')
-    lines.append('\tactivity "ACT_DIERAGDOLL" 1\n')
-    lines.append('\tfadein 0.2\n')
-    lines.append('\tfadeout 0.2\n')
-    lines.append('\tfps 60\n')
-    lines.append('}\n\n')
     if l4d2:
-        # Include the base-game survivor animation set for the selected slot so
-        # the model animates with that survivor's movement/gesture animations.
-        slot = normalize_survivor(plan.get("survivor"))
-        lines.append(f'$includemodel "survivors/anim_{slot}.mdl" \n')
-        lines.append(f'$includemodel "survivors/gestures_{slot}.mdl" \n')
+        # L4D2 survivor MULTIPLAYER sequence-index alignment (issue #105). A survivor REPLACEMENT must
+        # reproduce the base-game sequence INDEX layout: the local idle ('reference', index 0) and
+        # 'ragdoll' (1), then EVERY included anim/gesture sequence forward-declared in canonical order
+        # ($declaresequence, indices 2..N) so $includemodel fills exactly the indices the MP server
+        # addresses by number, and finally the proportions autoplay delta tacked on at the END (hidden)
+        # where it can't shift the included indices. Without this the server plays the wrong index ->
+        # remote clients see the bind/T-pose (single-player resolves by name, so it looks fine there).
+        # SCMI previously emitted 'proportions' at index 1, shifting every included sequence. The
+        # $declaresequence list + the per-slot $includemodel set are the base-game survivor's, bundled
+        # verbatim from TwentyCat's l4d2_survivors_converter (the proven fix for #105).
+        lines.append('$Sequence "ragdoll" {\n')
+        lines.append('\t"anims/proportions"\n')
+        lines.append('\tactivity "ACT_DIERAGDOLL" 1\n')
+        lines.append('\tfadein 0.2\n')
+        lines.append('\tfadeout 0.2\n')
+        lines.append('\tfps 60\n')
+        lines.append('}\n\n')
+        declare_lines = l4d2_declaresequence_lines(plan.get("survivor"))
+        if declare_lines:
+            lines.extend(declare_lines)
+            lines.append("\n")
+        lines.append('$sequence proportions a_proportions predelta autoplay hidden \n\n')
+        lines.extend(l4d2_includemodel_lines(plan.get("survivor")))
     else:
+        lines.append('$sequence proportions a_proportions predelta autoplay \n\n')
+        lines.append('$Sequence "ragdoll" {\n')
+        lines.append('\t"anims/proportions"\n')
+        lines.append('\tactivity "ACT_DIERAGDOLL" 1\n')
+        lines.append('\tfadein 0.2\n')
+        lines.append('\tfadeout 0.2\n')
+        lines.append('\tfps 60\n')
+        lines.append('}\n\n')
         gender_includes = GENDER_ANIMATION_INCLUDES[normalize_gender(plan.get("gender"))]
         for include in (gender_includes["player"] if pm else gender_includes["npc"]):
             lines.append(f'$includemodel "{include}" \n')
