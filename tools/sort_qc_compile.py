@@ -105,9 +105,10 @@ def normalize_game(value: object) -> str:
 # The 8 L4D2 survivor slots an MMD model can be ported onto (the 4 L4D2 survivors
 # plus the 4 returning L4D1 survivors). The model name/path MUST be the exact
 # survivor slot (custom names are not allowed in L4D2): the character is
-# survivors/survivor_<slot>.mdl and the first-person arms are
-# weapons/arms/v_arms_<slot>_new.mdl (the "_new" suffix is the L4D2 arms
-# convention). anim/gesture includes and the vgui survivor panels also use the
+# survivors/survivor_<slot>.mdl and the first-person arms are weapons/arms/v_arms_<slot>_new.mdl
+# for the 4 L4D2 survivors, but the 4 returning L4D1 survivors keep their original arms
+# (v_arms_bill/zoey/francis/louis, no "_new") -- see L4D2_SURVIVOR_ARMS_RELPATH.
+# anim/gesture includes and the vgui survivor panels also use the
 # exact slot. Internal slot -> in-game name: producer=Rochelle, coach=Coach,
 # gambler=Nick, mechanic=Ellis, namvet=Bill, teenangst=Zoey, biker=Francis,
 # manager=Louis.
@@ -217,8 +218,34 @@ def l4d2_character_modelname(slot: str) -> str:
     return f"survivors/survivor_{normalize_survivor(slot)}.mdl"
 
 
+# First-person arms model path per survivor slot (relative to models/, no extension). The 4 L4D2
+# survivors use the "_new" arms named by their internal anim slot (producer/coach/gambler/mechanic),
+# but the 4 returning L4D1 survivors keep their ORIGINAL L4D1 arms, named by the in-game character
+# WITHOUT the "_new" suffix (Bill/Zoey/Francis/Louis) -- verified against the base-game v_arms_*.mdl
+# headers in L4D2_Support/default_c_arm_l4d1. A custom survivor only shows up in first person if it
+# overrides the EXACT arms path the game loads for that character; the L4D1 slots cannot use the
+# v_arms_<slot>_new pattern (the game never loads v_arms_namvet_new.mdl, so those arms stayed the
+# default -- issue #124).
+L4D2_SURVIVOR_ARMS_RELPATH = {
+    "producer": "weapons/arms/v_arms_producer_new",
+    "coach": "weapons/arms/v_arms_coach_new",
+    "gambler": "weapons/arms/v_arms_gambler_new",
+    "mechanic": "weapons/arms/v_arms_mechanic_new",
+    "namvet": "weapons/arms/v_arms_bill",
+    "teenangst": "weapons/arms/v_arms_zoey",
+    "biker": "weapons/arms/v_arms_francis",
+    "manager": "weapons/arms/v_arms_louis",
+}
+
+
+def l4d2_arms_relpath(slot: str) -> str:
+    """Arms model path relative to models/ (no extension) for the survivor the game actually loads."""
+    survivor = normalize_survivor(slot)
+    return L4D2_SURVIVOR_ARMS_RELPATH.get(survivor, f"weapons/arms/v_arms_{survivor}_new")
+
+
 def l4d2_arms_modelname(slot: str) -> str:
-    return f"weapons/arms/v_arms_{normalize_survivor(slot)}_new.mdl"
+    return f"{l4d2_arms_relpath(slot)}.mdl"
 
 
 # The exact $includemodel set each survivor's base-game model uses, verbatim from TwentyCat's
@@ -1908,8 +1935,9 @@ def prepare_qc_source(plan: dict[str, Any]) -> Path:
 
 
 def qc_model_header(plan: dict[str, Any], pm: bool = False, arms: bool = False) -> list[str]:
-    # L4D2 requires exact, non-custom model paths: the character is
-    # survivors/survivor_<slot>.mdl and the arms are weapons/arms/v_arms_<slot>_new.mdl.
+    # L4D2 requires exact, non-custom model paths: the character is survivors/survivor_<slot>.mdl
+    # and the arms come from l4d2_arms_modelname (v_arms_<slot>_new for L4D2 survivors,
+    # v_arms_bill/zoey/francis/louis for the L4D1 survivors).
     if normalize_game(plan.get("game")) == "l4d2":
         slot = normalize_survivor(plan.get("survivor"))
         name = l4d2_arms_modelname(slot) if arms else l4d2_character_modelname(slot)
@@ -4095,7 +4123,7 @@ def l4d2_compiled_relpaths(slot: str, has_arms: bool) -> list[str]:
     slot = normalize_survivor(slot)
     rels = [f"survivors/survivor_{slot}"]
     if has_arms:
-        rels.append(f"weapons/arms/v_arms_{slot}_new")
+        rels.append(l4d2_arms_relpath(slot))
     return rels
 
 
