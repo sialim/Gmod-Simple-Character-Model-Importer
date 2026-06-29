@@ -1178,7 +1178,8 @@ class StaticModelPreviewWidget(QOpenGLWidget):
             # recreation during docking/reparenting the context is not yet current
             # here, and an unguarded GL call raises GLError 1282 (invalid
             # operation) which crashes the whole app. Ensure the context is
-            # current and swallow transient failures.
+            # current and swallow transient failures, matching how paintGL and
+            # the texture-delete paths already protect their GL calls.
             try:
                 self.makeCurrent()
             except Exception:
