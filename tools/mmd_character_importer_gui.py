@@ -23548,12 +23548,14 @@ def main() -> int:
     # QOpenGLWidgets (model + material preview) share contexts whose format is
     # whatever the platform/driver picks by default; on some drivers that default
     # produces a context that is invalid when initializeGL() runs, so the first
-    # glClearColor raises GLError 1282 and crashes.
+    # glClearColor raises GLError 1282 and crashes. Requesting a plain, widely
+    # supported compatibility-profile context (the same kind ordinary desktop GL
+    # apps get) avoids the rejected/invalid context. Per Qt, calling
+    # setDefaultFormat() before constructing QApplication is the supported way to
+    # make all shared contexts use a consistent, known format.
     try:
         _gl_format = QtGui.QSurfaceFormat()
         _gl_format.setRenderableType(QtGui.QSurfaceFormat.RenderableType.OpenGL)
-        _gl_format.setProfile(QtGui.QSurfaceFormat.OpenGLContextProfile.CompatibilityProfile)
-        _gl_format.setVersion(2, 1) # minimal, near-universally supported
         _gl_format.setDepthBufferSize(24)
         _gl_format.setStencilBufferSize(8)
         QtGui.QSurfaceFormat.setDefaultFormat(_gl_format)
