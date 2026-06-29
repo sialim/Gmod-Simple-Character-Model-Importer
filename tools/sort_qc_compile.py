@@ -4410,11 +4410,17 @@ def build_carms_qc(plan: dict[str, Any], source_dir: Path, definebones: list[str
     lines.append(f'$cdmaterials "models/{plan["author"]}/{plan["model_name"]}/" \n\n')
     lines.append('$cbox 0 0 0 0 0 0 \n\n')
     lines.append('$bbox -13 -13 0 13 13 72 \n\n')
-    if normalize_game(plan.get("game")) == "l4d2":
-        # L4D2 first-person arms (v_arms_<slot>_new): UNCHANGED -- the full-body skeleton +
-        # proportion trick + ragdoll + foot IK + a static idle are kept byte-identical so L4D2's
-        # sensitive sequence layout is not disturbed. The arms bonemerge onto the weapon
-        # viewmodel at runtime.
+    game = normalize_game(plan.get("game"))
+    # "Use experimental arms" (GMod only, default OFF): when ON, Step 10 conformed the arm mesh onto
+    # the standard c_arms skeleton, so we emit the minimal/conform c_arms below. When OFF (default,
+    # and always for L4D2), the c_arms keeps the full-body skeleton + proportion trick (the original
+    # method). Auto-porting never sets this key, so it gets the proportion-driven arms.
+    experimental_arms = bool(plan.get("gmod_experimental_arms", False))
+    if game == "l4d2" or (game == "gmod" and not experimental_arms):
+        # Proportion-driven first-person arms: the full-body skeleton + proportion trick + ragdoll +
+        # foot IK + a static idle. This is L4D2's v_arms (kept byte-identical so its sensitive
+        # sequence layout is not disturbed) AND the default/original GMod c_arms. The arms bonemerge
+        # onto the weapon viewmodel at runtime.
         lines.extend(definebones)
         lines.append('$ikchain "rhand" "ValveBiped.Bip01_R_Hand" knee 0.707 0.707 0 \n')
         lines.append('$ikchain "lhand" "ValveBiped.Bip01_L_Hand" knee 0.707 0.707 0 \n')
@@ -4430,8 +4436,9 @@ def build_carms_qc(plan: dict[str, Any], source_dir: Path, definebones: list[str
         lines.append('$Sequence "ragdoll" {\n\t"anims/proportions"\n\tactivity "ACT_DIERAGDOLL" 1\n\tfadein 0.2\n\tfadeout 0.2\n\tfps 60\n}\n\n')
         lines.append('$sequence "idle" {\n\t"anims/proportions"\n\tfadein 0.2\n\tfadeout 0.2\n\tfps 30\n}\n')
     else:
-        # GMod character c_arms (issue #121): the arm MESH is rest-pose-conformed onto the STANDARD
-        # c_arms skeleton in Step 10 (blender_sort_carms.py conform_meshes_to_standard), so the cut
+        # GMod EXPERIMENTAL c_arms (issue #121, "use experimental arms" ON): the arm MESH is
+        # rest-pose-conformed onto the STANDARD c_arms skeleton in Step 10
+        # (blender_sort_carms.py conform_meshes_to_standard), so the cut
         # SMDs now carry standard ValveBiped arm proportions. carms_minimal_definebones therefore
         # reads STANDARD bone positions straight from the conformed SMD -- no proportion trick and no
         # MMD-proportion bake -- which is what bonemerges cleanly onto weapon viewmodels. Like the

@@ -2263,11 +2263,12 @@ class CArmsRunWorker(QtCore.QThread):
     done = QtCore.Signal(dict)
     failed = QtCore.Signal(str)
 
-    def __init__(self, input_dir: str, weight_threshold: float, game: str = "gmod") -> None:
+    def __init__(self, input_dir: str, weight_threshold: float, game: str = "gmod", experimental_arms: bool = False) -> None:
         super().__init__()
         self.input_dir = input_dir
         self.weight_threshold = weight_threshold
         self.game = normalize_game_code(game)
+        self.experimental_arms = bool(experimental_arms)
         self.cancel_requested = False
 
     def cancel(self) -> None:
@@ -2287,6 +2288,7 @@ class CArmsRunWorker(QtCore.QThread):
                 progress=self._log,
                 cancel_check=self._cancelled,
                 game=self.game,
+                experimental_arms=self.experimental_arms,
             )
             self.done.emit(
                 {
@@ -4156,6 +4158,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self._refresh_character_selectors()
         self._refresh_gmod_only_visibility()
         self._refresh_nodecal_checks_for_game()
+        self._refresh_experimental_arms_check()
         # On a live target-game switch (not during initial construction): relabel all
         # GMod<->L4D2 brand text and load the studiomdl path saved for the now-selected game.
         if getattr(self, "_i18n_initialized", False):
@@ -4278,6 +4281,29 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.settings_store.setValue(self._nodecal_setting_key(), checked)
         if getattr(self, "current_qc_plan", None):
             self.current_qc_plan["nodecal"] = checked
+
+    def current_experimental_arms_enabled(self) -> bool:
+        """GMod 'use experimental arms' toggle: ON = conform implementation, OFF (default) =
+        proportion-driven c_arms. Single global setting; only takes effect for GMod."""
+        return self.settings_bool(self.settings_store.value("carms_experimental_arms", False), False)
+
+    def _refresh_experimental_arms_check(self) -> None:
+        """Sync the 'use experimental arms' checkbox to the stored value; enable only for GMod."""
+        check = getattr(self, "carms_experimental_check", None)
+        if isinstance(check, QtWidgets.QCheckBox):
+            blocker = QtCore.QSignalBlocker(check)
+            try:
+                check.setChecked(self.current_experimental_arms_enabled())
+                check.setEnabled(normalize_game_code(getattr(self, "selected_game", "gmod")) == "gmod")
+            finally:
+                del blocker
+
+    def on_experimental_arms_toggled(self, checked: bool) -> None:
+        """Remember the 'use experimental arms' choice and update the live QC plan."""
+        checked = bool(checked)
+        self.settings_store.setValue("carms_experimental_arms", checked)
+        if getattr(self, "current_qc_plan", None):
+            self.current_qc_plan["gmod_experimental_arms"] = checked
 
     def _studiomdl_setting_key(self, base: str, game: str | None = None) -> str:
         """Per-game QSettings key for a studiomdl/install path. GMod keeps the legacy key for
@@ -8903,6 +8929,15 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.carms_weight_spin.setSingleStep(0.01)
         self.carms_weight_spin.setValue(0.12)
         settings.addRow("Weight threshold", self.carms_weight_spin)
+        self.carms_experimental_check = QtWidgets.QCheckBox("Use experimental arms")
+        self.carms_experimental_check.setToolTip(
+            "GMod only. When checked, the c_arms are built with the experimental implementation "
+            "(the cut arm mesh is conformed onto the standard c_arms skeleton). When unchecked "
+            "(default), the original proportion-driven c_arms are used. Auto-porting always uses "
+            "the unchecked (proportion-driven) version."
+        )
+        self.carms_experimental_check.toggled.connect(self.on_experimental_arms_toggled)
+        settings.addRow("", self.carms_experimental_check)
         self.detect_proportion_export_button = QtWidgets.QPushButton("Detect Step 9 Output")
         self.detect_proportion_export_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogContentsView))
         settings.addRow("", self.detect_proportion_export_button)
@@ -10652,6 +10687,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
             self.qc_include_mci_metadata_check.setChecked(include_metadata)
         # $nodecal checkboxes are remembered per game; sync both to the current game's stored value.
         self._refresh_nodecal_checks_for_game()
+        self._refresh_experimental_arms_check()
         release_input = str(self.settings_store.value("release_input_dir", "", str) or "")
         if release_input and hasattr(self, "release_input_row"):
             self.release_input_row.set_value(release_input)
@@ -19083,7 +19119,12 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.carms_run_button.setEnabled(False)
         self.detect_proportion_export_button.setEnabled(False)
         self.carms_cancel_button.setEnabled(True)
-        self.worker = CArmsRunWorker(str(input_dir), self.carms_weight_spin.value(), game=self.selected_game)
+        self.worker = CArmsRunWorker(
+            str(input_dir),
+            self.carms_weight_spin.value(),
+            game=self.selected_game,
+            experimental_arms=self.current_experimental_arms_enabled(),
+        )
         self.worker.log.connect(self.append_carms_log)
         self.worker.done.connect(self.carms_done)
         self.worker.failed.connect(self.carms_failed)
@@ -22120,6 +22161,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 bool(self.qc_include_mci_metadata_check.isChecked()) if hasattr(self, "qc_include_mci_metadata_check") else True
             )
             self.current_qc_plan["nodecal"] = self.current_nodecal_enabled()
+            self.current_qc_plan["gmod_experimental_arms"] = self.current_experimental_arms_enabled()
             self.sync_qc_fields_from_plan(self.current_qc_plan)
             self.populate_qc_bone_table()
         self.refresh_qc_preview()
@@ -22573,6 +22615,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
             bool(self.qc_include_mci_metadata_check.isChecked()) if hasattr(self, "qc_include_mci_metadata_check") else True
         )
         plan["nodecal"] = self.current_nodecal_enabled()
+        plan["gmod_experimental_arms"] = self.current_experimental_arms_enabled()
         qc_dir = Path(str(plan.get("qc_dir") or self.qc_output_edit.text().strip() or ""))
         if qc_dir:
             plan["addon_dir"] = str(qc_dir / model)

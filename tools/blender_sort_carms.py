@@ -796,6 +796,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--files-json", type=Path, required=True)
     parser.add_argument("--weight-threshold", type=float, default=DEFAULT_WEIGHT_THRESHOLD)
     parser.add_argument("--game", default="gmod")
+    # GMod only: "use experimental arms" -- when enabled, conform the cut arm mesh onto the standard
+    # c_arms skeleton (the experimental implementation). Default off -> keep the MMD-proportion
+    # skeleton so Step 14 emits the proportion-driven c_arms (the original method).
+    parser.add_argument("--experimental-arms", default="0")
     return parser.parse_args(argv)
 
 
@@ -807,6 +811,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     files_json = args.files_json.resolve()
     threshold = float(args.weight_threshold)
     game = str(getattr(args, "game", "gmod") or "gmod").strip().lower()
+    experimental_arms = str(getattr(args, "experimental_arms", "0")).strip().lower() in ("1", "true", "yes", "on")
     if not input_dir.exists():
         raise FileNotFoundError(input_dir)
     if threshold <= 0.0:
@@ -826,18 +831,20 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     log(f"c_arms target bone set contains {len(target_bones)} forearm/hand/finger bone(s).")
     object_reports = prune_all_meshes(target_bones, threshold)
     # GMod first-person c_arms: conform the cut arm mesh onto the STANDARD c_arms skeleton (rest-pose
-    # retarget) so it bonemerges cleanly onto weapon viewmodels. NOT done for L4D2 (its v_arms keep
-    # the full-body skeleton + proportion trick) or SFM (Step 10 is skipped). Runs after the cut on
-    # the small arm-only mesh; the cut itself is unchanged.
-    conform_report: dict[str, object] = {"applied": False, "game": game}
-    if game == "gmod":
-        log("Conforming c_arms mesh onto the standard GMod c_arms skeleton (rest-pose retarget).")
+    # retarget) so it bonemerges cleanly onto weapon viewmodels. ONLY when "use experimental arms" is
+    # enabled -- the default (off) keeps the MMD-proportion skeleton so Step 14 emits the original
+    # proportion-driven c_arms. NOT done for L4D2 (its v_arms keep the full-body skeleton + proportion
+    # trick) or SFM (Step 10 is skipped). Runs after the cut; the cut itself is unchanged.
+    conform_report: dict[str, object] = {"applied": False, "game": game, "experimental_arms": experimental_arms}
+    if game == "gmod" and experimental_arms:
+        log("Experimental arms ON: conforming c_arms mesh onto the standard GMod c_arms skeleton (rest-pose retarget).")
         std_arm = import_standard_carms_armature()
         std_bone_names = {bone.name for bone in std_arm.data.bones}
         ulna_report = prepare_ulna_weights(armature, std_bone_names)
         log(f"Ulna weights: {ulna_report}")
         conform_report = conform_meshes_to_standard(armature, std_arm)
         conform_report["game"] = game
+        conform_report["experimental_arms"] = True
         conform_report["ulna"] = ulna_report
         log(
             f"Conform applied: matched {conform_report['matched_bone_count']} bones, moved "
@@ -847,6 +854,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         # the Source export writes the standard skeleton unambiguously.
         if armature.name in bpy.data.objects:
             bpy.data.objects.remove(armature, do_unlink=True)
+    elif game == "gmod":
+        log("Experimental arms OFF: keeping the MMD-proportion skeleton; Step 14 will emit the proportion-driven c_arms.")
     texture_by_name = material_texture_map(input_dir)
     preview = collect_preview(texture_by_name)
 

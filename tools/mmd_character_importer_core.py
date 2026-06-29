@@ -4734,6 +4734,7 @@ def run_carms_sort(
     progress: ProgressCallback | None = None,
     cancel_check: CancelCheck | None = None,
     game: str = "gmod",
+    experimental_arms: bool = False,
 ) -> CArmsResult:
     input_dir = input_dir.resolve()
     final_dir, carms_dir, workspace_blend, report_path, files_path = carms_paths_for_proportion_export(input_dir)
@@ -4767,6 +4768,8 @@ def run_carms_sort(
         str(float(weight_threshold)),
         "--game",
         (str(game or "gmod").strip().lower() or "gmod"),
+        "--experimental-arms",
+        ("1" if experimental_arms else "0"),
     ]
     emit(progress, f"Starting Blender c_arms sorting: {final_dir}")
     started = time.monotonic()
