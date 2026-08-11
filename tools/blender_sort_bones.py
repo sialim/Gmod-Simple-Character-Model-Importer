@@ -54,6 +54,7 @@ BASE_PROTECTED_BONES = {
     "Eye_L",
     "Eye_R",
 }
+PRESERVED_CHAIN_HINTS = ("skirt", "dress", "cf_j_sk_")
 FACE_ROOT_HINTS = {
     "face_head",
     "facehead",
@@ -203,6 +204,11 @@ def normalized_name(name: str) -> str:
     return name.lower().replace(" ", "").replace("-", "_").replace(".", "_")
 
 
+def has_preserved_chain_hint(name: str) -> bool:
+    normalized = normalized_name(name)
+    return any(hint in normalized for hint in PRESERVED_CHAIN_HINTS)
+
+
 def natural_key(name: str) -> tuple[object, ...]:
     parts = re.split(r"(\d+)", name.lower())
     return tuple(int(part) if part.isdigit() else part for part in parts)
@@ -213,7 +219,22 @@ def is_source_bone(name: str) -> bool:
 
 
 def is_protected_bone(name: str, extra: set[str] | None = None) -> bool:
-    return is_source_bone(name) or name in BASE_PROTECTED_BONES or bool(extra and name in extra)
+    return is_source_bone(name) or name in BASE_PROTECTED_BONES or has_preserved_chain_hint(name) or bool(extra and name in extra)
+
+
+def preserved_chain_names(parents: dict[str, str | None], existing: set[str] | None = None) -> set[str]:
+    existing = existing or set(parents)
+    preserved: set[str] = set()
+    for name in existing:
+        current: str | None = name
+        seen: set[str] = set()
+        while current and current not in seen:
+            if has_preserved_chain_hint(current):
+                preserved.add(name)
+                break
+            seen.add(current)
+            current = parents.get(current)
+    return preserved
 
 
 def is_safe_bone_name(name: str) -> bool:
@@ -461,6 +482,7 @@ def automatic_plan(armature: bpy.types.Object, limit: int, weight_totals: dict[s
     existing = set(simulated_parents)
     extra_protected: set[str] = set()
     protected = {name for name in existing if is_protected_bone(name, extra_protected)}
+    protected.update(preserved_chain_names(simulated_parents, existing))
     original_depths = depth_map_from_parents(original_parents, existing)
     if weight_totals is None:
         weight_totals = vertex_group_weight_totals(associated_meshes(armature))
@@ -508,6 +530,7 @@ def automatic_plan(armature: bpy.types.Object, limit: int, weight_totals: dict[s
         used_sources: set[str] = set()
         order = 0
         protected = {name for name in existing if is_protected_bone(name, extra_protected)}
+        protected.update(preserved_chain_names(simulated_parents, existing))
 
         face_sources = face_source_names(simulated_parents, existing, protected)
         if face_sources:
@@ -584,6 +607,7 @@ def automatic_plan(armature: bpy.types.Object, limit: int, weight_totals: dict[s
         "estimated_final_bone_count": len(existing),
         "protected_bones": sorted(protected),
         "base_protected_bones": sorted(BASE_PROTECTED_BONES),
+        "preserved_chain_hints": list(PRESERVED_CHAIN_HINTS),
         "protected_prefixes": [VALVEBIPED_PREFIX],
         "operations": operations,
         "rounds": rounds,
@@ -726,6 +750,7 @@ def enabled_operations(plan: dict[str, object]) -> list[dict[str, object]]:
 def protected_from_plan(plan: dict[str, object], armature: bpy.types.Object) -> set[str]:
     raw = plan.get("protected_bones", [])
     protected = {bone.name for bone in armature.data.bones if is_protected_bone(bone.name)}
+    protected.update(preserved_chain_names(parent_map(armature)))
     if isinstance(raw, list):
         protected.update(str(name) for name in raw if name)
     return protected

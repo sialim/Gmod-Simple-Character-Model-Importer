@@ -22,6 +22,7 @@ PROPORTION_TEMPLATE = PROPORTION_ROOT / "proportion_trick_4.5.10.blend"
 PROPORTION_TEXT_BLOCK = "Proportion Trick Full"
 HELPER_MESH_NAMES = {"smd_bone_vis"}
 PROTECTED_EXTRA_BONES = {"ZArmTwist_L", "ZArmTwist_R", "ZHandTwist_L", "ZHandTwist_R", "Eye_L", "Eye_R"}
+PRESERVED_CHAIN_HINTS = ("skirt", "dress", "cf_j_sk_")
 # Source's studiomdl aborts above 256 bones. Target a lower count so the Step 14
 # $definebone parent-repair (which can add a few bones) still fits under 256.
 SOURCE_MAX_BONES = 256
@@ -64,7 +65,24 @@ def hidden_subprocess_kwargs() -> dict[str, object]:
 
 
 def is_essential_bone(name: str) -> bool:
-    return name.startswith("ValveBiped") or name in PROTECTED_EXTRA_BONES
+    normalized = name.lower().replace(" ", "").replace("-", "_").replace(".", "_")
+    return (
+        name.startswith("ValveBiped")
+        or name in PROTECTED_EXTRA_BONES
+        or any(hint in normalized for hint in PRESERVED_CHAIN_HINTS)
+    )
+
+
+def is_preserved_chain_bone(name: str, parent_of: dict[str, str | None]) -> bool:
+    current: str | None = name
+    seen: set[str] = set()
+    while current and current not in seen:
+        normalized = current.lower().replace(" ", "").replace("-", "_").replace(".", "_")
+        if any(hint in normalized for hint in PRESERVED_CHAIN_HINTS):
+            return True
+        seen.add(current)
+        current = parent_of.get(current)
+    return False
 
 
 def normalize_roll_radians(value: float) -> float:
@@ -490,6 +508,11 @@ def prepare_armature_for_raw_export(armature: bpy.types.Object) -> dict[str, obj
         bone.select = True
         bone.select_head = True
         bone.select_tail = True
+    preserved_connections = {
+        bone.name: bool(bone.use_connect)
+        for bone in edit_bones
+        if is_essential_bone(bone.name) and bone.parent is not None and bone.use_connect
+    }
     before_connected = sum(1 for bone in edit_bones if bone.use_connect)
     try:
         bpy.ops.armature.parent_clear(type="DISCONNECT")
@@ -497,6 +520,10 @@ def prepare_armature_for_raw_export(armature: bpy.types.Object) -> dict[str, obj
         log(f"Armature DISCONNECT operator warning: {exc}")
         for bone in edit_bones:
             bone.use_connect = False
+    disconnected_connected = sum(1 for bone in edit_bones if bone.use_connect)
+    for bone in edit_bones:
+        if preserved_connections.get(bone.name):
+            bone.use_connect = True
     after_connected = sum(1 for bone in edit_bones if bone.use_connect)
 
     pelvis = edit_bones.get("ValveBiped.Bip01_Pelvis")
@@ -534,7 +561,9 @@ def prepare_armature_for_raw_export(armature: bpy.types.Object) -> dict[str, obj
     return {
         "armature": armature.name,
         "connected_bones_before": before_connected,
+        "connected_bones_after_disconnect": disconnected_connected,
         "connected_bones_after": after_connected,
+        "preserved_connected_bones": sorted(preserved_connections),
         "protected_bones": len(protected),
         "modified_nonessential_bones": len(modified),
         "nonessential_roll_offset_degrees": round(math.degrees(NONESSENTIAL_EXPORT_ROLL_OFFSET_RADIANS), 6),
@@ -706,7 +735,9 @@ def enforce_source_bone_limit(armature: bpy.types.Object, target: int = SOURCE_B
         candidates = [
             bone.name
             for bone in bones
-            if not is_essential_bone(bone.name) and bone.name not in has_children
+            if not is_essential_bone(bone.name)
+            and not is_preserved_chain_bone(bone.name, parent_of)
+            and bone.name not in has_children
         ]
         if not candidates:
             log("WARNING: no further non-essential leaf bones available to merge; stopping bone-limit reduction.")

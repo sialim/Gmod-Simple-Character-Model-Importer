@@ -40,12 +40,32 @@ COACD_RESULT_CACHE_VERSION = 3
 EXCLUDED_SOURCE_OBJECT_TOKENS = (
     "physics",
 )
+PRESERVED_CHAIN_HINTS = ("skirt", "dress", "cf_j_sk_")
 ACTIVE_SOURCE_BODYGROUPS: set[str] | None = None
 ACTIVE_ADDITIONAL_BONE_SELECTION: list[dict[str, object]] = []
 ACTIVE_COACD_QUALITY = "fast_preview"
 ACTIVE_RESULT_CACHE_DIR: Path | None = None
 ACTIVE_PREVIEW_CACHE_DIR: Path | None = None
 MODEL_PREVIEW_CACHE_VERSION = 1
+
+
+def has_preserved_chain_hint(name: str) -> bool:
+    normalized = str(name).lower().replace(" ", "").replace("-", "_").replace(".", "_")
+    return any(hint in normalized for hint in PRESERVED_CHAIN_HINTS)
+
+
+def is_preserved_chain_bone(armature: bpy.types.Object, name: str) -> bool:
+    current = str(name)
+    seen: set[str] = set()
+    while current and current not in seen:
+        if has_preserved_chain_hint(current):
+            return True
+        bone = armature.data.bones.get(current)
+        if bone is None or bone.parent is None:
+            break
+        seen.add(current)
+        current = bone.parent.name
+    return False
 
 COACD_QUALITY_PRESETS = {
     "fast_preview": {
@@ -784,6 +804,14 @@ def resolve_additional_collision_groups(armature: bpy.types.Object | None) -> tu
         errors.extend(f"Additional collision group {group_id}: {error}" for error in group_errors)
         if not group_bones:
             continue
+        if len(group_bones) > 1:
+            preserved = [name for name in group_bones if is_preserved_chain_bone(armature, name)]
+            if preserved:
+                errors.append(
+                    f"Additional collision group {group_id} contains preserved skirt/dress bone(s) "
+                    f"({', '.join(preserved)}); grouped reweighting is disabled for this chain."
+                )
+                continue
         # Selection order is meaningful: the first selected bone is the merge
         # target that owns the hull; the rest merge their weight regions into it.
         owner = group_bones[0]
@@ -3610,6 +3638,13 @@ def merge_additional_group_weights(
         sources = [name for name in bones if name and name != target]
         if not target or not sources or target not in armature.data.bones:
             continue
+        preserved = [name for name in bones if is_preserved_chain_bone(armature, name)]
+        if preserved:
+            log_progress(
+                f"Skipped collision group {group.get('group')} because it contains preserved skirt/dress bone(s): "
+                f"{', '.join(preserved)}."
+            )
+            continue
         group_moved = sum(transfer_vertex_weights_to_bone(mesh_obj, sources, target) for mesh_obj in render_meshes)
         if group_moved:
             moved_total += group_moved
@@ -3656,6 +3691,7 @@ def remove_merged_group_bones(
             if bone_name and bone_name != target:
                 candidates.add(bone_name)
     candidates = {name for name in candidates - targets if name in armature.data.bones}
+    candidates = {name for name in candidates if not is_preserved_chain_bone(armature, name)}
     if not candidates:
         return []
     still_weighted: set[str] = set()
@@ -3754,6 +3790,18 @@ def apply_scene(
         write_json(report_json, report)
         raise RuntimeError("Collision validation failed before apply: " + "; ".join(str(error) for error in validation.get("errors", [])))
     armature = main_armature()
+    for group in additional_groups:
+        if not isinstance(group, dict):
+            continue
+        bones = [str(name) for name in group.get("bones", []) if str(name)] if isinstance(group.get("bones"), list) else []
+        if len(bones) <= 1 or armature is None:
+            continue
+        preserved = [name for name in bones if is_preserved_chain_bone(armature, name)]
+        if preserved:
+            raise RuntimeError(
+                f"Refusing to apply additional collision group {group.get('group')} because it would merge "
+                f"preserved skirt/dress bones: {', '.join(preserved)}."
+            )
     physics = create_physics_object(armature, parts) if armature is not None else None
     log_progress("Created Physics object and assigned rigid 1.0 target-bone weights.")
     # A grouped collision part owns a single hull on its target bone; move the
