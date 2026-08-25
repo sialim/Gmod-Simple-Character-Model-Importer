@@ -49,6 +49,26 @@ STACKED_LAYER_WORDS = {
     "interior",
     "exterior",
 }
+LAYERED_FACE_MATERIAL_HINTS = (
+    "eye",
+    "eyeline",
+    "eyelash",
+    "lash",
+    "eyebrow",
+    "mayuge",
+    "hitomi",
+    "sirome",
+    "pupil",
+    "face",
+    "mouth",
+    "teeth",
+    "tooth",
+    "tongue",
+    "blush",
+    "nose",
+    "namida",
+    "tear",
+)
 TEXTURE_ALPHA_ZERO_THRESHOLD = 1.0e-6
 SUBSET_COMBINE_COVERAGE_THRESHOLD = 0.95
 IMAGE_ALPHA_STATS_CACHE: dict[str, dict[str, object]] = {}
@@ -680,6 +700,11 @@ def entry_base_zero_alpha_pixels(entry: dict[str, object]) -> int:
         return 0
 
 
+def is_layered_face_material(entry: dict[str, object]) -> bool:
+    name = str(entry.get("material_name") or "").casefold()
+    return any(hint in name for hint in LAYERED_FACE_MATERIAL_HINTS)
+
+
 def vertex_sets_by_object_uid(entries: list[dict[str, object]]) -> dict[str, dict[str, set[int]]]:
     uid_by_slot = material_slots_by_uid(entries)
     out: dict[str, dict[str, set[int]]] = defaultdict(lambda: defaultdict(set))
@@ -710,6 +735,8 @@ def subset_combine_operations(entries: list[dict[str, object]]) -> list[dict[str
                 if uid == container_uid or vertices.issubset(container_vertices)
             ]
             if len(member_uids) < 2:
+                continue
+            if any(is_layered_face_material(entry_by_uid.get(uid, {})) for uid in member_uids):
                 continue
             union_vertices: set[int] = set()
             for uid in member_uids:
@@ -785,6 +812,9 @@ def build_initial_plan(input_blend: Path, entries: list[dict[str, object]], limi
     for entry in entries:
         uid = str(entry.get("uid") or "")
         key = str(entry.get("base_color_key") or "")
+        if is_layered_face_material(entry):
+            entry["combine_target_uid"] = uid
+            continue
         if not bool(entry.get("keep", True)):
             entry["combine_target_uid"] = uid
             continue
