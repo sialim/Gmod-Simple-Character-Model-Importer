@@ -1328,6 +1328,30 @@ def orientation_code(pos: tuple[float, float, float], landmarks: dict[str, tuple
 
 def default_jiggle_params(jiggle_type: str) -> dict[str, float]:
     kind = str(jiggle_type or "Directional Jiggle")
+    if kind == "Koikatsu Skirt Jiggle":
+        return {
+            "length": 300.0,
+            "tip_mass": 0.0,
+            "pitch_stiffness": 100.0,
+            "pitch_damping": 5.0,
+            "yaw_stiffness": 100.0,
+            "yaw_damping": 5.0,
+            "along_stiffness": 100.0,
+            "along_damping": 0.0,
+            "angle_constraint": 15.0,
+        }
+    if kind == "Koikatsu Hair Jiggle":
+        return {
+            "length": 5.0,
+            "tip_mass": 0.0,
+            "pitch_stiffness": 200.0,
+            "pitch_damping": 14.0,
+            "yaw_stiffness": 200.0,
+            "yaw_damping": 14.0,
+            "along_stiffness": 100.0,
+            "along_damping": 0.0,
+            "angle_constraint": 40.0,
+        }
     if kind == "Spring Jiggle":
         return {
             "length": 15.0,
@@ -1442,8 +1466,13 @@ def classify_jigglebones(nodes: dict[int, SmdNode], stats: dict[str, dict[str, A
         else:
             near_support = nearest_dist <= near_threshold and weighted < 25 and not hint_hit
             if is_koikatsu_skirt_bone(name):
-                reason = "Koikatsu skirt chain; left rigid to preserve its imported rest pose"
+                jiggle_type = "Koikatsu Skirt Jiggle"
+                reason = "Koikatsu skirt chain; reference Source skirt profile"
                 confidence = 1.0
+            elif is_koikatsu_hair_bone(name):
+                jiggle_type = "Koikatsu Hair Jiggle"
+                reason = "Koikatsu hair chain; reference Source hair profile"
+                confidence = 0.9
             elif near_support:
                 reason = f"support/helper near {nearest_name}"
                 confidence = 0.86
@@ -1503,6 +1532,8 @@ def classify_jigglebones(nodes: dict[int, SmdNode], stats: dict[str, dict[str, A
             confidence = 0.9
         region = classify_region(ref_pos, landmarks)
         pitch_min, pitch_max, yaw_min, yaw_max = orientation_code(ref_pos, landmarks)
+        if jiggle_type == "Koikatsu Hair Jiggle":
+            yaw_min, yaw_max = -3.0, 40.0
         rows.append(
             {
                 "uid": f"bone_{node.index:03d}",
@@ -2765,6 +2796,36 @@ def directional_jiggle_block(row: dict[str, Any], invert_direction: bool = False
     ]
 
 
+def koikatsu_jiggle_block(row: dict[str, Any], jiggle_type: str) -> list[str]:
+    name = str(row.get("bone") or "")
+    params = jiggle_params_for_row(row, jiggle_type)
+    lines = [
+        f'$jigglebone "{name}"\n',
+        "{\n",
+        " is_flexible\n",
+        " {\n",
+        f"     length {fmt_qc_float(params['length'], 5.0)}\n",
+        f"     tip_mass {fmt_qc_float(params['tip_mass'], 0.0)}\n",
+    ]
+    if jiggle_type == "Koikatsu Hair Jiggle":
+        yaw = normalized_constraint(row.get("yaw_constraint"), (-3.0, 40.0))
+        lines.append(f"     yaw_constraint {yaw[0]:g} {yaw[1]:g}\n")
+    lines.extend(
+        [
+            f"     pitch_stiffness {fmt_qc_float(params['pitch_stiffness'], 200.0)}\n",
+            f"     pitch_damping {fmt_qc_float(params['pitch_damping'], 14.0)}\n",
+            f"     yaw_stiffness {fmt_qc_float(params['yaw_stiffness'], 200.0)}\n",
+            f"     yaw_damping {fmt_qc_float(params['yaw_damping'], 14.0)}\n",
+            f"     along_stiffness {fmt_qc_float(params['along_stiffness'], 100.0)}\n",
+            f"     along_damping {fmt_qc_float(params['along_damping'], 0.0)}\n",
+            f"     angle_constraint {fmt_qc_float(params['angle_constraint'], 40.0)}\n",
+            " }\n",
+            "}\n",
+        ]
+    )
+    return lines
+
+
 def jiggle_qc_blocks(plan: dict[str, Any], excluded_bones: set[str] | None = None) -> tuple[list[str], list[str], list[str]]:
     excluded_bones = excluded_bones or set()
     rows = [row for row in plan.get("rows", []) if isinstance(row, dict)]
@@ -2783,6 +2844,8 @@ def jiggle_qc_blocks(plan: dict[str, Any], excluded_bones: set[str] | None = Non
         elif jiggle_type == "Omni Jiggle":
             ignore.append(name)
             lines.extend(omni_jiggle_block(row, invert_direction))
+        elif jiggle_type in {"Koikatsu Hair Jiggle", "Koikatsu Skirt Jiggle"}:
+            lines.extend(koikatsu_jiggle_block(row, jiggle_type))
         else:
             lines.extend(directional_jiggle_block(row, invert_direction))
     return lines, jiggles, ignore
@@ -3665,6 +3728,11 @@ def is_koikatsu_eye_material(material_name: str) -> bool:
 def is_koikatsu_skirt_bone(name: str) -> bool:
     lname = lower_name(name)
     return bool(re.match(r"^(?:cf_[jd]_)?sk_", lname)) or "skirt" in lname
+
+
+def is_koikatsu_hair_bone(name: str) -> bool:
+    lname = lower_name(name)
+    return "hair" in lname or any(token in name for token in ("髪", "发", "髮"))
 
 
 def is_koikatsu_skin_material(material_name: str) -> bool:

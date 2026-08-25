@@ -21987,6 +21987,30 @@ class ImporterWindow(QtWidgets.QMainWindow):
 
     def qc_default_jiggle_params(self, jiggle_type: str) -> dict[str, float]:
         kind = str(jiggle_type or "Directional Jiggle")
+        if kind == "Koikatsu Skirt Jiggle":
+            return {
+                "length": 300.0,
+                "tip_mass": 0.0,
+                "pitch_stiffness": 100.0,
+                "pitch_damping": 5.0,
+                "yaw_stiffness": 100.0,
+                "yaw_damping": 5.0,
+                "along_stiffness": 100.0,
+                "along_damping": 0.0,
+                "angle_constraint": 15.0,
+            }
+        if kind == "Koikatsu Hair Jiggle":
+            return {
+                "length": 5.0,
+                "tip_mass": 0.0,
+                "pitch_stiffness": 200.0,
+                "pitch_damping": 14.0,
+                "yaw_stiffness": 200.0,
+                "yaw_damping": 14.0,
+                "along_stiffness": 100.0,
+                "along_damping": 0.0,
+                "angle_constraint": 40.0,
+            }
         if kind == "Spring Jiggle":
             return {
                 "length": 15.0,
@@ -22889,7 +22913,14 @@ class ImporterWindow(QtWidgets.QMainWindow):
         rows = self.qc_entries()
         self._updating_qc_table = True
         self.qc_bone_table.setRowCount(len(rows))
-        options = ["Not Jiggle", "Directional Jiggle", "Omni Jiggle", "Spring Jiggle"]
+        options = [
+            "Not Jiggle",
+            "Koikatsu Hair Jiggle",
+            "Koikatsu Skirt Jiggle",
+            "Directional Jiggle",
+            "Omni Jiggle",
+            "Spring Jiggle",
+        ]
         for row_index, entry in enumerate(rows):
             uid = str(entry.get("uid") or f"bone_{row_index + 1:03d}")
             entry["uid"] = uid
