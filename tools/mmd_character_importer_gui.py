@@ -12470,6 +12470,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.bulk_import_results = []
         self.bulk_import_failures = []
         self.bulk_import_cancel_requested = False
+        self.write_bulk_import_status("running")
         self.main_log.clear()
         self.main_files_table.setRowCount(0)
         self.main_warnings_label.clear()
@@ -12485,6 +12486,55 @@ class ImporterWindow(QtWidgets.QMainWindow):
         if busy:
             self.main_open_output_button.setEnabled(False)
 
+    def write_bulk_import_status(self, status: str) -> None:
+        output_text = str(getattr(self, "bulk_import_output_dir", "") or "").strip()
+        if not output_text:
+            return
+        output_dir = Path(output_text)
+        if not output_dir.exists():
+            return
+        queue = self.bulk_import_queue if isinstance(getattr(self, "bulk_import_queue", None), list) else []
+        completed = self.bulk_import_results if isinstance(getattr(self, "bulk_import_results", None), list) else []
+        failures = self.bulk_import_failures if isinstance(getattr(self, "bulk_import_failures", None), list) else []
+        index = max(0, int(getattr(self, "bulk_import_index", 0) or 0))
+        total = len(queue)
+        current = queue[index] if index < total and status == "running" else {}
+        completed_names = [
+            str((item.get("timing") if isinstance(item.get("timing"), dict) else {}).get("model_name") or item.get("model_name") or "unknown")
+            for item in completed if isinstance(item, dict)
+        ]
+        failed_names = [str(item.get("model_name") or "unknown") for item in failures if isinstance(item, dict)]
+        payload = {
+            "status": status,
+            "total": total,
+            "completed": len(completed),
+            "failed": len(failures),
+            "finished": len(completed) + len(failures),
+            "current_item": index + 1 if current else None,
+            "current_model": str(current.get("model_name") or "") if isinstance(current, dict) else "",
+            "completed_models": completed_names,
+            "failed_models": failed_names,
+        }
+        lines = [
+            f"Bulk queue: {status}",
+            f"Finished: {payload['finished']}/{total} ({payload['completed']} completed, {payload['failed']} failed)",
+        ]
+        if current:
+            lines.append(f"Current: {payload['current_item']}/{total} — {payload['current_model']}")
+        if completed_names:
+            lines.extend(["", "Completed:", *[f"- {name}" for name in completed_names]])
+        if failed_names:
+            lines.extend(["", "Failed:", *[f"- {name}" for name in failed_names]])
+        try:
+            json_path = output_dir / "bulk_import_queue_status.json"
+            text_path = output_dir / "bulk_import_queue_status.txt"
+            for path, text in ((json_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n"), (text_path, "\n".join(lines) + "\n")):
+                temporary = path.with_name(path.name + ".tmp")
+                temporary.write_text(text, encoding="utf-8")
+                temporary.replace(path)
+        except Exception as exc:
+            self.append_main_log(f"[Queue] Could not update queue status file: {exc}")
+
     def _start_next_bulk_import(self) -> None:
         if self.bulk_import_cancel_requested or self.bulk_import_index >= len(self.bulk_import_queue):
             self._finish_bulk_import_queue()
@@ -12495,6 +12545,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         model_name = entry["model_name"]
         self.append_main_log(f"\n===== Bulk item {ordinal}/{total}: {model_name} =====")
         self.set_main_progress(0, f"Bulk {ordinal}/{total}", f"Starting {model_name}", "#58a6ff")
+        self.write_bulk_import_status("running")
         self._active_import_problem_reasons = []
         self.worker = FullImportWorker(
             entry["pmx_path"],
@@ -12568,6 +12619,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
             )
             self.append_main_log(f"[Timing] {timing.get('model_name') or 'Model'}: {total_seconds:.1f}s total. Slowest: {summary}")
         self.bulk_import_index += 1
+        self.write_bulk_import_status("running")
         QtCore.QTimer.singleShot(0, self._start_next_bulk_import)
 
     def bulk_import_item_failed(self, message: str) -> None:
@@ -12576,6 +12628,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.bulk_import_failures.append({"model_name": model_name, "message": str(message)})
         self.append_main_log(f"Bulk item failed: {model_name}\n{message}")
         self.bulk_import_index += 1
+        self.write_bulk_import_status("running")
         QtCore.QTimer.singleShot(0, self._start_next_bulk_import)
 
     def _finish_bulk_import_queue(self) -> None:
@@ -12616,6 +12669,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 self.append_main_log(f"[Timing] Bulk timing report: {timing_path}")
             except Exception as exc:
                 self.append_main_log(f"[Timing] Could not write bulk timing report: {exc}")
+        self.write_bulk_import_status("cancelled" if cancelled else "complete")
         self.bulk_import_queue = []
         self.refresh_workspace_cache_size()
 
