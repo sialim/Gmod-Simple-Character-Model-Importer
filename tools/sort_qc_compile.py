@@ -3725,6 +3725,18 @@ def is_koikatsu_eye_material(material_name: str) -> bool:
     return "hitomi" in name or "sirome" in name
 
 
+def is_koikatsu_translucent_face_material(material_name: str) -> bool:
+    name = str(material_name or "").lower()
+    return any(token in name for token in (
+        "sirome", "eyeline", "mayuge", "noseline", "namida", "tear",
+    ))
+
+
+def is_koikatsu_two_sided_material(material_name: str) -> bool:
+    name = str(material_name or "").lower()
+    return "hair" in name or "skirt" in name or "_sk_" in name
+
+
 def is_koikatsu_skirt_bone(name: str) -> bool:
     lname = lower_name(name)
     return bool(re.match(r"^(?:cf_[jd]_)?sk_", lname)) or "skirt" in lname
@@ -3762,58 +3774,25 @@ def write_vmt(
     base_name: str | None = None,
     normal_name: str | None = None,
 ) -> None:
-    target = normalize_game(game)
-    sfm = target == "sfm"
-    shared = l4d2_shared_material_root(author, model_name, game)
-    # base_name / normal_name let a de-duplicated material point its $basetexture / $bumpmap at
-    # another material's shared VTF (merge-identical-textures). Default to this material's own name,
-    # which keeps the VMT byte-identical to before.
+    # base_name lets a de-duplicated material point at another material's shared
+    # VTF. Keep Source's default lighting model for character materials: the
+    # diffuse texture carries the illustrated shading, without a generated
+    # normal map, lightwarp, rim light, or universal phong pass.
     base_name = base_name or material_name
-    normal_name = normal_name or material_name
-    bump = f"models/{author}/{model_name}/{normal_name}_n" if has_normal else f"{shared}/normal"
-    # A per-material phong-exponent map (Step 12 PBR scheme) carries gloss in
-    # red and metallic in alpha, replacing the shared static exponent. When
-    # absent (legacy/auto-port), fall back to the shared texture so the VMT is
-    # byte-identical to before.
-    phong = phongexp_texture or f"{shared}/phong_exp"
-    phong_fresnel = "[0.0 1.5 2]" if has_normal else "[0.0 0.5 1]"
-    # SFM keeps alpha-test only for eye/effect/transparent materials; GMod/L4D2
-    # keep it on every material (unchanged, byte-identical).
-    include_alphatest = (not sfm) or sfm_material_keeps_alphatest(material_name)
     body = (
         "VertexLitGeneric\n"
         "{\n"
         f'\t$basetexture "models/{author}/{model_name}/{base_name}"\n'
-        f'\t$bumpmap "{bump}"\n'
-        '\t$nocull "1"\n'
+        '\t$surfaceprop "Flesh"\n'
     )
-    # $nodecal stops decals (bullet/blood marks) from sticking to the material. Default off keeps
-    # GMod/SFM output byte-identical; the Step 12 / main-interface toggle turns it on (default on
-    # for L4D2 survivors, where decals on a custom anime mesh look wrong).
+    if is_koikatsu_translucent_face_material(material_name):
+        body += '\t$translucent 1\n'
+    else:
+        body += '\t$alphatest 1\n'
     if nodecal:
         body += '\t$nodecal "1"\n'
-    if include_alphatest:
-        body += (
-            '\t$alphatest "1"\n'
-            "\t$alphatestreference 0.5\n"
-        )
-    body += (
-        '\t$allowalphatocoverage "1"\n'
-        f'\t$lightwarptexture "{shared}/lightwarptexture"\n'
-        '\t$phong "1"\n'
-        '\t$phongboost "1"\n'
-        '\t$phongalbedotint "1"\n'
-        f'\t$phongexponenttexture "{phong}"\n'
-        f'\t$phongfresnelranges "{phong_fresnel}"\n'
-    )
-    # SFM drops rim light ("re-lighting" / raylight): unnecessary for SFM (it is
-    # not a game), per the expert. GMod/L4D2 keep it (unchanged).
-    if not sfm:
-        body += (
-            '\t$rimlight "1"\n'
-            '\t$rimlightexponent "2"\n'
-            '\t$rimlightboost "2"\n'
-        )
+    if is_koikatsu_two_sided_material(material_name):
+        body += '\t$nocull 1\n'
     if selfillum_mask:
         body += (
             '\t$selfillum "1"\n'
