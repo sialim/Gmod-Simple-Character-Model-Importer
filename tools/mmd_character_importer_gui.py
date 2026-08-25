@@ -2821,9 +2821,12 @@ class FullImportWorker(QtCore.QThread):
         survivor: str = "producer",
         copy_to_sfm_usermod: bool = True,
         nodecal: bool = False,
-        generate_vrd: bool = True,
+        generate_vrd: bool = False,
         merge_identical_textures: bool = True,
         max_texture_edge: int = 0,
+        local_fast_output: bool = True,
+        automatic_hitboxes: bool = False,
+        ragdoll_only_output: bool = True,
     ) -> None:
         super().__init__()
         self.pmx_path = Path(pmx_path)
@@ -2846,11 +2849,20 @@ class FullImportWorker(QtCore.QThread):
         self.merge_identical_textures = bool(merge_identical_textures)
         self.max_texture_edge = int(max_texture_edge or 0)
         self.generate_vrd = bool(generate_vrd)
+        self.local_fast_output = bool(local_fast_output)
+        self.automatic_hitboxes = bool(automatic_hitboxes)
+        self.ragdoll_only_output = bool(ragdoll_only_output)
         self.bodygroup_scale_factor = float(bodygroup_scale_factor or getattr(core, "DEFAULT_BODYGROUP_SCALE_FACTOR", 40.457))
         self.cancel_requested = False
         self.step_results: dict[int, dict[str, object]] = {}
         self.optional_warnings: list[str] = []
         self.current_step = 0
+        self._timing_started = time.monotonic()
+        self._step_timing_started = self._timing_started
+        self._timing_step_titles: dict[int, str] = {}
+        self._timing_step_seconds: dict[int, float] = {}
+        self._timing_step14_operations: dict[str, object] = {}
+        self._timing_workspace: Path | None = None
 
     def cancel(self) -> None:
         self.cancel_requested = True
@@ -2862,10 +2874,52 @@ class FullImportWorker(QtCore.QThread):
         self.log.emit(message)
 
     def _stage(self, step: int, title: str, detail: str = "", color: str = "#58a6ff") -> None:
+        now = time.monotonic()
+        if self.current_step:
+            elapsed = max(0.0, now - self._step_timing_started)
+            self._timing_step_seconds[self.current_step] = self._timing_step_seconds.get(self.current_step, 0.0) + elapsed
         self.current_step = int(step)
+        self._timing_step_titles[self.current_step] = title
+        self._step_timing_started = now
         pct = max(0, min(99, int((step - 1) * 100 / 14)))
         self.progress.emit(pct, f"Step {step}: {title}", detail, color)
         self._log(f"[Main Import] Step {step} - {title}: {detail}")
+
+    def _timing_report(self, status: str, error: str = "") -> dict[str, object]:
+        now = time.monotonic()
+        if self.current_step:
+            elapsed = max(0.0, now - self._step_timing_started)
+            self._timing_step_seconds[self.current_step] = self._timing_step_seconds.get(self.current_step, 0.0) + elapsed
+            self._step_timing_started = now
+        steps = [
+            {
+                "step": step,
+                "title": self._timing_step_titles.get(step, FULL_IMPORT_STEP_TITLES.get(step, f"Step {step}")),
+                "seconds": round(seconds, 3),
+            }
+            for step, seconds in sorted(self._timing_step_seconds.items())
+        ]
+        report: dict[str, object] = {
+            "status": status,
+            "model_name": self.model_name,
+            "pmx_path": str(self.pmx_path),
+            "source_dir": str(self.source_dir),
+            "total_seconds": round(max(0.0, now - self._timing_started), 3),
+            "steps": steps,
+        }
+        if error:
+            report["error"] = error
+        if self._timing_step14_operations:
+            report["step14_operations_seconds"] = self._timing_step14_operations
+        if self._timing_workspace is not None:
+            path = self._timing_workspace / "import_timing.json"
+            try:
+                path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+                report["report_path"] = str(path)
+                self._log(f"[Timing] Wrote {path}")
+            except Exception as exc:
+                self._log(f"[Timing] Could not write timing report: {exc}")
+        return report
 
     def _write_marker(
         self,
@@ -2956,6 +3010,7 @@ class FullImportWorker(QtCore.QThread):
                 workspace_root=Path(self.workspace_root) if self.workspace_root else None,
             )
             workspace = import_result.workspace
+            self._timing_workspace = workspace.root
             self._write_marker(
                 1,
                 workspace.import_dir,
@@ -3108,10 +3163,8 @@ class FullImportWorker(QtCore.QThread):
                 self._write_marker(11, vrd.vrd_dir, outputs={"vrd": str(vrd.vrd_path)}, report_path=vrd.report_path)
                 self.step_results[11] = {"dir": str(vrd.vrd_dir), "report": str(vrd.report_path), "vrd": str(vrd.vrd_path)}
 
-            if self.game == "sfm" and not self.generate_vrd:
-                # SFM: VRD ($proceduralbones skirt helpers) is opt-in and off by default. Skip Step 11
-                # entirely so no VRD is generated or compiled; Step 14 will not warn about its absence.
-                self._log("Skipping Step 11 (Sort VRD): disabled for Source Filmmaker (enable 'Generate VRD' to include it).")
+            if not self.generate_vrd:
+                self._log("Skipping Step 11 (Sort VRD): disabled (enable 'Generate VRD' to include it).")
             else:
                 self._optional(11, "Sort VRD", run_vrd)
 
@@ -3169,6 +3222,13 @@ class FullImportWorker(QtCore.QThread):
             qc_plan["copy_to_sfm_usermod"] = bool(self.copy_to_sfm_usermod)
             qc_plan["nodecal"] = bool(self.nodecal)
             qc_plan["merge_identical_textures"] = bool(self.merge_identical_textures)
+            qc_plan["package_gma"] = not self.local_fast_output
+            qc_plan["include_compile_source_backup"] = not self.local_fast_output
+            qc_plan["capture_custom_hitboxes"] = not self.automatic_hitboxes
+            qc_plan["ragdoll_only_output"] = bool(self.ragdoll_only_output and self.game == "gmod")
+            bodygroup_manifest = self.pmx_path.with_suffix(".kpt_bodygroups.json")
+            if bodygroup_manifest.exists():
+                qc_plan["bodygroup_manifest_path"] = str(bodygroup_manifest)
             qc_plan["distribution_output_dir"] = self.distribution_output_dir
             qc_result = core.compile_and_compose_qc(proportion_result.final_dir, qc_plan, progress=self._log, cancel_check=self._cancelled)
             validation = qc_result.report.get("validation") if isinstance(qc_result.report.get("validation"), dict) else {}
@@ -3185,10 +3245,14 @@ class FullImportWorker(QtCore.QThread):
                             self.optional_warnings.append(labelled)
             self._write_marker(14, qc_result.qc_dir, outputs={"files": str(qc_result.files_path)}, report_path=qc_result.report_path, validation=validation or {"ok": True})
             self.step_results[14] = {"dir": str(qc_result.qc_dir), "report": str(qc_result.report_path), "files": str(qc_result.files_path)}
+            operation_timings = qc_result.report.get("operation_timings_seconds")
+            if isinstance(operation_timings, dict):
+                self._timing_step14_operations = dict(operation_timings)
 
             completion_title = "Import Complete With Warnings" if self.optional_warnings else "Import Complete"
             completion_color = "#d29922" if self.optional_warnings else "#2ea043"
             self.progress.emit(100, completion_title, str(qc_result.report.get("distribution_output_dir") or qc_result.report.get("addon_dir") or ""), completion_color)
+            timing = self._timing_report("complete")
             self.done.emit(
                 {
                     "workspace": str(workspace.root),
@@ -3199,9 +3263,11 @@ class FullImportWorker(QtCore.QThread):
                     "distribution_output_dir": str(qc_result.report.get("distribution_output_dir") or ""),
                     "addon_dir": str(qc_result.report.get("addon_dir") or ""),
                     "gmod_addon_dir": str(qc_result.report.get("gmod_addon_dir") or ""),
+                    "timing": timing,
                 }
             )
         except Exception as exc:
+            self._timing_report("cancelled" if self.cancel_requested else "failed", str(exc))
             if self.cancel_requested:
                 self.failed.emit("Main import was cancelled by the user.")
                 return
@@ -3650,6 +3716,12 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self._active_import_problem_reasons: list[str] = []
         self.main_pmx_paths: list[Path] = []
         self.main_output_files: dict[str, object] | None = None
+        self.bulk_import_queue: list[dict[str, str]] = []
+        self.bulk_import_index = 0
+        self.bulk_import_output_dir = ""
+        self.bulk_import_results: list[dict[str, object]] = []
+        self.bulk_import_failures: list[dict[str, str]] = []
+        self.bulk_import_cancel_requested = False
         self._loading_main_source_from_settings = False
         self.workspace_size_worker: WorkspaceSizeWorker | None = None
         self.workspace_cleanup_worker: WorkspaceCleanupWorker | None = None
@@ -4239,11 +4311,17 @@ class ImporterWindow(QtWidgets.QMainWindow):
         main_sfm_label = getattr(self, "main_copy_to_sfm_usermod_label", None)
         if isinstance(main_sfm_label, QtWidgets.QWidget):
             main_sfm_label.setVisible(sfm)
-        # SFM-only: the "generate VRD" toggle (procedural skirt bones; off by default for SFM).
         for attr in ("main_generate_vrd_check", "main_generate_vrd_label"):
             widget = getattr(self, attr, None)
             if isinstance(widget, QtWidgets.QWidget):
-                widget.setVisible(sfm)
+                widget.setVisible(True)
+        for attr in ("main_local_fast_output_check", "main_automatic_hitboxes_check"):
+            widget = getattr(self, attr, None)
+            if isinstance(widget, QtWidgets.QWidget):
+                widget.setVisible(not sfm)
+        ragdoll_only_widget = getattr(self, "main_ragdoll_only_output_check", None)
+        if isinstance(ragdoll_only_widget, QtWidgets.QWidget):
+            ragdoll_only_widget.setVisible(normalize_game_code(self.selected_game) == "gmod")
         # The $nodecal toggle applies to GMod and L4D2 only; hide it in SFM mode.
         for attr in ("main_nodecal_check", "texture_nodecal_check"):
             check = getattr(self, attr, None)
@@ -6241,9 +6319,16 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.main_pmx_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.main_refresh_pmx_button = QtWidgets.QPushButton("Refresh")
         self.main_refresh_pmx_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_BrowserReload))
+        self.main_bulk_import_button = QtWidgets.QPushButton("Bulk Queue…")
+        self.main_bulk_import_button.setToolTip(
+            "Select multiple PMX/VRM files, edit the output names, and convert them one after another without closing the app."
+        )
         pmx_layout.addLayout(pmx_header, 0, 0, 1, 2)
         pmx_layout.addWidget(self.main_pmx_combo, 1, 0)
-        pmx_layout.addWidget(self.main_refresh_pmx_button, 1, 1)
+        pmx_actions = QtWidgets.QHBoxLayout()
+        pmx_actions.addWidget(self.main_refresh_pmx_button)
+        pmx_actions.addWidget(self.main_bulk_import_button)
+        pmx_layout.addLayout(pmx_actions, 1, 1)
         pmx_layout.setColumnStretch(0, 1)
         layout.addLayout(pmx_layout)
 
@@ -6349,6 +6434,31 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.main_nodecal_check.toggled.connect(self.on_nodecal_toggled)
         form.addRow(self.main_merge_textures_check)
         self.main_merge_textures_check.toggled.connect(self.on_merge_textures_toggled)
+        self.main_local_fast_output_check = QtWidgets.QCheckBox("Local GMod fast output")
+        self.main_local_fast_output_check.setChecked(True)
+        self.main_local_fast_output_check.setToolTip(
+            "Default on for local GMod ports. Installs the normal loose addon folder but skips the redundant "
+            ".gma package and QC-source backup. Turn off only when you need a Workshop-ready .gma or a "
+            "portable source backup."
+        )
+        form.addRow(self.main_local_fast_output_check)
+        self.main_local_fast_output_check.toggled.connect(lambda _value: self.save_settings())
+        self.main_automatic_hitboxes_check = QtWidgets.QCheckBox("Use automatic hitboxes (faster compile)")
+        self.main_automatic_hitboxes_check.setChecked(False)
+        self.main_automatic_hitboxes_check.setToolTip(
+            "Skips StudioMDL's full hitbox-probe compile and lets Source generate hitboxes automatically. "
+            "Ragdoll physics is unchanged, but weapon hitboxes may be less tailored."
+        )
+        form.addRow(self.main_automatic_hitboxes_check)
+        self.main_automatic_hitboxes_check.toggled.connect(lambda _value: self.save_settings())
+        self.main_ragdoll_only_output_check = QtWidgets.QCheckBox("Ragdoll-only output (faster)")
+        self.main_ragdoll_only_output_check.setChecked(True)
+        self.main_ragdoll_only_output_check.setToolTip(
+            "Default on for local ragdoll ports. Compiles only the ragdoll model and skips the player model, "
+            "c_arms, player-registration Lua, and importer metadata. Turn off only when you need a usable player model."
+        )
+        form.addRow(self.main_ragdoll_only_output_check)
+        self.main_ragdoll_only_output_check.toggled.connect(lambda _value: self.save_settings())
         # SFM-only auto-port option (shown only in SFM mode by _refresh_gmod_only_visibility).
         self.main_copy_to_sfm_usermod_check = QtWidgets.QCheckBox("Put into SFM usermod (loose files)")
         self.main_copy_to_sfm_usermod_check.setChecked(True)
@@ -6359,15 +6469,14 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.main_copy_to_sfm_usermod_label = QtWidgets.QLabel("SFM usermod install")
         form.addRow(self.main_copy_to_sfm_usermod_label, self.main_copy_to_sfm_usermod_check)
         self.main_copy_to_sfm_usermod_check.toggled.connect(lambda _value: self.save_settings())
-        # SFM-only auto-port option (shown only in SFM mode by _refresh_gmod_only_visibility).
         self.main_generate_vrd_check = QtWidgets.QCheckBox("Generate VRD procedural skirt bones")
         self.main_generate_vrd_check.setChecked(False)
         self.main_generate_vrd_check.setToolTip(
-            "Default OFF for Source Filmmaker. When on, the auto-port runs Step 11 and compiles the VRD "
+            "Default OFF. When on, the auto-port runs Step 11 and compiles the VRD "
             "($proceduralbones) skirt/dress helpers into the model. When off, no VRD is generated, it is not "
             "compiled with the model, and Step 14 will not warn about the missing VRD."
         )
-        self.main_generate_vrd_label = QtWidgets.QLabel("SFM procedural VRD")
+        self.main_generate_vrd_label = QtWidgets.QLabel("Procedural skirt VRD")
         form.addRow(self.main_generate_vrd_label, self.main_generate_vrd_check)
         self.main_generate_vrd_check.toggled.connect(lambda _value: self.save_settings())
         layout.addLayout(form)
@@ -6553,6 +6662,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.main_language_combo.currentIndexChanged.connect(self.on_language_changed)
         self.main_gmod_row.changed.connect(lambda _value: self.save_settings())
         self.main_refresh_pmx_button.clicked.connect(self.populate_main_pmx_files)
+        self.main_bulk_import_button.clicked.connect(self.open_bulk_import_dialog)
         self.main_pmx_combo.currentIndexChanged.connect(self.on_main_pmx_changed)
         self.main_detect_gmod_button.clicked.connect(self.detect_gmod_for_main)
         self.main_preflight_button.clicked.connect(lambda: self.analyze_main_pmx(silent=False, show_special_warning_dialog=True))
@@ -10733,6 +10843,18 @@ class ImporterWindow(QtWidgets.QMainWindow):
             self.main_generate_vrd_check.setChecked(
                 self.settings_bool(self.settings_store.value("main_generate_vrd", False), False)
             )
+        if hasattr(self, "main_local_fast_output_check"):
+            self.main_local_fast_output_check.setChecked(
+                self.settings_bool(self.settings_store.value("main_local_fast_output", True), True)
+            )
+        if hasattr(self, "main_automatic_hitboxes_check"):
+            self.main_automatic_hitboxes_check.setChecked(
+                self.settings_bool(self.settings_store.value("main_automatic_hitboxes", False), False)
+            )
+        if hasattr(self, "main_ragdoll_only_output_check"):
+            self.main_ragdoll_only_output_check.setChecked(
+                self.settings_bool(self.settings_store.value("main_ragdoll_only_output", True), True)
+            )
         # Model Manager is GMod-only, so it always reads the GMod (legacy) studiomdl path.
         model_manager_gmod = str(self.settings_store.value("model_manager_gmod_path", "", str) or "")
         if not model_manager_gmod:
@@ -11020,6 +11142,12 @@ class ImporterWindow(QtWidgets.QMainWindow):
             self.settings_store.setValue("main_copy_to_sfm_usermod", self.main_copy_to_sfm_usermod_check.isChecked())
         if hasattr(self, "main_generate_vrd_check"):
             self.settings_store.setValue("main_generate_vrd", self.main_generate_vrd_check.isChecked())
+        if hasattr(self, "main_local_fast_output_check"):
+            self.settings_store.setValue("main_local_fast_output", self.main_local_fast_output_check.isChecked())
+        if hasattr(self, "main_automatic_hitboxes_check"):
+            self.settings_store.setValue("main_automatic_hitboxes", self.main_automatic_hitboxes_check.isChecked())
+        if hasattr(self, "main_ragdoll_only_output_check"):
+            self.settings_store.setValue("main_ragdoll_only_output", self.main_ragdoll_only_output_check.isChecked())
         if hasattr(self, "model_manager_gmod_row"):
             self.settings_store.setValue("model_manager_gmod_path", self.model_manager_gmod_row.value())
         if hasattr(self, "main_model_name_edit"):
@@ -12179,6 +12307,318 @@ class ImporterWindow(QtWidgets.QMainWindow):
         explicit = self.main_model_display_edit.text().strip() if hasattr(self, "main_model_display_edit") else ""
         return sanitize_display_name_text(explicit or self.qc_display_from_internal(self.main_effective_model_name(), "Mmd Model"))
 
+    def open_bulk_import_dialog(self) -> None:
+        if self._reject_if_busy():
+            return
+        start_dir = self.main_source_row.value().strip() or str(Path.home())
+        picker = QtWidgets.QMessageBox(self)
+        picker.setWindowTitle("Bulk Import Queue")
+        picker.setText("Choose models individually or scan a folder and all of its subfolders.")
+        files_button = picker.addButton("Select PMX/VRM Files…", QtWidgets.QMessageBox.ButtonRole.ActionRole)
+        folder_button = picker.addButton("Scan Folder…", QtWidgets.QMessageBox.ButtonRole.ActionRole)
+        picker.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
+        picker.exec()
+        paths: list[Path] = []
+        if picker.clickedButton() is files_button:
+            selected, _filter = QtWidgets.QFileDialog.getOpenFileNames(
+                self,
+                "Select PMX/VRM models for bulk import",
+                start_dir,
+                "MMD/VRM models (*.pmx *.vrm)",
+            )
+            paths = [Path(path).resolve() for path in selected if Path(path).is_file()]
+        elif picker.clickedButton() is folder_button:
+            selected_folder = QtWidgets.QFileDialog.getExistingDirectory(
+                self,
+                "Scan folder and subfolders for PMX/VRM models",
+                start_dir,
+            )
+            if selected_folder:
+                paths = core.find_model_files(Path(selected_folder))
+                if not paths:
+                    QtWidgets.QMessageBox.information(self, "Bulk Import Queue", "No .pmx or .vrm files were found in that folder or its subfolders.")
+        paths = sorted(set(paths), key=lambda path: str(path).lower())
+        if not paths:
+            return
+
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Bulk Import Queue")
+        dialog.resize(1080, min(720, 260 + len(paths) * 30))
+        layout = QtWidgets.QVBoxLayout(dialog)
+        note = QtWidgets.QLabel(
+            "Each PMX uses its own containing folder as its texture source. Edit the internal and display names before starting. "
+            "The queue runs sequentially and continues after a failed model; use Cancel to stop after the current model."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        selection_actions = QtWidgets.QHBoxLayout()
+        select_all_button = QtWidgets.QPushButton("Select All")
+        select_none_button = QtWidgets.QPushButton("Select None")
+        selection_actions.addWidget(select_all_button)
+        selection_actions.addWidget(select_none_button)
+        selection_actions.addStretch(1)
+        layout.addLayout(selection_actions)
+        table = QtWidgets.QTableWidget(len(paths), 4)
+        table.setHorizontalHeaderLabels(["Include", "PMX/VRM file", "Internal model name", "Display name"])
+        table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setAlternatingRowColors(True)
+        table.verticalHeader().setVisible(False)
+        table.setColumnWidth(0, 70)
+        table.setColumnWidth(1, 420)
+        table.setColumnWidth(2, 230)
+        table.horizontalHeader().setStretchLastSection(True)
+        used_names: set[str] = set()
+        for row, path in enumerate(paths):
+            candidate = self.main_model_name_candidate(path)
+            unique = candidate or f"mmd_model_{short_model_hash(path)}"
+            base = unique
+            suffix = 2
+            while unique.lower() in used_names:
+                unique = f"{base}_{suffix}"
+                suffix += 1
+            used_names.add(unique.lower())
+            include_item = QtWidgets.QTableWidgetItem()
+            include_item.setFlags(
+                QtCore.Qt.ItemFlag.ItemIsEnabled
+                | QtCore.Qt.ItemFlag.ItemIsSelectable
+                | QtCore.Qt.ItemFlag.ItemIsUserCheckable
+            )
+            include_item.setCheckState(QtCore.Qt.CheckState.Checked)
+            table.setItem(row, 0, include_item)
+            file_item = QtWidgets.QTableWidgetItem(str(path))
+            file_item.setToolTip(str(path))
+            file_item.setFlags(file_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+            table.setItem(row, 1, file_item)
+            table.setItem(row, 2, QtWidgets.QTableWidgetItem(unique))
+            table.setItem(row, 3, QtWidgets.QTableWidgetItem(self.qc_display_from_internal(unique, "Mmd Model")))
+        def set_all_included(include: bool) -> None:
+            state = QtCore.Qt.CheckState.Checked if include else QtCore.Qt.CheckState.Unchecked
+            for row in range(table.rowCount()):
+                item = table.item(row, 0)
+                if item is not None:
+                    item.setCheckState(state)
+        select_all_button.clicked.connect(lambda: set_all_included(True))
+        select_none_button.clicked.connect(lambda: set_all_included(False))
+        layout.addWidget(table, 1)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Cancel | QtWidgets.QDialogButtonBox.StandardButton.Ok
+        )
+        buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).setText("Choose Output Folder")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+
+        queue: list[dict[str, str]] = []
+        names: set[str] = set()
+        errors: list[str] = []
+        for row, path in enumerate(paths):
+            include_item = table.item(row, 0)
+            if include_item is None or include_item.checkState() != QtCore.Qt.CheckState.Checked:
+                continue
+            name_item = table.item(row, 2)
+            display_item = table.item(row, 3)
+            model_name = str(name_item.text() if name_item else "").strip()
+            display_name = str(display_item.text() if display_item else "").strip()
+            if not INTERNAL_IDENTIFIER_REQUIRED_RE.fullmatch(model_name):
+                errors.append(f"{path.name}: internal model name must use only English letters, numbers, and underscores.")
+            elif model_name.lower() in names:
+                errors.append(f"{path.name}: duplicate internal model name '{model_name}'.")
+            else:
+                names.add(model_name.lower())
+            if not is_valid_display_name_text(display_name, allow_blank=False):
+                errors.append(f"{path.name}: display name must use only English letters, spaces, and underscores.")
+            queue.append(
+                {
+                    "pmx_path": str(path),
+                    "source_dir": str(path.parent),
+                    "model_name": model_name,
+                    "display_name": display_name,
+                }
+            )
+        if not queue:
+            errors.append("Select at least one PMX/VRM file to import.")
+        category = self.main_effective_category()
+        if category and not INTERNAL_IDENTIFIER_REQUIRED_RE.fullmatch(category):
+            errors.append("Category internal name must contain only English letters, numbers, and underscores.")
+        if not is_valid_category_display_name_text(self.main_effective_category_display_name(), allow_blank=False):
+            errors.append("Category display name must contain only printable ASCII characters.")
+        gmod = self.main_gmod_row.value().strip()
+        if not gmod:
+            errors.append("Detect or browse to the GMod install/studiomdl.exe.")
+        elif not resolve_gmod_path_input(gmod).get("ok"):
+            errors.append("Invalid GMod install/studiomdl.exe path.")
+        if errors:
+            self.show_error("Bulk Import", "Blocking errors:\n" + "\n".join(f"- {error}" for error in errors))
+            return
+
+        previous_output = str(self.settings_store.value("qc_gma_output_dir", "", str) or "")
+        start_output = previous_output if previous_output and Path(previous_output).exists() else str(Path.home() / "Desktop")
+        selected_output = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Select folder for the bulk .gma and composed addon folders",
+            start_output,
+        )
+        if not selected_output:
+            return
+        self.settings_store.setValue("qc_gma_output_dir", selected_output)
+        self.save_settings()
+        self.bulk_import_queue = queue
+        self.bulk_import_index = 0
+        self.bulk_import_output_dir = selected_output
+        self.bulk_import_results = []
+        self.bulk_import_failures = []
+        self.bulk_import_cancel_requested = False
+        self.main_log.clear()
+        self.main_files_table.setRowCount(0)
+        self.main_warnings_label.clear()
+        self._set_main_import_controls(True)
+        self._start_next_bulk_import()
+
+    def _set_main_import_controls(self, busy: bool) -> None:
+        self.main_import_button.setEnabled(not busy)
+        self.main_preflight_button.setEnabled(not busy)
+        self.main_detect_gmod_button.setEnabled(not busy)
+        self.main_bulk_import_button.setEnabled(not busy)
+        self.main_cancel_button.setEnabled(busy)
+        if busy:
+            self.main_open_output_button.setEnabled(False)
+
+    def _start_next_bulk_import(self) -> None:
+        if self.bulk_import_cancel_requested or self.bulk_import_index >= len(self.bulk_import_queue):
+            self._finish_bulk_import_queue()
+            return
+        entry = self.bulk_import_queue[self.bulk_import_index]
+        ordinal = self.bulk_import_index + 1
+        total = len(self.bulk_import_queue)
+        model_name = entry["model_name"]
+        self.append_main_log(f"\n===== Bulk item {ordinal}/{total}: {model_name} =====")
+        self.set_main_progress(0, f"Bulk {ordinal}/{total}", f"Starting {model_name}", "#58a6ff")
+        self._active_import_problem_reasons = []
+        self.worker = FullImportWorker(
+            entry["pmx_path"],
+            entry["source_dir"],
+            self.main_gmod_row.value(),
+            self.main_effective_category(),
+            self.main_effective_category_display_name(),
+            model_name,
+            entry["display_name"],
+            self.bulk_import_output_dir,
+            self.bodygroup_vertex_limit(),
+            self.main_clear_custom_normals_enabled(),
+            self.main_workspace_edit.text().strip(),
+            collision_quality=(
+                str(self.collision_quality_combo.currentData() or "balanced")
+                if hasattr(self, "collision_quality_combo")
+                else "balanced"
+            ),
+            gender=self.current_character_gender(),
+            bodygroup_scale_factor=self.main_effective_bodygroup_scale(),
+            game=self.selected_game,
+            survivor=self.current_selected_survivor(),
+            copy_to_sfm_usermod=(
+                self.main_copy_to_sfm_usermod_check.isChecked()
+                if hasattr(self, "main_copy_to_sfm_usermod_check")
+                else True
+            ),
+            nodecal=self.current_nodecal_enabled(),
+            merge_identical_textures=self.current_merge_textures_enabled(),
+            max_texture_edge=self.current_texture_max_edge(),
+            generate_vrd=(
+                bool(self.main_generate_vrd_check.isChecked())
+                if hasattr(self, "main_generate_vrd_check")
+                else False
+            ),
+            local_fast_output=(
+                bool(self.main_local_fast_output_check.isChecked())
+                if hasattr(self, "main_local_fast_output_check")
+                else True
+            ),
+            automatic_hitboxes=(
+                bool(self.main_automatic_hitboxes_check.isChecked())
+                if hasattr(self, "main_automatic_hitboxes_check")
+                else False
+            ),
+            ragdoll_only_output=(
+                bool(self.main_ragdoll_only_output_check.isChecked())
+                if hasattr(self, "main_ragdoll_only_output_check")
+                else True
+            ),
+        )
+        self.worker.log.connect(self.append_main_log)
+        self.worker.progress.connect(self.set_main_progress)
+        self.worker.done.connect(self.bulk_import_item_done)
+        self.worker.failed.connect(self.bulk_import_item_failed)
+        self.worker.start()
+
+    def bulk_import_item_done(self, result: dict) -> None:
+        self.bulk_import_results.append(result)
+        timing = result.get("timing") if isinstance(result.get("timing"), dict) else {}
+        total_seconds = float(timing.get("total_seconds", 0.0) or 0.0)
+        if total_seconds > 0.0:
+            slowest = sorted(
+                (item for item in timing.get("steps", []) if isinstance(item, dict)),
+                key=lambda item: float(item.get("seconds", 0.0) or 0.0),
+                reverse=True,
+            )[:3]
+            summary = ", ".join(
+                f"Step {item.get('step')} {item.get('title')}: {float(item.get('seconds', 0.0) or 0.0):.1f}s"
+                for item in slowest
+            )
+            self.append_main_log(f"[Timing] {timing.get('model_name') or 'Model'}: {total_seconds:.1f}s total. Slowest: {summary}")
+        self.bulk_import_index += 1
+        QtCore.QTimer.singleShot(0, self._start_next_bulk_import)
+
+    def bulk_import_item_failed(self, message: str) -> None:
+        entry = self.bulk_import_queue[self.bulk_import_index] if self.bulk_import_index < len(self.bulk_import_queue) else {}
+        model_name = str(entry.get("model_name") or "unknown")
+        self.bulk_import_failures.append({"model_name": model_name, "message": str(message)})
+        self.append_main_log(f"Bulk item failed: {model_name}\n{message}")
+        self.bulk_import_index += 1
+        QtCore.QTimer.singleShot(0, self._start_next_bulk_import)
+
+    def _finish_bulk_import_queue(self) -> None:
+        completed = len(self.bulk_import_results)
+        failed = len(self.bulk_import_failures)
+        total = len(self.bulk_import_queue)
+        cancelled = self.bulk_import_cancel_requested
+        self._set_main_import_controls(False)
+        self.bulk_import_cancel_requested = False
+        if self.bulk_import_results:
+            last_result = self.bulk_import_results[-1]
+            output_folder = str(last_result.get("distribution_output_dir") or last_result.get("addon_dir") or last_result.get("gmod_addon_dir") or self.bulk_import_output_dir)
+            self.last_main_output_folder = output_folder
+            self.main_open_output_button.setEnabled(bool(output_folder and Path(output_folder).exists()))
+            self.main_output_files = last_result.get("qc_files") if isinstance(last_result.get("qc_files"), dict) else {}
+            self.populate_main_files_table(self.main_output_files.get("files", []) if self.main_output_files else [])
+        self.set_main_progress(100 if not cancelled else self.main_progress_bar.value(), "Bulk import complete" if not cancelled else "Bulk import cancelled", f"{completed} completed, {failed} failed", "#2ea043" if not failed else "#d29922")
+        if failed:
+            names = "\n".join(f"- {item['model_name']}" for item in self.bulk_import_failures)
+            self.main_warnings_label.setText(f'<span style="color:#d29922;">Bulk queue: {completed} completed, {failed} failed.</span><br>{html.escape(names)}')
+        else:
+            self.main_warnings_label.setText(f'<span style="color:#2ea043;">Bulk queue completed: {completed}/{total} models.</span>')
+        if self.bulk_import_output_dir:
+            timing_path = Path(self.bulk_import_output_dir) / "bulk_import_timing_report.json"
+            timing_report = {
+                "status": "cancelled" if cancelled else "complete",
+                "completed": completed,
+                "failed": failed,
+                "models": [
+                    result.get("timing")
+                    for result in self.bulk_import_results
+                    if isinstance(result.get("timing"), dict)
+                ],
+                "failures": self.bulk_import_failures,
+            }
+            try:
+                timing_path.write_text(json.dumps(timing_report, ensure_ascii=False, indent=2), encoding="utf-8")
+                self.append_main_log(f"[Timing] Bulk timing report: {timing_path}")
+            except Exception as exc:
+                self.append_main_log(f"[Timing] Could not write bulk timing report: {exc}")
+        self.bulk_import_queue = []
+        self.refresh_workspace_cache_size()
+
     def start_full_import(self) -> None:
         if self._reject_if_busy():
             return
@@ -12258,9 +12698,23 @@ class ImporterWindow(QtWidgets.QMainWindow):
             merge_identical_textures=self.current_merge_textures_enabled(),
             max_texture_edge=self.current_texture_max_edge(),
             generate_vrd=(
-                # VRD is opt-in for SFM (default off); always generated for GMod/L4D2.
                 bool(self.main_generate_vrd_check.isChecked())
-                if (self.selected_game == "sfm" and hasattr(self, "main_generate_vrd_check"))
+                if hasattr(self, "main_generate_vrd_check")
+                else False
+            ),
+            local_fast_output=(
+                bool(self.main_local_fast_output_check.isChecked())
+                if hasattr(self, "main_local_fast_output_check")
+                else True
+            ),
+            automatic_hitboxes=(
+                bool(self.main_automatic_hitboxes_check.isChecked())
+                if hasattr(self, "main_automatic_hitboxes_check")
+                else False
+            ),
+            ragdoll_only_output=(
+                bool(self.main_ragdoll_only_output_check.isChecked())
+                if hasattr(self, "main_ragdoll_only_output_check")
                 else True
             ),
         )
@@ -12775,9 +13229,11 @@ class ImporterWindow(QtWidgets.QMainWindow):
         return self.translate_runtime_text(text)
 
     def cancel_full_import(self) -> None:
+        if self.bulk_import_queue:
+            self.bulk_import_cancel_requested = True
         if self.worker and self.worker.isRunning() and hasattr(self.worker, "cancel"):
             self.worker.cancel()  # type: ignore[attr-defined]
-            self.append_main_log("Cancel requested.")
+            self.append_main_log("Cancel requested; the bulk queue will stop after the current model.")
 
     def full_import_done(self, result: dict) -> None:
         self.main_import_button.setEnabled(True)

@@ -31,3 +31,4 @@ MMDCharacterImporter.spec
 /smoke_tests
 GmodSimpleMMDCharacterImporter.spec
 GmodSimpleMMDCharacterImporter_NoBlender.spec
+sheepyfixed.spec

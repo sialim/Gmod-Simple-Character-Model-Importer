@@ -1441,7 +1441,10 @@ def classify_jigglebones(nodes: dict[int, SmdNode], stats: dict[str, dict[str, A
             confidence = 1.0
         else:
             near_support = nearest_dist <= near_threshold and weighted < 25 and not hint_hit
-            if near_support:
+            if is_koikatsu_skirt_bone(name):
+                reason = "Koikatsu skirt chain; left rigid to preserve its imported rest pose"
+                confidence = 1.0
+            elif near_support:
                 reason = f"support/helper near {nearest_name}"
                 confidence = 0.86
             elif any(hint in lname or hint in name for hint in spring_hints):
@@ -2130,6 +2133,119 @@ def default_bodygroup_rows(step9_dir: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def smd_marker_materials(path: Path) -> set[str]:
+    markers: set[str] = set()
+    try:
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            value = line.strip()
+            if value.upper().startswith("KPTBG_"):
+                markers.add(value.casefold())
+    except OSError:
+        pass
+    return markers
+
+
+def combine_bodygroup_smds(destination: Path, sources: list[Path], material_names: dict[str, str]) -> bool:
+    if not sources:
+        return False
+    header = ""
+    triangles: list[str] = []
+    for index, source in enumerate(sources):
+        text = source.read_text(encoding="utf-8", errors="ignore")
+        marker = "\ntriangles\n"
+        start = text.find(marker)
+        end = text.rfind("\nend")
+        if start < 0 or end <= start:
+            return False
+        if index == 0:
+            header = text[: start + len(marker)]
+        body = text[start + len(marker) : end]
+        for line in body.splitlines():
+            replacement = material_names.get(line.strip().casefold())
+            triangles.append(replacement if replacement else line)
+    destination.write_text(header + "\n".join(triangles) + "\nend\n", encoding="utf-8")
+    return True
+
+
+def apply_kpt_bodygroup_manifest(plan: dict[str, Any], source_dir: Path) -> list[str]:
+    path_text = str(plan.get("bodygroup_manifest_path") or "").strip()
+    if not path_text:
+        return []
+    path = Path(path_text)
+    if not path.exists():
+        return [f"Bodygroup manifest was not found: {path}"]
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return [f"Could not read bodygroup manifest {path.name}: {exc}"]
+    groups = payload.get("groups") if isinstance(payload, dict) else None
+    rows = plan.get("bodygroups") if isinstance(plan.get("bodygroups"), list) else []
+    if not isinstance(groups, list) or not rows:
+        return [f"Bodygroup manifest {path.name} has no usable groups."]
+    markers_to_rows: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        smd = source_dir / str(row.get("smd") or "")
+        for marker in smd_marker_materials(smd):
+            markers_to_rows.setdefault(marker, []).append(row)
+    warnings: list[str] = []
+    applied = 0
+    for group_index, group in enumerate(groups, start=1):
+        if not isinstance(group, dict):
+            continue
+        group_name = str(group.get("name") or f"Bodygroup_{group_index}").strip()
+        variants = group.get("variants") if isinstance(group.get("variants"), list) else []
+        for variant_index, variant in enumerate(variants, start=1):
+            if not isinstance(variant, dict):
+                continue
+            marker_entries = variant.get("markers", []) if isinstance(variant.get("markers"), list) else []
+            marker_names = {
+                str(value.get("marker") if isinstance(value, dict) else value).casefold()
+                for value in marker_entries
+                if str(value.get("marker") if isinstance(value, dict) else value)
+            }
+            material_names = {
+                str(value.get("marker") or "").casefold(): str(value.get("material") or "")
+                for value in marker_entries if isinstance(value, dict) and str(value.get("material") or "")
+            }
+            markers = marker_names
+            matches = {id(row): row for marker in markers for row in markers_to_rows.get(marker, [])}.values()
+            if not matches:
+                warnings.append(f"{group_name}: option {variant.get('name') or variant_index} had no matching PMX section.")
+                continue
+            matched_rows = list(matches)
+            if any(bool(row.get("has_flex")) for row in matched_rows):
+                for row in matched_rows:
+                    if bool(row.get("has_flex")):
+                        warnings.append(f"{group_name}: skipped flex section {row.get('name')}; flex sections cannot be switchable.")
+                continue
+            safe_group = safe_internal_identifier(group_name, f"Bodygroup_{group_index}")
+            generated_name = f"KPTBG_{group_index:02d}_{variant_index:02d}.smd"
+            generated_path = source_dir / generated_name
+            source_paths = [source_dir / str(row.get("smd") or "") for row in matched_rows]
+            if not combine_bodygroup_smds(generated_path, source_paths, material_names):
+                warnings.append(f"{group_name}: could not combine option {variant.get('name') or variant_index}.")
+                continue
+            for row in matched_rows:
+                row["exclude_from_qc"] = True
+            rows.append({
+                "smd": generated_name,
+                "name": safe_internal_identifier(str(variant.get("name") or f"Option_{variant_index}"), f"Option_{variant_index}"),
+                "group": safe_group,
+                "can_hide": bool(group.get("can_hide", True)),
+                "has_flex": False,
+                "kpt_variant_order": variant_index,
+                "kpt_variant_default": bool(variant.get("default", False)),
+            })
+            applied += 1
+    if applied:
+        plan["kpt_bodygroup_manifest_applied"] = str(path)
+    else:
+        warnings.append(f"No marked bodygroup sections from {path.name} reached Step 14.")
+    return warnings
+
+
 def _bodygroup_qc_blocks_scan(source_dir: Path, include_flexes: bool) -> list[str]:
     """Back-compat default: every SMD is its own bodygroup, hideable except the
     core body parts (ESSENTIAL_BODYGROUP_NAMES); flex SMDs (with a .vta) become
@@ -2169,7 +2285,8 @@ def _bodygroup_qc_blocks_from_config(source_dir: Path, include_flexes: bool, bod
     one switchable $bodygroup; non-hideable groups omit `blank`. Flex SMDs are
     always their own $model (never grouped or hidden)."""
     lines: list[str] = []
-    valid = [row for row in bodygroups if isinstance(row, dict) and str(row.get("smd") or "")]
+    excluded = {str(row.get("smd") or "") for row in bodygroups if isinstance(row, dict) and bool(row.get("exclude_from_qc"))}
+    valid = [row for row in bodygroups if isinstance(row, dict) and not bool(row.get("exclude_from_qc")) and str(row.get("smd") or "")]
     flex_names = {
         str(row.get("name") or Path(str(row.get("smd"))).stem)
         for row in valid
@@ -2189,7 +2306,14 @@ def _bodygroup_qc_blocks_from_config(source_dir: Path, include_flexes: bool, bod
             group = str(row.get("group") or name).strip() or name
             if group in flex_names:  # never merge a part into a flex part's group
                 group = name
-        member = {"smd": smd, "name": name, "has_flex": has_flex, "can_hide": bool(row.get("can_hide", True))}
+        member = {
+            "smd": smd,
+            "name": name,
+            "has_flex": has_flex,
+            "can_hide": bool(row.get("can_hide", True)),
+            "variant_order": int(row.get("kpt_variant_order", 0) or 0),
+            "variant_default": bool(row.get("kpt_variant_default", False)),
+        }
         if group not in groups:
             groups[group] = []
             order.append(group)
@@ -2206,10 +2330,10 @@ def _bodygroup_qc_blocks_from_config(source_dir: Path, include_flexes: bool, bod
                 lines.extend(bodygroup_group_block(member["name"], [member["smd"]], False))
         nonflex = [m for m in members if not m["has_flex"]]
         if nonflex:
-            # Show the part whose name matches the group first (the default option),
-            # then the rest in their listed order.
-            anchor = [m for m in nonflex if m["name"] == group]
-            rest = [m for m in nonflex if m["name"] != group]
+            marked_default = [m for m in nonflex if m["variant_default"]]
+            anchor = marked_default or [m for m in nonflex if m["name"] == group]
+            rest = [m for m in nonflex if m not in anchor]
+            rest.sort(key=lambda member: (member["variant_order"] or 999999, natural_key(member["name"])))
             studios = [m["smd"] for m in anchor + rest]
             can_hide = all(bool(m["can_hide"]) for m in nonflex)
             lines.extend(bodygroup_group_block(group, studios, can_hide))
@@ -2217,7 +2341,7 @@ def _bodygroup_qc_blocks_from_config(source_dir: Path, include_flexes: bool, bod
     # new part) falls back to its own bodygroup so nothing is dropped, hideable
     # unless it is a core body part.
     for smd in sorted(source_dir.glob("*.smd"), key=lambda item: natural_key(item.name)):
-        if smd.name in covered or smd.name == "Physics.smd":
+        if smd.name in covered or smd.name in excluded or smd.name == "Physics.smd":
             continue
         stem = smd.stem
         vta = source_dir / f"{stem}.vta"
@@ -3533,6 +3657,25 @@ SFM_ALPHATEST_KEEP_HINTS = (
 )
 
 
+def is_koikatsu_eye_material(material_name: str) -> bool:
+    name = str(material_name or "").lower()
+    return "hitomi" in name or "sirome" in name
+
+
+def is_koikatsu_skirt_bone(name: str) -> bool:
+    lname = lower_name(name)
+    return bool(re.match(r"^(?:cf_[jd]_)?sk_", lname)) or "skirt" in lname
+
+
+def is_koikatsu_skin_material(material_name: str) -> bool:
+    name = str(material_name or "").lower()
+    if is_koikatsu_eye_material(name):
+        return False
+    return any(token in name for token in (
+        "cf_m_body", "cf_m_face", "_body", "_face", "skin", "kupa", "gomu", "nip_",
+    ))
+
+
 def sfm_material_keeps_alphatest(material_name: str) -> bool:
     lname = str(material_name or "").strip().lower()
     return any(token in lname for token in SFM_ALPHATEST_KEEP_HINTS)
@@ -4725,6 +4868,13 @@ def compose(plan_path: Path) -> dict[str, Any]:
         shutil.rmtree(addon_dir)
     addon_dir.mkdir(parents=True, exist_ok=True)
     emit("Prepared QC source folder.")
+    marker_warnings = apply_kpt_bodygroup_manifest(plan, source_dir)
+    if marker_warnings:
+        warnings.extend(marker_warnings)
+        plan["warnings"] = warnings
+        write_json(plan_path, plan)
+        for warning in marker_warnings:
+            emit("WARNING: " + warning)
 
     gmod = dict(plan["gmod"]) if isinstance(plan.get("gmod"), dict) else {}
     # Re-resolve the game tooling (studiomdl + game dir) for the plan's TARGET game so the compile
@@ -4758,14 +4908,31 @@ def compose(plan_path: Path) -> dict[str, Any]:
     model = str(plan["model_name"])
     l4d2 = normalize_game(plan.get("game")) == "l4d2"
     sfm = normalize_game(plan.get("game")) == "sfm"
-    single_model = l4d2 or sfm  # no GMod-style "_pm" playermodel variant
+    ragdoll_only_output = normalize_game(plan.get("game")) == "gmod" and bool(plan.get("ragdoll_only_output", False))
+    single_model = l4d2 or sfm or ragdoll_only_output
     survivor_slot = normalize_survivor(plan.get("survivor"))
+    capture_custom_hitboxes = bool(plan.get("capture_custom_hitboxes", True))
+    package_gma = bool(plan.get("package_gma", True))
+    include_compile_source_backup = bool(plan.get("include_compile_source_backup", True))
+    operation_timings: dict[str, float] = {}
+
+    def timed_operation(label: str, operation: Any) -> Any:
+        started = time.monotonic()
+        try:
+            return operation()
+        finally:
+            elapsed = max(0.0, time.monotonic() - started)
+            operation_timings[label] = operation_timings.get(label, 0.0) + elapsed
+            emit(f"Timing {label}: {elapsed:.1f}s")
 
     initial_qc = source_dir / "compile_initial.qc"
     write_lines(initial_qc, base_qc_lines(plan, source_dir, pm=False, include_flexes=False, for_definebone_capture=True))
     define_log = qc_dir / "compile_definebones.log"
     emit("Running studiomdl -definebones.")
-    code, define_output = run_command([str(studiomdl), "-game", str(game_dir), "-definebones", "-nop4", "-verbose", str(initial_qc)], define_log, cwd=source_dir)
+    code, define_output = timed_operation(
+        "studiomdl_definebones",
+        lambda: run_command([str(studiomdl), "-game", str(game_dir), "-definebones", "-nop4", "-verbose", str(initial_qc)], define_log, cwd=source_dir),
+    )
     definebone_repair_reports: list[dict[str, Any]] = []
     if code != 0:
         reason = f"StudioMDL -definebones failed with exit code {code}; see {define_log}"
@@ -4840,23 +5007,30 @@ def compose(plan_path: Path) -> dict[str, Any]:
         ),
     )
     hbox_log = qc_dir / "compile_hbox.log"
-    emit("Running studiomdl -h for hitbox capture.")
-    hbox_code, hbox_output = run_command([str(studiomdl), "-game", str(game_dir), "-nop4", "-verbose", "-h", str(hbox_probe_qc)], hbox_log, cwd=source_dir)
-    hboxes = extract_hboxes(hbox_output)
-    emit(f"Captured {len(hboxes)} hitbox lines.")
-    if hbox_code != 0 or not hboxes:
-        hbox_warning = (
-            f"Hitbox probe {'failed with exit code ' + str(hbox_code) if hbox_code != 0 else 'completed'}"
-            " but produced no usable $hbox lines; the compiled model will use auto-generated hitboxes. "
-            f"See {hbox_log}"
-        ) if not hboxes else (
-            f"Hitbox probe exited with code {hbox_code}; captured $hbox lines may be incomplete. See {hbox_log}"
+    if capture_custom_hitboxes:
+        emit("Running studiomdl -h for hitbox capture.")
+        hbox_code, hbox_output = timed_operation(
+            "studiomdl_hitbox_probe",
+            lambda: run_command([str(studiomdl), "-game", str(game_dir), "-nop4", "-verbose", "-h", str(hbox_probe_qc)], hbox_log, cwd=source_dir),
         )
-        warnings.append(hbox_warning)
-        emit("WARNING: " + hbox_warning)
+        hboxes = extract_hboxes(hbox_output)
+        emit(f"Captured {len(hboxes)} hitbox lines.")
+        if hbox_code != 0 or not hboxes:
+            hbox_warning = (
+                f"Hitbox probe {'failed with exit code ' + str(hbox_code) if hbox_code != 0 else 'completed'}"
+                " but produced no usable $hbox lines; the compiled model will use auto-generated hitboxes. "
+                f"See {hbox_log}"
+            ) if not hboxes else (
+                f"Hitbox probe exited with code {hbox_code}; captured $hbox lines may be incomplete. See {hbox_log}"
+            )
+            warnings.append(hbox_warning)
+            emit("WARNING: " + hbox_warning)
+    else:
+        hboxes = []
+        emit("Skipping hitbox probe; Source will generate hitboxes automatically.")
 
     main_qc = source_dir / "compile.qc"
-    pm_qc = source_dir / "compile_pm.qc"
+    pm_qc = None if ragdoll_only_output else source_dir / "compile_pm.qc"
     flex_compile_enabled = True
     flex_compile_disabled_reason = ""
 
@@ -4874,26 +5048,30 @@ def compose(plan_path: Path) -> dict[str, Any]:
                 include_flexes=flex_compile_enabled,
             ),
         )
-        write_lines(
-            pm_qc,
-            base_qc_lines(
-                plan,
-                source_dir,
-                pm=True,
-                include_definebones=definebones,
-                include_jiggles=jiggle_lines,
-                include_hboxes=hboxes,
-                include_collision=True,
-                include_flexes=flex_compile_enabled,
-            ),
-        )
-        return build_carms_qc(plan, source_dir, definebones)
+        if pm_qc is not None:
+            write_lines(
+                pm_qc,
+                base_qc_lines(
+                    plan,
+                    source_dir,
+                    pm=True,
+                    include_definebones=definebones,
+                    include_jiggles=jiggle_lines,
+                    include_hboxes=hboxes,
+                    include_collision=True,
+                    include_flexes=flex_compile_enabled,
+                ),
+            )
+        return None if ragdoll_only_output else build_carms_qc(plan, source_dir, definebones)
 
     carms_qc = refresh_compile_qcs()
 
     def compile_with_definebone_repair(label: str, qc_path: Path, log_path: Path) -> tuple[str, bool]:
         nonlocal definebones, carms_qc, definebone_support_bones
-        output = compile_one(compile_studiomdl, compile_game_dir, qc_path, log_path)
+        output = timed_operation(
+            f"studiomdl_{label}",
+            lambda: compile_one(compile_studiomdl, compile_game_dir, qc_path, log_path),
+        )
         missing, warning_lines = parse_missing_parent_warnings(output)
         if not missing:
             return output, False
@@ -4923,7 +5101,10 @@ def compose(plan_path: Path) -> dict[str, Any]:
         refresh_jiggle_outputs()
         carms_qc = refresh_compile_qcs()
         retry_log = log_path.with_name(f"{log_path.stem}_retry{log_path.suffix}")
-        retry_output = compile_one(compile_studiomdl, compile_game_dir, qc_path, retry_log)
+        retry_output = timed_operation(
+            f"studiomdl_{label}_retry",
+            lambda: compile_one(compile_studiomdl, compile_game_dir, qc_path, retry_log),
+        )
         retry_missing, retry_warnings = parse_missing_parent_warnings(retry_output)
         if retry_missing:
             missing_text = ", ".join(sorted(retry_missing, key=natural_key))
@@ -4972,7 +5153,7 @@ def compose(plan_path: Path) -> dict[str, Any]:
         )
         compile_material_outputs.append(_main_output)
         pm_repaired = False
-        if not single_model:
+        if pm_qc is not None:
             emit("Compiling player model.")
             _pm_output, pm_repaired = compile_with_definebone_repair(
                 f"player{('_' + log_suffix) if log_suffix else ''}",
@@ -5004,7 +5185,7 @@ def compose(plan_path: Path) -> dict[str, Any]:
                     compile_log_path("compile_main_after_carms_definebone_repair", log_suffix),
                 )
                 compile_material_outputs.append(_main_output)
-                if not single_model:
+                if pm_qc is not None:
                     _pm_output, _ = compile_with_definebone_repair(
                         f"player_after_carms_repair{('_' + log_suffix) if log_suffix else ''}",
                         pm_qc,
@@ -5012,7 +5193,7 @@ def compose(plan_path: Path) -> dict[str, Any]:
                     )
                     compile_material_outputs.append(_pm_output)
 
-    if not carms_qc and not sfm:
+    if not carms_qc and not sfm and not ragdoll_only_output:
         # SFM does not use c_arms (Step 10 is skipped), so its absence is expected -- no warning.
         warnings.append("Step 10 c_arms output was not found; c_arms QC and Lua hands registration were skipped.")
     fallback_compile_used = False
@@ -5104,25 +5285,29 @@ def compose(plan_path: Path) -> dict[str, Any]:
         "definebones": str(define_log),
         "hitbox_probe": str(hbox_log),
         "main": str(compile_log_path("compile_main", successful_compile_log_suffix)),
-        "player": str(compile_log_path("compile_pm", successful_compile_log_suffix)),
     }
+    if pm_qc is not None:
+        studiomdl_logs["player"] = str(compile_log_path("compile_pm", successful_compile_log_suffix))
     if carms_qc:
         studiomdl_logs["c_arms"] = str(compile_log_path("compile_carms", successful_compile_log_suffix))
 
     emit("Composing final addon folder.")
     generated_files: list[dict[str, Any]] = []
     compile_source_copy_dir = workspace_compile_source_copy_dir(qc_dir)
-    try:
-        if same_resolved_path(source_dir, compile_source_copy_dir):
-            generated_files.append(folder_row(compile_source_copy_dir, "qc_compile_source", ["Already the active StudioMDL compile source folder."]))
-        else:
-            copytree_clean(source_dir, compile_source_copy_dir)
-            generated_files.append(folder_row(compile_source_copy_dir, "qc_compile_source"))
-        # Keep only the re-compilable QCs in the distributed source copy. The
-        # distribution copy below is made from this folder, so it inherits the prune.
-        prune_extra_compile_source_qc(compile_source_copy_dir)
-    except Exception as exc:
-        errors.append(f"Failed to copy QC compile source folder: {exc}")
+    if include_compile_source_backup:
+        try:
+            def copy_compile_source() -> None:
+                if same_resolved_path(source_dir, compile_source_copy_dir):
+                    generated_files.append(folder_row(compile_source_copy_dir, "qc_compile_source", ["Already the active StudioMDL compile source folder."]))
+                else:
+                    copytree_clean(source_dir, compile_source_copy_dir)
+                    generated_files.append(folder_row(compile_source_copy_dir, "qc_compile_source"))
+                prune_extra_compile_source_qc(compile_source_copy_dir)
+            timed_operation("copy_qc_source_backup", copy_compile_source)
+        except Exception as exc:
+            errors.append(f"Failed to copy QC compile source folder: {exc}")
+    else:
+        emit("Skipping QC source backup for local fast output.")
     if l4d2:
         compiled_files, compiled_errors = copy_compiled_outputs_l4d2(compile_game_dir, addon_dir, survivor_slot, carms_qc is not None)
     else:
@@ -5130,7 +5315,10 @@ def compose(plan_path: Path) -> dict[str, Any]:
     generated_files.extend(compiled_files)
     errors.extend(compiled_errors)
     used_materials = parse_used_materials(compile_material_outputs)
-    material_files, material_warnings, material_errors = compose_materials(plan, addon_dir, used_materials)
+    material_files, material_warnings, material_errors = timed_operation(
+        "compose_materials_and_vtf",
+        lambda: compose_materials(plan, addon_dir, used_materials),
+    )
     generated_files.extend(material_files)
     warnings.extend(material_warnings)
     errors.extend(material_errors)
@@ -5152,18 +5340,21 @@ def compose(plan_path: Path) -> dict[str, Any]:
         # metadata/addon.json and no L4D2 addoninfo.
         emit("SFM: composing loose model + materials only (no GMod lua/spawn-icons/metadata).")
     else:
-        icon_files, icon_warnings = compose_icons(plan, addon_dir)
-        generated_files.extend(icon_files)
-        warnings.extend(icon_warnings)
-        lua_path = write_lua(plan, addon_dir, carms_qc is not None)
-        generated_files.append(file_row(lua_path, "lua"))
-        if include_mci_metadata_json:
-            simple_vrd_immunity_path = write_simple_vrd_immunity(plan, addon_dir, carms_qc is not None)
-            generated_files.append(file_row(simple_vrd_immunity_path, "simple_vrd_immunity"))
-            dynamic_model_manifest_path = write_dynamic_model_importer_manifest(plan, addon_dir, carms_qc is not None)
-            generated_files.append(file_row(dynamic_model_manifest_path, "dynamic_model_importer_manifest"))
+        if ragdoll_only_output:
+            emit("Ragdoll-only output: skipped player model, c_arms, player-registration Lua, and importer metadata.")
         else:
-            emit("Skipping MMD Character Importer metadata JSON files by user request.")
+            icon_files, icon_warnings = compose_icons(plan, addon_dir)
+            generated_files.extend(icon_files)
+            warnings.extend(icon_warnings)
+            lua_path = write_lua(plan, addon_dir, carms_qc is not None)
+            generated_files.append(file_row(lua_path, "lua"))
+            if include_mci_metadata_json:
+                simple_vrd_immunity_path = write_simple_vrd_immunity(plan, addon_dir, carms_qc is not None)
+                generated_files.append(file_row(simple_vrd_immunity_path, "simple_vrd_immunity"))
+                dynamic_model_manifest_path = write_dynamic_model_importer_manifest(plan, addon_dir, carms_qc is not None)
+                generated_files.append(file_row(dynamic_model_manifest_path, "dynamic_model_importer_manifest"))
+            else:
+                emit("Skipping MMD Character Importer metadata JSON files by user request.")
         addon_json = addon_dir / "addon.json"
         addon_json.write_text(json.dumps({"title": f"{model}_public_version", "type": "model", "tags": ["cartoon", "fun"]}, indent=4), encoding="utf-8")
         generated_files.append(file_row(addon_json, "addon_json"))
@@ -5177,12 +5368,16 @@ def compose(plan_path: Path) -> dict[str, Any]:
         if not (model_dir / f"{model}.mdl").exists():
             errors.append("Main .mdl output is missing from the final SFM model folder.")
     else:
-        required_lua = addon_dir / "lua" / "autorun" / f"{model}_{author}.lua"
-        if not required_lua.exists():
-            errors.append("Lua autorun file was not written.")
         model_dir = addon_dir / "models" / author / category
-        if not (model_dir / f"{model}.mdl").exists() or not (model_dir / f"{model}_pm.mdl").exists():
-            errors.append("Main or player-model .mdl output is missing from the final addon folder.")
+        if ragdoll_only_output:
+            if not (model_dir / f"{model}.mdl").exists():
+                errors.append("Main ragdoll .mdl output is missing from the final addon folder.")
+        else:
+            required_lua = addon_dir / "lua" / "autorun" / f"{model}_{author}.lua"
+            if not required_lua.exists():
+                errors.append("Lua autorun file was not written.")
+            if not (model_dir / f"{model}.mdl").exists() or not (model_dir / f"{model}_pm.mdl").exists():
+                errors.append("Main or player-model .mdl output is missing from the final addon folder.")
     mat_dir = addon_dir / "materials" / "models" / author / model
     if not any(mat_dir.glob("*.vmt")):
         warnings.append("No material VMT files were written.")
@@ -5224,7 +5419,7 @@ def compose(plan_path: Path) -> dict[str, Any]:
         try:
             if path_is_inside(distribution_output_dir, addon_dir):
                 raise RuntimeError("The selected distribution folder cannot be inside the composed addon folder.")
-            if compile_source_copy_dir.exists() and path_is_inside(distribution_output_dir, compile_source_copy_dir):
+            if include_compile_source_backup and compile_source_copy_dir.exists() and path_is_inside(distribution_output_dir, compile_source_copy_dir):
                 raise RuntimeError("The selected distribution folder cannot be inside the QC compile source folder.")
             distribution_output_dir.mkdir(parents=True, exist_ok=True)
             if not l4d2:
@@ -5236,7 +5431,7 @@ def compose(plan_path: Path) -> dict[str, Any]:
                 else:
                     copytree_clean(addon_dir, distribution_addon_dir)
                     generated_files.append(folder_row(distribution_addon_dir, "distribution_addon_folder"))
-            if compile_source_copy_dir.exists():
+            if include_compile_source_backup and compile_source_copy_dir.exists():
                 distribution_compile_source_dir = distribution_compile_source_copy_dir(distribution_output_dir, model, author)
                 if same_resolved_path(distribution_compile_source_dir, compile_source_copy_dir):
                     generated_files.append(folder_row(distribution_compile_source_dir, "distribution_qc_compile_source", ["Already copied in this folder."]))
@@ -5252,12 +5447,17 @@ def compose(plan_path: Path) -> dict[str, Any]:
                         shutil.copyfile(packaged_vpk_path, distribution_gma)
                     generated_files.append(file_row(distribution_gma, "vpk_package"))
                     emit(f"Copied VPK package to distribution folder: {distribution_gma}")
-            else:
+            elif package_gma:
                 emit("Packaging final addon GMA.")
                 distribution_gma = distribution_output_dir / f"{model}_{author}.gma"
-                distribution_gma = package_addon_gma(addon_dir, distribution_gma, gmod, qc_dir / "gmad_create.log")
+                distribution_gma = timed_operation(
+                    "package_gma",
+                    lambda: package_addon_gma(addon_dir, distribution_gma, gmod, qc_dir / "gmad_create.log"),
+                )
                 generated_files.append(file_row(distribution_gma, "gma_package"))
                 emit(f"Wrote GMA package: {distribution_gma}")
+            else:
+                emit("Skipping GMA package for local fast output.")
         except Exception as exc:
             errors.append(f"Failed to copy/package addon to selected output folder: {exc}")
 
@@ -5325,6 +5525,10 @@ def compose(plan_path: Path) -> dict[str, Any]:
         "compile_source_copy_dir": str(compile_source_copy_dir),
         "distribution_compile_source_dir": str(distribution_compile_source_dir) if str(distribution_compile_source_dir) != "." else "",
         "include_mci_metadata_json": include_mci_metadata_json,
+        "package_gma": package_gma,
+        "include_compile_source_backup": include_compile_source_backup,
+        "capture_custom_hitboxes": capture_custom_hitboxes,
+        "operation_timings_seconds": operation_timings,
         "studiomdl_logs": studiomdl_logs,
         "flex_compile_enabled": flex_compile_enabled,
         "flex_compile_disabled_reason": flex_compile_disabled_reason,
@@ -5349,6 +5553,10 @@ def compose(plan_path: Path) -> dict[str, Any]:
         "copy_to_gmod_addons": bool(plan.get("copy_to_gmod_addons", False)),
         "copy_to_sfm_usermod": bool(plan.get("copy_to_sfm_usermod", True)),
         "include_mci_metadata_json": include_mci_metadata_json,
+        "package_gma": package_gma,
+        "include_compile_source_backup": include_compile_source_backup,
+        "capture_custom_hitboxes": capture_custom_hitboxes,
+        "operation_timings_seconds": operation_timings,
         "studiomdl_logs": studiomdl_logs,
         "flex_compile_enabled": flex_compile_enabled,
         "flex_compile_disabled_reason": flex_compile_disabled_reason,
@@ -5357,7 +5565,7 @@ def compose(plan_path: Path) -> dict[str, Any]:
         "gmod_addon_dir": str(gmod_addon_dir) if str(gmod_addon_dir) != "." else "",
         "source_dir": str(source_dir),
         "main_qc": str(main_qc),
-        "pm_qc": str(pm_qc),
+        "pm_qc": str(pm_qc) if pm_qc is not None else "",
         "carms_qc": str(carms_qc) if carms_qc else "",
         "simple_vrd_immunity": str(simple_vrd_immunity_path) if simple_vrd_immunity_path else "",
         "dynamic_model_importer_manifest": str(dynamic_model_manifest_path) if dynamic_model_manifest_path else "",

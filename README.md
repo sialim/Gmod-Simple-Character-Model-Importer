@@ -6,6 +6,21 @@ To developers: This repo can be directly ran from the source without downloading
 Gmod / SFM Steam Workshop Addon: https://steamcommunity.com/sharedfiles/filedetails/?id=3738916298
 L4D2 Steam Addon: https://steamcommunity.com/sharedfiles/filedetails/?id=3748993892
 
+## About This Fork
+
+This build keeps the normal MMD-to-Source workflow while adding conveniences
+for high-part-count character ports:
+
+- Bulk Queue for processing a selected set of PMX files in one session.
+- Ragdoll-focused output mode, enabled by default, which skips player-model
+  extras when only a ragdoll is needed.
+- Koikatsu-focused skeleton handling for clothing, hair, and skirt chains.
+- PMX bodygroup manifests. Companion Blender export markers can turn selected
+  mesh objects into Source bodygroup options even when they share an atlas.
+
+Releases provide a portable Windows build. Keep the `_internal` folder beside
+the executable when extracting a release archive.
+
 ## Requirements
 
 - Windows 10/11, 64-bit.

@@ -156,6 +156,55 @@ def mesh_objects() -> list[bpy.types.Object]:
     return [obj for obj in bpy.data.objects if obj.type == "MESH"]
 
 
+def material_text(material: bpy.types.Material) -> str:
+    values = [material.name]
+    node_tree = getattr(material, "node_tree", None)
+    if node_tree is not None:
+        for node in node_tree.nodes:
+            image = getattr(node, "image", None)
+            if image is not None:
+                values.extend((image.name, image.filepath))
+    return " ".join(values).lower()
+
+
+def offset_hitomi_geometry() -> dict[str, object]:
+    moved = []
+    for obj in mesh_objects():
+        hitomi_slots = {
+            index for index, slot in enumerate(obj.material_slots)
+            if slot.material is not None and "hitomi" in material_text(slot.material)
+        }
+        if not hitomi_slots:
+            continue
+        hitomi_vertices = set()
+        other_vertices = set()
+        for polygon in obj.data.polygons:
+            vertices = set(polygon.vertices)
+            if polygon.material_index in hitomi_slots:
+                hitomi_vertices.update(vertices)
+            else:
+                other_vertices.update(vertices)
+        indices = hitomi_vertices - other_vertices
+        if not indices:
+            continue
+        coordinates = [vertex.co for vertex in obj.data.vertices]
+        low = [min(point[axis] for point in coordinates) for axis in range(3)]
+        high = [max(point[axis] for point in coordinates) for axis in range(3)]
+        diagonal = sum((high[axis] - low[axis]) ** 2 for axis in range(3)) ** 0.5
+        distance = max(0.0005, min(0.015, diagonal * 0.0003))
+        key_blocks = list(obj.data.shape_keys.key_blocks) if obj.data.shape_keys else []
+        for index in indices:
+            offset = obj.data.vertices[index].normal * distance
+            obj.data.vertices[index].co += offset
+            for key in key_blocks:
+                key.data[index].co += offset
+        obj.data.update()
+        moved.append({"object": obj.name, "vertices": len(indices), "distance": distance})
+    if moved:
+        print(f"Offset Hitomi geometry on {len(moved)} mesh object(s) for alpha-test eyes.")
+    return {"objects": moved, "vertices": sum(item["vertices"] for item in moved)}
+
+
 def set_active_armature() -> bpy.types.Object:
     candidates = armatures()
     if not candidates:
@@ -471,6 +520,7 @@ def build_report(
     final_cleared_custom_normals: int,
     vrm_spine_merge: dict[str, object] | None = None,
     spine_accessory_protection: dict[str, object] | None = None,
+    hitomi_alpha_test_offset: dict[str, object] | None = None,
 ) -> dict[str, object]:
     merged_away = {SPINE2_BONE} if vrm_spine_merge and vrm_spine_merge.get("merged") else set()
     status = valve_bone_status(excluded=merged_away)
@@ -497,6 +547,7 @@ def build_report(
         "custom_normal_meshes_cleared_final": final_cleared_custom_normals,
         "vrm_spine_merge": vrm_spine_merge,
         "spine_accessory_protection": spine_accessory_protection,
+        "hitomi_alpha_test_offset": hitomi_alpha_test_offset,
         "valve_bones": status,
         "objects": [
             {
@@ -523,6 +574,7 @@ def main() -> int:
     bpy.ops.wm.open_mainfile(filepath=str(args.input_blend))
     enable_cats()
     make_single_user()
+    hitomi_alpha_test_offset = offset_hitomi_geometry()
     spine_accessory_protection = protect_misdetected_spine_accessories()
     if args.clear_custom_normals:
         initial_cleared_custom_normals = clear_custom_normals("before model fix")
@@ -549,6 +601,7 @@ def main() -> int:
         final_cleared_custom_normals,
         vrm_spine_merge,
         spine_accessory_protection,
+        hitomi_alpha_test_offset,
     )
     missing_valve_bones = report["valve_bones"]["missing"]
     if missing_valve_bones:
