@@ -36,8 +36,8 @@ $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $ReleaseRoot = Join-Path $Root "release"
 $PortableDir = Join-Path $ReleaseRoot "${Name}_portable"
 $StandaloneExe = Join-Path $ReleaseRoot "${Name}.exe"
-$UpdateReleasePageUrl = "https://github.com/SheepyLord/Gmod-Simple-Character-Model-Importer/releases"
-$UpdateLatestReleaseApiUrl = "https://api.github.com/repos/SheepyLord/Gmod-Simple-Character-Model-Importer/releases/latest"
+$UpdateReleasePageUrl = "https://github.com/sialim/Gmod-Simple-Character-Model-Importer/releases"
+$UpdateLatestReleaseApiUrl = "https://api.github.com/repos/sialim/Gmod-Simple-Character-Model-Importer/releases/latest"
 $GeneratedBuildInfoDir = $null
 
 function Resolve-ProjectPath([string]$RelativePath) {
