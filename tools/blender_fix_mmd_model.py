@@ -167,12 +167,23 @@ def material_text(material: bpy.types.Material) -> str:
     return " ".join(values).lower()
 
 
+def is_pupil_material(material: bpy.types.Material) -> bool:
+    text = material_text(material)
+    return any(token in text for token in ("hitomi", "pupil", "iris"))
+
+
 def offset_hitomi_geometry() -> dict[str, object]:
     moved = []
     for obj in mesh_objects():
+        if any(obj.get(key) for key in (
+            "gmod_hitomi_alpha_test_offset",
+            "kpt_hitomi_alphatest_offset",
+            "kpt_eye_geometry_offset",
+        )):
+            continue
         hitomi_slots = {
             index for index, slot in enumerate(obj.material_slots)
-            if slot.material is not None and "hitomi" in material_text(slot.material)
+            if slot.material is not None and is_pupil_material(slot.material)
         }
         if not hitomi_slots:
             continue
@@ -199,10 +210,64 @@ def offset_hitomi_geometry() -> dict[str, object]:
             for key in key_blocks:
                 key.data[index].co += offset
         obj.data.update()
+        obj["gmod_hitomi_alpha_test_offset"] = distance
         moved.append({"object": obj.name, "vertices": len(indices), "distance": distance})
     if moved:
         print(f"Offset Hitomi geometry on {len(moved)} mesh object(s) for alpha-test eyes.")
     return {"objects": moved, "vertices": sum(item["vertices"] for item in moved)}
+
+
+def bind_sirome_to_eye_bones() -> dict[str, object]:
+    armature = set_active_armature()
+    left_bone = armature.data.bones.get("Eye_L")
+    right_bone = armature.data.bones.get("Eye_R")
+    if left_bone is None or right_bone is None:
+        print("Skipping sirome eye-bone binding; Eye_L or Eye_R was not found.")
+        return {"objects": [], "vertices": 0, "skipped": "Eye_L or Eye_R was not found"}
+
+    left_head = armature.matrix_world @ left_bone.head_local
+    right_head = armature.matrix_world @ right_bone.head_local
+    bound = []
+    for obj in mesh_objects():
+        sirome_slots = {
+            index for index, slot in enumerate(obj.material_slots)
+            if slot.material is not None and "sirome" in material_text(slot.material)
+        }
+        if not sirome_slots:
+            continue
+        sirome_vertices = set()
+        other_vertices = set()
+        for polygon in obj.data.polygons:
+            vertices = set(polygon.vertices)
+            if polygon.material_index in sirome_slots:
+                sirome_vertices.update(vertices)
+            else:
+                other_vertices.update(vertices)
+        indices = sorted(sirome_vertices - other_vertices)
+        if not indices:
+            continue
+
+        for group in obj.vertex_groups:
+            group.remove(indices)
+        left_group = obj.vertex_groups.get(left_bone.name) or obj.vertex_groups.new(name=left_bone.name)
+        right_group = obj.vertex_groups.get(right_bone.name) or obj.vertex_groups.new(name=right_bone.name)
+        left_indices = []
+        right_indices = []
+        for index in indices:
+            point = obj.matrix_world @ obj.data.vertices[index].co
+            if (point - left_head).length_squared <= (point - right_head).length_squared:
+                left_indices.append(index)
+            else:
+                right_indices.append(index)
+        if left_indices:
+            left_group.add(left_indices, 1.0, "REPLACE")
+        if right_indices:
+            right_group.add(right_indices, 1.0, "REPLACE")
+        obj.data.update()
+        bound.append({"object": obj.name, "left_vertices": len(left_indices), "right_vertices": len(right_indices)})
+    if bound:
+        print(f"Bound sirome geometry to Eye_L/Eye_R on {len(bound)} mesh object(s).")
+    return {"objects": bound, "vertices": sum(item["left_vertices"] + item["right_vertices"] for item in bound)}
 
 
 def set_active_armature() -> bpy.types.Object:
@@ -521,6 +586,7 @@ def build_report(
     vrm_spine_merge: dict[str, object] | None = None,
     spine_accessory_protection: dict[str, object] | None = None,
     hitomi_alpha_test_offset: dict[str, object] | None = None,
+    sirome_eye_binding: dict[str, object] | None = None,
 ) -> dict[str, object]:
     merged_away = {SPINE2_BONE} if vrm_spine_merge and vrm_spine_merge.get("merged") else set()
     status = valve_bone_status(excluded=merged_away)
@@ -548,6 +614,7 @@ def build_report(
         "vrm_spine_merge": vrm_spine_merge,
         "spine_accessory_protection": spine_accessory_protection,
         "hitomi_alpha_test_offset": hitomi_alpha_test_offset,
+        "sirome_eye_binding": sirome_eye_binding,
         "valve_bones": status,
         "objects": [
             {
@@ -584,6 +651,7 @@ def main() -> int:
     fix_armature_twice()
     translate_with_cats()
     convert_to_valve()
+    sirome_eye_binding = bind_sirome_to_eye_bones()
     vrm_spine_merge = merge_vrm_spine2_into_spine1() if args.vrm_spine_merge else None
     if args.clear_custom_normals:
         final_cleared_custom_normals = clear_custom_normals("after model fix")
@@ -602,6 +670,7 @@ def main() -> int:
         vrm_spine_merge,
         spine_accessory_protection,
         hitomi_alpha_test_offset,
+        sirome_eye_binding,
     )
     missing_valve_bones = report["valve_bones"]["missing"]
     if missing_valve_bones:
