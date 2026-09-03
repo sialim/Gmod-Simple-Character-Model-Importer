@@ -156,6 +156,21 @@ MODEL_SCALE_DEFAULTS = {"pmx": 1.0, "vrm": 1.33}
 def model_scale_default_for_path(path: Path | None) -> float:
     suffix = path.suffix.lower().lstrip(".") if path is not None else "pmx"
     return float(MODEL_SCALE_DEFAULTS.get(suffix, 1.0))
+
+
+def sheepy_package_scale_for_path(path: Path | None) -> float | None:
+    """Read an optional authored scale recommendation beside a PMX package."""
+    if path is None or path.suffix.lower() != ".pmx":
+        return None
+    manifest = path.with_suffix(".kpt_bodygroups.json")
+    if not manifest.is_file():
+        return None
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        value = float(payload.get("recommendedScaleMultiplier"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return value if 0.01 <= value <= 10.0 else None
 # Distinct colors for the up-to-14 additional CoACD collision groups (preview
 # bone tint + table row tint).
 COLLISION_GROUP_COLORS: list[tuple[float, float, float]] = [
@@ -4586,6 +4601,19 @@ class ImporterWindow(QtWidgets.QMainWindow):
         fmt = pmx.suffix.lower().lstrip(".") if pmx is not None else "pmx"
         if fmt not in MODEL_SCALE_DEFAULTS:
             fmt = "pmx"
+        package_scale = sheepy_package_scale_for_path(pmx)
+        if package_scale is not None:
+            default_scale = model_scale_default_for_path(pmx)
+            current_scale = float(self.main_scale_spin.value())
+            previous_package_scale = getattr(self, "_main_package_scale", None)
+            if (abs(current_scale - default_scale) < 0.0005
+                    or previous_package_scale is None
+                    or abs(current_scale - previous_package_scale) < 0.0005):
+                self.main_scale_spin.setValue(package_scale)
+            self._main_package_scale = package_scale
+            self._main_scale_format = fmt
+            return
+        self._main_package_scale = None
         if fmt == self._main_scale_format:
             return
         self._main_scale_format = fmt
