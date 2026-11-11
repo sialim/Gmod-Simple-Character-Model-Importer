@@ -43,7 +43,7 @@ TARGET_PARENTS = {
     R_CLAVICLE: SPINE4,
     L_CLAVICLE: SPINE4,
 }
-ADDABLE_TARGETS = {SPINE, SPINE2}
+ADDABLE_TARGETS = {SPINE, SPINE1, SPINE2}
 SIDE_LANDMARKS = [R_CLAVICLE, L_CLAVICLE, R_UPPER_ARM, L_UPPER_ARM, R_THIGH, L_THIGH]
 SAFE_BONE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
 SOURCE_BONE_NAME_PATTERN = re.compile(r"^ValveBiped\.Bip01_[A-Za-z0-9_]+$")
@@ -377,13 +377,16 @@ def added_spine_position(target: str, selected: dict[str, str | None], bones: di
     if target == SPINE2:
         lower_name = selected.get(SPINE1)
         upper_name = selected.get(SPINE4)
+    elif target == SPINE1:
+        lower_name = selected.get(SPINE) or selected.get(PELVIS)
+        upper_name = selected.get(SPINE4)
     else:
         lower_name = selected.get(PELVIS)
         upper_name = selected.get(SPINE1)
     lower = bones.get(lower_name or "")
     upper = bones.get(upper_name or "")
     if lower and upper:
-        if target == SPINE:
+        if target in {SPINE, SPINE1}:
             head = lower.head_local.lerp(upper.head_local, 0.45)
             tail = lower.head_local.lerp(upper.head_local, 0.82)
         else:
@@ -738,6 +741,10 @@ def proposal_for_armature(armature: bpy.types.Object, weighted: set[str]) -> dic
         else:
             targets[target] = make_entry(target, None, "missing", SPINE4, 0.0, [f"{target} must map to an existing bone."])
 
+    replacement = missing_spine1_entry(bones, targets)
+    if replacement:
+        targets[SPINE1] = replacement
+
     duplicate_sources: dict[str, list[str]] = {}
     for target, entry in targets.items():
         source = entry.get("source")
@@ -757,6 +764,31 @@ def proposal_for_armature(armature: bpy.types.Object, weighted: set[str]) -> dic
         "pre_bone_merges": pre_bone_merges,
         "warnings": proposal_warnings,
     }
+
+
+def missing_spine1_entry(bones: dict[str, bpy.types.Bone], targets: dict) -> dict[str, object] | None:
+    entry = targets.get(SPINE1, {})
+    if entry.get("action") != "missing" or entry.get("source"):
+        return None
+    # A chest source may already use the Spine1 name. Insert an unweighted
+    # intermediate only when the mapped lower and upper torso form a real chain.
+    renamed_sources = {row.get("source") for row in targets.values() if row.get("action") == "rename"}
+    if SPINE1 in bones and SPINE1 not in renamed_sources:
+        return None
+    lower_name = targets.get(SPINE, {}).get("source") or targets.get(PELVIS, {}).get("source")
+    upper_name = targets.get(SPINE4, {}).get("source")
+    lower = bones.get(lower_name)
+    upper = bones.get(upper_name)
+    if lower is None or upper is None or lower == upper:
+        return None
+    if lower not in upper.parent_recursive or upper.head_local.z <= lower.head_local.z + 0.000001:
+        return None
+    selected = {target: row.get("source") for target, row in targets.items()}
+    return make_entry(
+        SPINE1, None, "add", SPINE, 0.7,
+        ["Spine1 is missing between the mapped lower torso and chest and will be added without weights."],
+        added_spine_position(SPINE1, selected, bones),
+    )
 
 
 def validation_for_armature(armature: bpy.types.Object, added_bones: set[str] | None = None) -> dict[str, object]:
@@ -1123,6 +1155,10 @@ def normalize_added_spine_positions(armature: bpy.types.Object, added: set[str])
             before = {"head": v3(edit_bones[SPINE].head), "tail": v3(edit_bones[SPINE].tail)}
             place_bone_between(edit_bones[SPINE], edit_bones[PELVIS].head, edit_bones[SPINE1].head, 0.45, 0.82)
             changes.append({"bone": SPINE, "before": before, "after": {"head": v3(edit_bones[SPINE].head), "tail": v3(edit_bones[SPINE].tail)}})
+        if SPINE1 in added and SPINE in edit_bones and SPINE4 in edit_bones:
+            before = {"head": v3(edit_bones[SPINE1].head), "tail": v3(edit_bones[SPINE1].tail)}
+            place_bone_between(edit_bones[SPINE1], edit_bones[SPINE].head, edit_bones[SPINE4].head, 0.45, 0.70)
+            changes.append({"bone": SPINE1, "before": before, "after": {"head": v3(edit_bones[SPINE1].head), "tail": v3(edit_bones[SPINE1].tail)}})
         if SPINE2 in added and SPINE1 in edit_bones and SPINE4 in edit_bones and SPINE2 in edit_bones:
             before = {"head": v3(edit_bones[SPINE2].head), "tail": v3(edit_bones[SPINE2].tail)}
             place_bone_between(edit_bones[SPINE2], edit_bones[SPINE1].head, edit_bones[SPINE4].head, 0.55, 0.82)
@@ -1370,6 +1406,16 @@ def rename_unsafe_bones(armature: bpy.types.Object) -> list[dict[str, object]]:
 
 
 def apply_plan(armature: bpy.types.Object, plan: dict[str, object]) -> dict[str, object]:
+    targets = plan.get("targets", {})
+    replacement = missing_spine1_entry(bone_lookup(armature), targets)
+    if replacement:
+        # Older workspaces can contain the incomplete plan generated before
+        # intermediate Spine1 insertion was supported.
+        targets = {**targets, SPINE1: replacement}
+        plan = dict(plan, targets=targets)
+    unresolved = [target for target in TARGETS if plan_entry(plan, target).get("action") == "missing"]
+    if unresolved:
+        raise RuntimeError("Spine plan has unresolved source bones: " + ", ".join(unresolved))
     pre_bone_merges = apply_pre_bone_merges(armature, plan)
     changes = apply_renames(armature, plan)
     added = add_missing_bones(armature, plan)
@@ -1387,6 +1433,7 @@ def apply_plan(armature: bpy.types.Object, plan: dict[str, object]) -> dict[str,
         "added_position_changes": added_position_changes,
         "renamed_unsafe_bones": renamed_unsafe,
         "validation": validation,
+        "resolved_targets": {SPINE1: replacement} if replacement else {},
     }
 
 
@@ -1454,7 +1501,19 @@ def main() -> int:
     plan = load_plan(args.plan_json)
     before_analysis, _proposal = analyze_current_file(args.input_blend, include_preview=False)
     armature = active_armature()
-    result = apply_plan(armature, plan)
+    try:
+        result = apply_plan(armature, plan)
+    except Exception as exc:
+        write_json(args.report_json, {
+            "version": 1,
+            "input_blend": str(args.input_blend),
+            "output_blend": str(args.output_blend),
+            "plan_json": str(args.plan_json),
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+            "before": before_analysis,
+            "validation": {"ok": False, "errors": [str(exc)], "warnings": []},
+        })
+        raise
     if not result["validation"]["ok"]:
         print("Validation failed after spine repair.")
         for error in result["validation"]["errors"]:

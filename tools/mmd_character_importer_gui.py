@@ -780,7 +780,7 @@ SPINE_TARGET_PARENTS = {
     "ValveBiped.Bip01_R_Clavicle": "ValveBiped.Bip01_Spine4",
     "ValveBiped.Bip01_L_Clavicle": "ValveBiped.Bip01_Spine4",
 }
-SPINE_ADDABLE_TARGETS = {"ValveBiped.Bip01_Spine", "ValveBiped.Bip01_Spine2"}
+SPINE_ADDABLE_TARGETS = {"ValveBiped.Bip01_Spine", "ValveBiped.Bip01_Spine1", "ValveBiped.Bip01_Spine2"}
 ADD_NEW_MARKER = "__MCI_ADD_NEW_BONE__"
 _CRASH_LOG_HANDLE = None
 OPENAI_MODEL_OPTIONS = [
@@ -3637,7 +3637,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.settings_store = QtCore.QSettings("MMDCharacterImporter", "PortingTool")
-        self._loading_settings = False
+        self._loading_settings = True
         self._settings_save_timer = QtCore.QTimer(self)
         self._settings_save_timer.setSingleShot(True)
         self._settings_save_timer.setInterval(500)
@@ -6390,7 +6390,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.main_rtx_bodygroup_limit_check = QtWidgets.QCheckBox("Enforce 32,767 vertex bodygroup limit (RTX Remix)")
         self.main_rtx_bodygroup_limit_check.setToolTip("Default GMod builds allow 65,535 vertices per bodygroup. Enable this for RTX Remix builds that require 32,767.")
         self.main_clear_custom_normals_check = QtWidgets.QCheckBox("Clear Model Custom Normals")
-        self.main_clear_custom_normals_check.setChecked(True)
+        self.main_clear_custom_normals_check.setChecked(False)
         self.main_clear_custom_normals_check.setToolTip(
             "Some models has their own definition of how the lights are reflected such as the ones with 平面化 tags, "
             "clearing them could fix the potential shading issue in game."
@@ -11091,7 +11091,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         if not bool(self.settings_store.value("fix_clear_custom_normals_default_off_migrated", False, bool)):
             self.settings_store.setValue("fix_clear_custom_normals", False)
             self.settings_store.setValue("fix_clear_custom_normals_default_off_migrated", True)
-        main_clear_normals = self.settings_bool(self.settings_store.value("main_clear_custom_normals", True), True)
+        main_clear_normals = self.settings_bool(self.settings_store.value("main_clear_custom_normals", False), False)
         fix_clear_normals = self.settings_bool(self.settings_store.value("fix_clear_custom_normals", False), False)
         widget = getattr(self, "main_clear_custom_normals_check", None)
         if isinstance(widget, QtWidgets.QCheckBox):
@@ -12214,7 +12214,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         widget = getattr(self, "main_clear_custom_normals_check", None)
         if isinstance(widget, QtWidgets.QCheckBox):
             return bool(widget.isChecked())
-        return True
+        return False
 
     def fix_clear_custom_normals_enabled(self) -> bool:
         widget = getattr(self, "fix_clear_custom_normals_check", None)
@@ -14325,8 +14325,20 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 value = bones[str(source)].get(key)
                 if isinstance(value, list) and len(value) >= 3:
                     return [float(value[0]), float(value[1]), float(value[2])]
+            position = entry.get("position", {}) if isinstance(entry, dict) else {}
+            value = position.get(key) if isinstance(position, dict) else None
+            if isinstance(value, list) and len(value) >= 3:
+                return [float(value[0]), float(value[1]), float(value[2])]
             return None
 
+        if target == "ValveBiped.Bip01_Spine1":
+            lower_head = target_vec("ValveBiped.Bip01_Spine", "head") or target_vec("ValveBiped.Bip01_Pelvis", "head")
+            upper_head = target_vec("ValveBiped.Bip01_Spine4", "head")
+            if lower_head and upper_head:
+                return {
+                    "head": [lower_head[i] * 0.55 + upper_head[i] * 0.45 for i in range(3)],
+                    "tail": [lower_head[i] * 0.30 + upper_head[i] * 0.70 for i in range(3)],
+                }
         lower_tail = target_vec("ValveBiped.Bip01_Spine1" if target.endswith("Spine2") else "ValveBiped.Bip01_Pelvis", "tail")
         upper_head = target_vec("ValveBiped.Bip01_Spine4" if target.endswith("Spine2") else "ValveBiped.Bip01_Spine1", "head")
         if lower_tail and upper_head:
