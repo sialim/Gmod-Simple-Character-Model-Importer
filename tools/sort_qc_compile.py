@@ -2602,8 +2602,10 @@ def base_qc_lines(
         lines.append('$ikchain "lhand" "ValveBiped.Bip01_L_Hand" knee 0.707 0.707 0 \n')
         lines.append('$ikchain "rfoot" "ValveBiped.Bip01_R_Foot" knee 0.707 -0.707 0 \n')
         lines.append('$ikchain "lfoot" "ValveBiped.Bip01_L_Foot" knee 0.707 -0.707 0 \n\n')
-        lines.append('$ikautoplaylock "rfoot" 0.7 0.1 \n')
-        lines.append('$ikautoplaylock "lfoot" 0.7 0.1 \n\n')
+        # Autoplay locks restore the pre-proportion animation's foot positions.
+        # That pulls custom ankles back toward the stock skeleton and lifts
+        # short feet off the floor. Keep the chains for animation ground IK,
+        # while allowing the proportion delta to move the feet with the body.
     if sfm:
         # SFM: a single static idle holding the proportioned pose. No proportion
         # subtract/autoplay, no ragdoll, no $includemodel, no collision -- per the
@@ -2619,7 +2621,11 @@ def base_qc_lines(
         return lines
     reference_name = gendered_reference_name(plan, source_dir / "anims")
     lines.append(f'$sequence reference "anims/{reference_name}" fps 1 \n')
-    lines.append('$origin 0 0 -2.50 \n\n')
+    # GMod's proportion delta must reconstruct the model's authored height.
+    # The fixed downward offset used with foot autoplay locks would sink it
+    # after removing those locks.
+    if l4d2:
+        lines.append('$origin 0 0 -2.50 \n\n')
     lines.append('$animation a_proportions "anims/proportions" subtract reference 0 \n\n')
     if l4d2:
         # L4D2 survivor MULTIPLAYER sequence-index alignment (issue #105). A survivor REPLACEMENT must
