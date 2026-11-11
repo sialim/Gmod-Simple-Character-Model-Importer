@@ -48,6 +48,7 @@ BAD_OPEN_BRACE_RE = re.compile(r"\((?P<line>\d+)\):\s*-\s*bad command\s+\{", re.
 ESSENTIAL_EXACT = {"ZArmTwist_L", "ZArmTwist_R", "ZHandTwist_L", "ZHandTwist_R", "Eye_L", "Eye_R"}
 GENDER_CHOICES = ("female", "male")
 GAME_CHOICES = ("gmod", "l4d2", "sfm")
+GMOD_FOOT_IK_HELPERS = ("mci_foot_ik_root", "mci_foot_ik_knee", "mci_foot_ik_target")
 GENDER_ANIMATION_INCLUDES = {
     "female": {
         # Playermodel QC needs ONLY the standard GMod player animation packs.
@@ -2558,6 +2559,19 @@ def base_qc_lines(
         lines.extend(include_definebones)
         if lines and not lines[-1].endswith("\n\n"):
             lines.append("\n")
+        if target == "gmod" and not for_definebone_capture:
+            # Included animation rules address the four IK chains by index.
+            # Keep both foot slots, but route them to an unweighted, separate
+            # helper skeleton. Stock ankle offsets then cannot move real legs.
+            # Capturing the real skeleton first keeps these definitions from
+            # changing StudioMDL's bind-pose capture or its real bone ordering.
+            if any(f'"{name}"' in line.lower() for name in GMOD_FOOT_IK_HELPERS for line in include_definebones):
+                raise RuntimeError("The source skeleton uses a reserved MCI foot IK helper name.")
+            parent = ""
+            for index, name in enumerate(GMOD_FOOT_IK_HELPERS):
+                lines.append(f'$definebone "{name}" "{parent}" 0 0 {int(index > 0)} 0 0 0 0 0 0 0 0 0\n')
+                parent = name
+            lines.append("\n")
     if include_hboxes:
         if l4d2:
             # L4D2 survivors use a named "L4D" hitbox set.
@@ -2600,12 +2614,16 @@ def base_qc_lines(
     else:
         lines.append('$ikchain "rhand" "ValveBiped.Bip01_R_Hand" knee 0.707 0.707 0 \n')
         lines.append('$ikchain "lhand" "ValveBiped.Bip01_L_Hand" knee 0.707 0.707 0 \n')
-        lines.append('$ikchain "rfoot" "ValveBiped.Bip01_R_Foot" knee 0.707 -0.707 0 \n')
-        lines.append('$ikchain "lfoot" "ValveBiped.Bip01_L_Foot" knee 0.707 -0.707 0 \n\n')
-        # Autoplay locks restore the pre-proportion animation's foot positions.
-        # That pulls custom ankles back toward the stock skeleton and lifts
-        # short feet off the floor. Keep the chains for animation ground IK,
-        # while allowing the proportion delta to move the feet with the body.
+        for side in ("R", "L"):
+            endpoint = (
+                GMOD_FOOT_IK_HELPERS[-1] if include_definebones and not for_definebone_capture
+                else f"ValveBiped.Bip01_{side}_Foot"
+            )
+            lines.append(f'$ikchain "{side.lower()}foot" "{endpoint}" knee 0.707 -0.707 0 \n')
+        lines.append("\n")
+        # Autoplay locks and stock ground IK both restore stock ankle height.
+        # The final compile retains hand IK and both foot chain indices, while
+        # routing foot rules away from the model's deforming skeleton.
     if sfm:
         # SFM: a single static idle holding the proportioned pose. No proportion
         # subtract/autoplay, no ragdoll, no $includemodel, no collision -- per the
@@ -2622,8 +2640,7 @@ def base_qc_lines(
     reference_name = gendered_reference_name(plan, source_dir / "anims")
     lines.append(f'$sequence reference "anims/{reference_name}" fps 1 \n')
     # GMod's proportion delta must reconstruct the model's authored height.
-    # The fixed downward offset used with foot autoplay locks would sink it
-    # after removing those locks.
+    # The fixed origin offset used with foot autoplay locks also changes height.
     if l4d2:
         lines.append('$origin 0 0 -2.50 \n\n')
     lines.append('$animation a_proportions "anims/proportions" subtract reference 0 \n\n')
@@ -3781,9 +3798,8 @@ def write_vmt(
     normal_name: str | None = None,
 ) -> None:
     # base_name lets a de-duplicated material point at another material's shared
-    # VTF. Keep Source's default lighting model for character materials: the
-    # diffuse texture carries the illustrated shading, without a generated
-    # normal map, lightwarp, rim light, or universal phong pass.
+    # VTF. GMod character materials use the original porter toon-lighting
+    # profile, including the bundled flat normal when no normal map is supplied.
     base_name = base_name or material_name
     body = (
         "VertexLitGeneric\n"
@@ -3791,6 +3807,25 @@ def write_vmt(
         f'\t$basetexture "models/{author}/{model_name}/{base_name}"\n'
         '\t$surfaceprop "Flesh"\n'
     )
+    if normalize_game(game) == "gmod":
+        shared = l4d2_shared_material_root(author, model_name, game)
+        normal_texture = (
+            f"models/{author}/{model_name}/{normal_name or material_name}_normal"
+            if has_normal else f"{shared}/normal"
+        )
+        exponent_texture = phongexp_texture or f"{shared}/phong_exp"
+        body += (
+            f'\t$bumpmap "{normal_texture}"\n'
+            f'\t$lightwarptexture "{shared}/lightwarptexture"\n'
+            '\t$phong "1"\n'
+            '\t$phongboost "1"\n'
+            '\t$phongalbedotint "1"\n'
+            f'\t$phongexponenttexture "{exponent_texture}"\n'
+            '\t$phongfresnelranges "[0.0 0.5 1]"\n'
+            '\t$rimlight "1"\n'
+            '\t$rimlightexponent "2"\n'
+            '\t$rimlightboost "2"\n'
+        )
     if is_koikatsu_translucent_face_material(material_name):
         body += '\t$translucent 1\n'
     else:
