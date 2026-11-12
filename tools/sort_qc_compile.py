@@ -18,6 +18,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+try:
+    import gmod_wrist_twist
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import gmod_wrist_twist
+
 
 ROOT = Path(__file__).resolve().parents[1]
 STEP_DIR_NAME = "14_sort_qc_compile"
@@ -2587,7 +2593,11 @@ def base_qc_lines(
         lines.append('$poseparameter "body_yaw" -90 90 loop 360 \n')
         lines.append('$poseparameter "head_pitch" -90 90 loop 360 \n')
         lines.append('$poseparameter "head_yaw" -90 90 loop 360 \n\n')
-    if (source_dir / "vrd.vrd").exists():
+    wrist_vrd = source_dir / gmod_wrist_twist.GENERATED_FILENAME
+    if (target == "gmod" and include_definebones and not for_definebone_capture
+            and wrist_vrd.exists() and wrist_vrd.read_text(encoding="utf-8").startswith(gmod_wrist_twist.GENERATED_HEADER)):
+        lines.append(f'$proceduralbones "{wrist_vrd.name}"\n\n')
+    elif (source_dir / "vrd.vrd").exists():
         lines.append('$proceduralbones "vrd.vrd"\n\n')
     if l4d2:
         # L4D2 survivor weapon/item placement + IK. Without these $attachments the game has
@@ -3252,6 +3262,39 @@ def parse_definebone_lines(lines: list[str]) -> list[DefineBone]:
                 values = ()
             definitions.append(DefineBone(match.group("name"), match.group("parent"), index, values, tokens, line.strip()))
     return definitions
+
+
+def prepare_gmod_wrist_twist(source_dir: Path, definebones: list[str], game: str = "gmod") -> dict[str, Any]:
+    report: dict[str, Any] = {"enabled": normalize_game(game) == "gmod", "helpers": []}
+    if not report["enabled"]:
+        return report
+    generated = source_dir / gmod_wrist_twist.GENERATED_FILENAME
+    owned = generated.exists() and generated.read_text(encoding="utf-8").startswith(gmod_wrist_twist.GENERATED_HEADER)
+    proportions = source_dir / "anims" / "proportions.smd"
+    if not proportions.exists():
+        if owned:
+            generated.unlink()
+        return report
+    smd = parse_smd(proportions, include_triangles=False)
+    poses = {
+        node.name: gmod_wrist_twist.BonePose(
+            smd.nodes[node.parent].name if node.parent in smd.nodes else "",
+            node.local_pos, node.local_rot,
+        ) for node in smd.nodes.values()
+    }
+    authored_path = source_dir / "vrd.vrd"
+    authored = authored_path.read_text(encoding="utf-8-sig") if authored_path.exists() else ""
+    declared = {bone.name for bone in parse_definebone_lines(definebones)}
+    text, helpers = gmod_wrist_twist.build_vrd(poses, declared, authored)
+    if not helpers:
+        if owned:
+            generated.unlink()
+        return report
+    if generated.exists() and not owned:
+        raise RuntimeError(f"Automatic wrist VRD output would overwrite an authored file: {generated}")
+    generated.write_text(gmod_wrist_twist.GENERATED_HEADER + authored.rstrip() + "\n\n" + text, encoding="utf-8")
+    report.update(helpers=helpers, path=str(generated), triggers_per_helper=25)
+    return report
 
 
 def scan_missing_definebone_parents(definitions: list[DefineBone]) -> dict[str, set[str]]:
@@ -5065,6 +5108,10 @@ def compose(plan_path: Path) -> dict[str, Any]:
         emit("Inserted missing parent definebones: " + ", ".join(str(name) for name in inserted))
     write_definebone_repair_report(qc_dir, definebone_repair_reports)
 
+    wrist_twist_report = prepare_gmod_wrist_twist(source_dir, definebones, game)
+    if wrist_twist_report["helpers"]:
+        emit("Added GMod wrist twist drivers: " + ", ".join(wrist_twist_report["helpers"]))
+
     jiggle_lines: list[str] = []
     jiggles: list[str] = []
     ignores: list[str] = []
@@ -5123,6 +5170,8 @@ def compose(plan_path: Path) -> dict[str, Any]:
     flex_compile_disabled_reason = ""
 
     def refresh_compile_qcs() -> Path | None:
+        nonlocal wrist_twist_report
+        wrist_twist_report = prepare_gmod_wrist_twist(source_dir, definebones, game)
         write_lines(
             main_qc,
             base_qc_lines(
@@ -5658,6 +5707,7 @@ def compose(plan_path: Path) -> dict[str, Any]:
         "simple_vrd_immunity": str(simple_vrd_immunity_path) if simple_vrd_immunity_path else "",
         "dynamic_model_importer_manifest": str(dynamic_model_manifest_path) if dynamic_model_manifest_path else "",
         "definebone_count": len(definebones),
+        "gmod_wrist_twist": wrist_twist_report,
         "definebone_repair": {
             "report": str(qc_dir / "missing_definebones_repair.json"),
             "inserted_bones": sorted(
