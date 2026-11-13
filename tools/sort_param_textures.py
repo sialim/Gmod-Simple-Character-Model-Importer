@@ -496,6 +496,7 @@ class MaterialTexture:
     vertex_count: int = 0
     face_count: int = 0
     warnings: list[str] = field(default_factory=list)
+    two_sided: bool | None = None
 
 
 def emit(message: str) -> None:
@@ -618,6 +619,7 @@ def read_materials_json(json_path: Path, used_names: set[str]) -> list[MaterialT
                 vertex_count=int(entry.get("vertex_count", 0) or 0),
                 face_count=int(entry.get("face_count", 0) or 0),
                 warnings=warnings,
+                two_sided=entry.get("two_sided") if isinstance(entry.get("two_sided"), bool) else None,
             )
         )
     return materials
@@ -1205,6 +1207,7 @@ def analyze_textures(input_path: Path, analysis_json: Path, plan_json: Path, sch
             "uid": material.uid,
             "material_name": material.material_name,
             "output_name": material.output_name,
+            "two_sided": material.two_sided,
             "enabled": True,
             "base_source_path": str(base_path) if base_path else "",
             "base_source_path_original": material.base_source_path,
@@ -1349,6 +1352,7 @@ def process_textures(input_path: Path, plan_json: Path, report_json: Path, manif
             "uid": row.get("uid"),
             "material_name": material_name,
             "output_name": row.get("output_name"),
+            "two_sided": row.get("two_sided") if isinstance(row.get("two_sided"), bool) else None,
             "base_source_path": str(base_source) if base_source else "",
             "base_output_path": str(base_output),
             "normal_source_path": str(normal_source) if normal_source else "",

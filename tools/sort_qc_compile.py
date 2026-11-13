@@ -1999,6 +1999,7 @@ def material_plan_rows(manifest_path: Path) -> list[dict[str, Any]]:
                 "uid": f"mat_{index:03d}",
                 "material_name": str(row.get("material_name") or output_name),
                 "output_name": output_name,
+                "two_sided": row.get("two_sided") if isinstance(row.get("two_sided"), bool) else None,
                 "base_png": str(row.get("base_output_path") or ""),
                 "normal_png": str(row.get("normal_output_path") or ""),
                 "normal_status": str(row.get("normal_status") or row.get("normal_action") or ""),
@@ -3800,7 +3801,9 @@ def is_koikatsu_translucent_face_material(material_name: str) -> bool:
 
 def is_koikatsu_two_sided_material(material_name: str) -> bool:
     name = str(material_name or "").lower()
-    return "hair" in name or "skirt" in name or "_sk_" in name
+    # Older workspaces do not carry the source material's culling flag. KKBP
+    # baked dresses commonly use generic names such as cloth/cloth atlas.
+    return any(token in name for token in ("hair", "skirt", "_sk_", "dress", "cloth", "outfit"))
 
 
 def is_koikatsu_skirt_bone(name: str) -> bool:
@@ -3839,6 +3842,7 @@ def write_vmt(
     nodecal: bool = False,
     base_name: str | None = None,
     normal_name: str | None = None,
+    two_sided: bool | None = None,
 ) -> None:
     # base_name lets a de-duplicated material point at another material's shared
     # VTF. GMod character materials use the original porter toon-lighting
@@ -3875,7 +3879,9 @@ def write_vmt(
         body += '\t$alphatest 1\n'
     if nodecal:
         body += '\t$nodecal "1"\n'
-    if is_koikatsu_two_sided_material(material_name):
+    if not isinstance(two_sided, bool):
+        two_sided = is_koikatsu_two_sided_material(material_name)
+    if two_sided:
         body += '\t$nocull 1\n'
     if selfillum_mask:
         body += (
@@ -4061,6 +4067,7 @@ def compose_materials(
         write_vmt(
             vmt, author, model, material_name, has_normal, phongexp_texture, selfillum_mask,
             game=game, nodecal=nodecal, base_name=base_canon, normal_name=normal_canon,
+            two_sided=row.get("two_sided"),
         )
         files.append(file_row(vmt, "material_vmt"))
     if merge and dedup_saved:

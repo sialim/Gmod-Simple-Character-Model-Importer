@@ -607,6 +607,7 @@ def collect_material_entries() -> tuple[list[dict[str, object]], dict[str, objec
                 "vertex_count": vertex_count,
                 "face_count": int(assigned_faces.get(mat.name, 0)),
                 "alpha": alpha,
+                "two_sided": not mat.use_backface_culling,
                 "diffuse": diffuse,
                 "swatch": color,
                 "preview_color": color,
@@ -1102,6 +1103,9 @@ def consolidate_slots(entries: list[dict[str, object]], target_key: str = "combi
             target_mat = mat_by_uid.get(target_uid) or mat_by_uid.get(uid)
             if target_mat is None:
                 continue
+            source_mat = mat_by_uid.get(uid)
+            if source_mat is not None and not source_mat.use_backface_culling:
+                target_mat.use_backface_culling = False
             if target_uid not in target_index_by_uid:
                 target_index_by_uid[target_uid] = len(target_mats)
                 target_mats.append(target_mat)
@@ -1617,6 +1621,7 @@ def build_merge_plan_from_analysis(
                 "base_color_file": entry.get("base_color_file", ""),
                 "base_color_key": entry.get("base_color_key", ""),
                 "alpha": entry.get("alpha", 1.0),
+                "two_sided": entry.get("two_sided"),
                 "warnings": entry.get("warnings", []),
                 "enabled": True,
             }
@@ -2000,6 +2005,16 @@ def apply_merge(
     started = time.monotonic()
     entries = merge_entries_from_plan(plan)
     final_by_group = validate_merge_names(entries)
+    # An atlas must retain backfaces if any of its source materials used them.
+    two_sided_by_group: dict[int, bool] = {}
+    for entry in entries:
+        if not entry.get("enabled", True):
+            continue
+        mat = bpy.data.materials.get(str(entry.get("current_name") or entry.get("material_name") or ""))
+        flag = not mat.use_backface_culling if mat is not None else entry.get("two_sided")
+        if isinstance(flag, bool):
+            group = int(entry.get("group", 0) or 0)
+            two_sided_by_group[group] = two_sided_by_group.get(group, False) or flag
     print("Consolidating material merge groups")
     should_try_combiner = bool(plan.get("use_material_combiner")) and len(entries) > limit
     merge_report = try_material_combiner_merge(entries, final_by_group, output_blend.parent) if should_try_combiner else {"status": "skipped", "method": "material_combiner", "reason": "not required"}
@@ -2007,6 +2022,10 @@ def apply_merge(
         fallback_report = consolidate_merge_groups(entries, final_by_group)
         fallback_report["material_combiner_attempt"] = merge_report
         merge_report = fallback_report
+    for group, two_sided in two_sided_by_group.items():
+        mat = bpy.data.materials.get(final_by_group.get(group, ""))
+        if mat is not None:
+            mat.use_backface_culling = not two_sided
     print("Creating final material vertex groups")
     final_groups = create_final_vertex_groups(final_by_group)
     output_blend.parent.mkdir(parents=True, exist_ok=True)
